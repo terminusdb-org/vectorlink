@@ -25,7 +25,7 @@ For this problem, we do not have to worry too much about the implementation deta
 The purpose of this graph is to support two operations, namely search and nearest-neighbor.
 
 #### Search
-`G->V->->[..initial search queue..]->count->[V;count]`
+`G->V->[..initial search queue..]->count->[V;count]`
 
 In other words, given a graph, a query vector, an initial search queue, and a desired amount of results, produce the `count` closest matches to this query vector according to the graph's distance function.
 
