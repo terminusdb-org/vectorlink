@@ -66,7 +66,7 @@ The entire graph can be improved in this way by just looping over all nodes and 
 The way we actually generate graph is by creating a best-effort graph as a first pass, then iteratively optimizing that until no more significant improvements are made.
 
 ### Hierarchical NSW
-As described above, search takes in an initial list of nodes to initiate the search with. For a small well-connected graph any random selection (or even a static selection, like the first node in the graph) will do, but beyond a certain size this is no longer possible, because the number of hops (neighborhood traversals) becomes troo large.
+As described above, search takes in an initial list of nodes to initiate the search with. For a small well-connected graph any random selection (or even a static selection, like the first node in the graph) will do, but beyond a certain size this is no longer possible, because the number of hops (neighborhood traversals) becomes too large.
 
 HNSW (Hierarchical Navigable Small World) aims to solve this by introducing supernode graphs. We take a random selection of nodes from our graph that is an order of magnitude smaller, then generate a new NSW with just those nodes. This process can be repeated until we end up with a top-level graph that is easily searchable.
 
