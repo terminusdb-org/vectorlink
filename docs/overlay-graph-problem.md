@@ -89,7 +89,7 @@ There probably exists an algorithm that generates an ideal overlay graph for a p
 For each node, we can generate an additional number of virtual connections by randomly selecting nodes to connect to. Given a static seed to the pseudo-random number generator (for example, a combination of layer id, node id and a salt), we could always generate the same number of random connections, avoiding the need of actually having to maintain this additional graph.
 
 ### Circulant graphs
-Given a list of generator numbers `C`, for each `c in C`, we can imagine that each node `v` (here considered to be a nonnegative integer adressing an element in `V`) is additionally connected to `v+c` and `v-c` (mod |V|).
+Given a list of generator numbers `C`, for each `c in C`, we can imagine that each node `v` (here considered to be a nonnegative integer adressing an element in `V`) is additionally connected to `v+c` and `v-c` (mod `|V|`).
 
 The choice of `C` is an interesting parameter. Right now we're just using the lowest 12 primes.
 
