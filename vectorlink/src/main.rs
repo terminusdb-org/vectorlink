@@ -185,7 +185,7 @@ enum Commands {
         domain: String,
         #[arg(short, long)]
         directory: String,
-        #[arg(short, long)]
+        #[arg(long)]
         take: Option<usize>,
         #[arg(short, long, default_value_t = 10000)]
         size: usize,

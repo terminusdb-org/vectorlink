@@ -1016,6 +1016,7 @@ impl<C: Comparator + 'static> Hnsw<C> {
                     search_parameters.number_of_candidates,
                     search_parameters,
                 );
+
                 last = pq.last().expect("should have at least retrieved self").1;
                 if last < threshold && pq.len() == pq.capacity() {
                     pq.resize_capacity(pq.capacity() * 2);

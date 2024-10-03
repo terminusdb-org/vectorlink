@@ -27,8 +27,8 @@ use urlencoding::encode;
 use crate::{
     comparator::{
         ArrayCentroidComparator, Centroid16Comparator, Centroid16Comparator1024,
-        Centroid8Comparator, Disk1024Comparator, DiskOpenAIComparator, OpenAIComparator,
-        Quantized16Comparator, Quantized16Comparator1024, Quantized8Comparator,
+        Centroid8Comparator, Disk1024Comparator, DiskOpenAIComparator, Memory1024Comparator,
+        OpenAIComparator, Quantized16Comparator, Quantized16Comparator1024, Quantized8Comparator,
     },
     configuration::HnswConfiguration,
     domain::Domain,
@@ -505,7 +505,7 @@ fn perform_indexing(
                 );
                 HnswConfiguration::Quantized1024By16(model, quantized_hnsw)
             } else {
-                let comparator = OpenAIComparator::new(
+                let comparator = Memory1024Comparator::new(
                     domain_obj.name().to_owned(),
                     Arc::new(domain_obj.all_vecs()?),
                 );
@@ -516,7 +516,7 @@ fn perform_indexing(
                     BuildParameters::default(),
                     &mut SimpleProgressMonitor::default(),
                 );
-                HnswConfiguration::UnquantizedOpenAi(model, hnsw)
+                HnswConfiguration::Unquantized1024(model, hnsw)
             };
             eprintln!("done generating hnsw");
             keepalive!(progress, hnsw.serialize(&staging_file))?;

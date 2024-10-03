@@ -380,7 +380,7 @@ impl Serializable for Memory1024Comparator {
         let mut contents = String::new();
         comparator_file.read_to_string(&mut contents)?;
         let ComparatorMeta { domain_name, .. } = serde_json::from_str(&contents)?;
-        let domain = store.get_domain_sized(&domain_name, EMBEDDING_BYTE_LENGTH)?;
+        let domain = store.get_domain_sized(&domain_name, EMBEDDING_BYTE_LENGTH_1024)?;
         Ok(Memory1024Comparator {
             domain_name,
             range: Arc::new(domain.all_vecs()?),
