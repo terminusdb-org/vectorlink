@@ -459,6 +459,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 HnswConfiguration::SmallQuantizedOpenAi8(_, _) => todo!(),
                 HnswConfiguration::SmallQuantizedOpenAi4(_, _) => todo!(),
                 HnswConfiguration::UnquantizedOpenAi(_, _) => todo!(),
+                HnswConfiguration::Unquantized1024(_, _) => todo!(),
                 HnswConfiguration::Quantized1024By16(_, q) => q.compare(v1, v2),
             };
             eprintln!("result: {res:?}");

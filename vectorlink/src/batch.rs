@@ -505,7 +505,18 @@ fn perform_indexing(
                 );
                 HnswConfiguration::Quantized1024By16(model, quantized_hnsw)
             } else {
-                panic!("No unquantized 1024 available");
+                let comparator = OpenAIComparator::new(
+                    domain_obj.name().to_owned(),
+                    Arc::new(domain_obj.all_vecs()?),
+                );
+                let vids: Vec<_> = (0..domain_obj.num_vecs()).map(VectorId).collect();
+                let hnsw = Hnsw::generate(
+                    comparator,
+                    vids,
+                    BuildParameters::default(),
+                    &mut SimpleProgressMonitor::default(),
+                );
+                HnswConfiguration::UnquantizedOpenAi(model, hnsw)
             };
             eprintln!("done generating hnsw");
             keepalive!(progress, hnsw.serialize(&staging_file))?;
@@ -656,8 +667,10 @@ mod tests {
 
     impl Comparator for MemoryOpenAIComparator {
         type T = Embedding;
-        type Borrowable<'a> = &'a Embedding
-        where Self: 'a;
+        type Borrowable<'a>
+            = &'a Embedding
+        where
+            Self: 'a;
         fn lookup(&self, v: VectorId) -> &Embedding {
             &self.vectors[v.0]
         }

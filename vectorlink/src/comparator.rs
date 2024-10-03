@@ -47,8 +47,10 @@ impl DiskOpenAIComparator {
 
 impl Comparator for DiskOpenAIComparator {
     type T = Embedding;
-    type Borrowable<'a> = Box<Embedding>
-        where Self: 'a;
+    type Borrowable<'a>
+        = Box<Embedding>
+    where
+        Self: 'a;
     fn lookup(&self, v: VectorId) -> Box<Embedding> {
         Box::new(self.vectors.vec(v.0).unwrap())
     }
@@ -158,8 +160,10 @@ impl Disk1024Comparator {
 
 impl Comparator for Disk1024Comparator {
     type T = Embedding1024;
-    type Borrowable<'a> = Box<Embedding1024>
-        where Self: 'a;
+    type Borrowable<'a>
+        = Box<Embedding1024>
+    where
+        Self: 'a;
     fn lookup(&self, v: VectorId) -> Box<Embedding1024> {
         Box::new(self.vectors.vec(v.0).unwrap())
     }
@@ -269,8 +273,10 @@ pub struct ComparatorMeta {
 
 impl Comparator for OpenAIComparator {
     type T = Embedding;
-    type Borrowable<'a> = &'a Embedding
-        where Self: 'a;
+    type Borrowable<'a>
+        = &'a Embedding
+    where
+        Self: 'a;
     fn lookup(&self, v: VectorId) -> &Embedding {
         &self.range[v.0]
     }
@@ -316,6 +322,73 @@ impl Serializable for OpenAIComparator {
         })
     }
 }
+
+/* Memory 1024 comparator */
+#[derive(Clone)]
+pub struct Memory1024Comparator {
+    domain_name: String,
+    range: Arc<LoadedSizedVectorRange<Embedding1024>>,
+}
+
+impl Memory1024Comparator {
+    pub fn new(domain_name: String, range: Arc<LoadedSizedVectorRange<Embedding1024>>) -> Self {
+        Self { domain_name, range }
+    }
+}
+
+impl Comparator for Memory1024Comparator {
+    type T = Embedding1024;
+    type Borrowable<'a>
+        = &'a Embedding1024
+    where
+        Self: 'a;
+    fn lookup(&self, v: VectorId) -> &Embedding1024 {
+        &self.range[v.0]
+    }
+
+    fn compare_raw(&self, v1: &Embedding1024, v2: &Embedding1024) -> f32 {
+        normalized_cosine_distance_1024(v1, v2)
+    }
+}
+
+impl Serializable for Memory1024Comparator {
+    type Params = Arc<VectorStore>;
+    fn serialize<P: AsRef<Path>>(&self, path: P) -> Result<(), SerializationError> {
+        let mut comparator_file: std::fs::File = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        eprintln!("opened comparator serialize file");
+        // How do we get this value?
+        let comparator = ComparatorMeta {
+            domain_name: self.domain_name.clone(),
+            size: self.range.len(),
+        };
+        let comparator_meta = serde_json::to_string(&comparator)?;
+        eprintln!("serialized comparator");
+        comparator_file.write_all(&comparator_meta.into_bytes())?;
+        eprintln!("wrote comparator to file");
+        Ok(())
+    }
+
+    fn deserialize<P: AsRef<Path>>(
+        path: P,
+        store: Arc<VectorStore>,
+    ) -> Result<Self, SerializationError> {
+        let mut comparator_file = OpenOptions::new().read(true).open(path)?;
+        let mut contents = String::new();
+        comparator_file.read_to_string(&mut contents)?;
+        let ComparatorMeta { domain_name, .. } = serde_json::from_str(&contents)?;
+        let domain = store.get_domain_sized(&domain_name, EMBEDDING_BYTE_LENGTH)?;
+        Ok(Memory1024Comparator {
+            domain_name,
+            range: Arc::new(domain.all_vecs()?),
+        })
+    }
+}
+
+/* End Memory comparator */
 
 struct MemoizedPartialDistances {
     partial_distances: Vec<bf16>,
@@ -593,7 +666,10 @@ impl<
 {
     type T = [f32; SIZE];
 
-    type Borrowable<'a> = &'a Self::T where QuantizedDistance: 'a;
+    type Borrowable<'a>
+        = &'a Self::T
+    where
+        QuantizedDistance: 'a;
 
     fn lookup(&self, v: VectorId) -> Self::Borrowable<'_> {
         &self.centroids[v.0]
