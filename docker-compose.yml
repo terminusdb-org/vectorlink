@@ -1,0 +1,59 @@
+# tdb-search self-contained stack.
+#
+# Complete, self-contained system on CPU, no external network dependency after a
+# one-time model download. **Embedding runs as part of the solution with a local 
+# endpoint** inside tdb-search (nomic-embed-text-v2-moe, F16) — no 
+# embedding sidecar by default.
+# Default = two services primarily, fastembed in the future: terminusdb + tdb-search.
+#
+# Override to a hosted embedding endpoint (OpenAI / OpenAI-compatible) via the
+# TDB_SEARCH_EMBED_* env vars; an Ollama/TEI sidecar can be added
+# but is not part of the default.
+
+services:
+  # TerminusDB — renders embedding text, pushes deltas to the indexer, fronts search.
+  terminusdb:
+    image: terminusdb/terminusdb-server:latest
+    pull_policy: missing
+    environment:
+      - TERMINUSDB_SERVER_PORT=6363
+      - "TERMINUSDB_ADMIN_PASS=${TERMINUSDB_ADMIN_PASS:-root}"
+    ports:
+      # Host 6363/6364 are commonly taken by an existing dev TerminusDB; use 6365.
+      - "127.0.0.1:6365:6363"
+    volumes:
+      - terminusdb-storage:/app/terminusdb/storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:6363/api/info || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  # tdb-search indexer — embeds in-process (fastembed F16); added once implemented (Phase 1+).
+  # tdb-search:
+  #   build: .
+  #   environment:
+  #     - TDB_SEARCH_ADMIN_USER=admin
+  #     - TDB_SEARCH_ADMIN_SECRET=${TDB_SEARCH_ADMIN_SECRET:-root}
+  #     - TDB_SEARCH_EMBED_PROVIDER=inprocess        # default; override: openai | openai_compatible | generic_http
+  #     - TDB_SEARCH_MODEL=nomic-ai/nomic-embed-text-v2-moe
+  #     - TDB_SEARCH_DIM=768
+  #     - FASTEMBED_CACHE_DIR=/models                # lazy first-use download cached here
+  #     # Hosted override example (unset by default):
+  #     # - TDB_SEARCH_EMBED_PROVIDER=openai_compatible
+  #     # - TDB_SEARCH_EMBED_URL=https://api.openai.com/v1
+  #     # - OPENAI_API_KEY=sk-...
+  #   ports: ["127.0.0.1:8081:8080"]
+  #   volumes:
+  #     - tdb-search-data:/data
+  #     - embed-models:/models                       # persist the in-process model across restarts
+  #   depends_on:
+  #     terminusdb: { condition: service_healthy }
+  #   restart: unless-stopped
+
+volumes:
+  terminusdb-storage:
+  embed-models: # in-process model cache (fastembed); persists the first-use download
+  # tdb-search-data:

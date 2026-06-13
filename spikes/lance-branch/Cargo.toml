@@ -1,0 +1,17 @@
+[package]
+name = "spike-lance-branch"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Phase-0 spike 0a-1 (RISK-01/02): lance 7.0 create_branch shares parent
+# fragments (block reuse) + branch isolation + fork-from-past + lancedb coexistence.
+
+[dependencies]
+lance = { workspace = true }
+lance-table = { workspace = true }
+lancedb = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
