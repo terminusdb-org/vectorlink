@@ -90,11 +90,11 @@ In normal operation TerminusDB performs steps 1–2 automatically; the `curl` ca
 
 ## HTTP API
 
-- **Indexing (push):** `GET /last-indexed`, `POST /push` (NDJSON operation stream, incremental), `GET /check` (poll a push task), `GET /assign` (point a commit at an existing index).
+- **Indexing (push):** `GET /last-indexed`, `POST /push` (NDJSON operation stream, incremental), `GET /check` (poll a push task), `POST /assign` (point a commit at an existing index — a mutation, so POST, not the reference's `GET`).
 - **Search:** `POST /search?mode=vector|fts|hybrid` (hybrid default; `doc_type`/`doc_id` filters), `GET /similar`, `GET /duplicates`.
 - **Ops:** `GET /statistics`.
 
-The reference's `GET /index` (pull-trigger + content-callback) is **removed** — TerminusDB owns the client-facing index trigger and pushes deltas instead. Full contract: [`specs/02-interface-contract.md`](../../projects/2026-06-terminusdb-vectorlink/specs/02-interface-contract.md) (the frozen `openapi.yaml` will live alongside this README once Phase 0.5 completes).
+Indexing is driven by push (`/last-indexed` + `/push`), not a pull trigger. The full contract is the OpenAPI document: [`openapi.yaml`](./openapi.yaml) — render it with `make docs`.
 
 ## Deployment & startup
 
@@ -108,4 +108,4 @@ The engine targets **fast cold-start for KEDA-style scale-from-zero**: a fresh p
 
 ## License
 
-Intended: Apache-2.0. (The `LICENSE` file lands with the first code in Phase 1.)
+Apache-2.0 (see `LICENSE`).

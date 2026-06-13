@@ -1,0 +1,867 @@
+openapi: 3.1.0
+
+# tdb-search — HTTP interface contract.
+#
+# A standalone semantic search engine. It is driven by push: a client asks
+# `/last-indexed`, then POSTs NDJSON text deltas to `/push`; the engine chunks,
+# embeds (with its own model), stores versioned snapshots, and answers vector /
+# full-text / hybrid search. It integrates with TerminusDB (which fronts and
+# authorises search and drives indexing), but runs and is testable on its own.
+#
+# Notes for readers:
+#  • Search staleness uses the `TerminusDB-Data-Version` header (value
+#    `commit:<hash>`): the response reports the data-version actually SERVED (the
+#    nearest indexed ancestor when the exact commit is not yet indexed); the
+#    caller may send the one it EXPECTS. "Stale" is simply requested != served,
+#    so the caller can compare against head and trigger indexing on mismatch.
+#  • The only per-request credential is the admin secret (HTTP Basic). The
+#    embedding provider key, if any, is the engine's own server-side config.
+#  • Liveness/readiness probes are the only unauthenticated endpoints, kept cheap
+#    so a fresh instance becomes serveable with minimal cold-start latency.
+
+info:
+  title: tdb-search
+  version: 0.1.0
+  description: >
+    Standalone semantic search engine — push-indexed, versioned per commit, with
+    vector, full-text, and hybrid search (hybrid is the default).
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+
+servers:
+  - url: http://localhost:8080
+    description: Default local bind ([::]:8080).
+
+tags:
+  - name: indexing
+    description: Push-driven indexing.
+  - name: search
+    description: Vector / full-text / hybrid search (hybrid is the default mode).
+  - name: ops
+    description: Statistics and health/readiness probes.
+
+# Admin secret on every functional endpoint; health probes are exempt (below).
+security:
+  - adminSecret: []
+
+paths:
+
+  # ───────────────────────────── indexing ──────────────────────────────────
+  /last-indexed:
+    get:
+      tags: [indexing]
+      operationId: getLastIndexed
+      summary: Report the last-indexed commit for a (domain, branch).
+      description: >
+        A client calls this to learn where the engine is up to, then computes the
+        delta `last → head` to push. Returns `commit: null` if the
+        (domain, branch) has never been indexed.
+      parameters:
+        - $ref: '#/components/parameters/Domain'
+        - $ref: '#/components/parameters/Branch'
+      responses:
+        '200':
+          description: The last-indexed commit (or null if none).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LastIndexed' }
+              examples:
+                indexed:   { value: { branch: main, commit: "abc123", version: 7 } }
+                unindexed: { value: { branch: main, commit: null, version: 0 } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /push:
+    post:
+      tags: [indexing]
+      operationId: pushDelta
+      summary: Ingest an NDJSON operation delta for a target commit (async).
+      description: >
+        Body is an NDJSON operation stream (one operation per line; see
+        OperationLine). Parsed and processed incrementally — never buffered whole.
+        The engine chunks each rendered string, embeds it, upserts/deletes chunk
+        rows, and on completion binds `target_commit` to the resulting snapshot.
+        Returns a task id to poll via `/check`. `parent_commit` comes from the
+        `/last-indexed` handshake.
+      parameters:
+        - $ref: '#/components/parameters/Domain'
+        - $ref: '#/components/parameters/Branch'
+        - name: target_commit
+          in: query
+          required: true
+          description: The commit this delta produces.
+          schema: { type: string }
+        - name: parent_commit
+          in: query
+          required: false
+          description: >
+            The commit the delta is computed from (the prior last-indexed).
+            Absent means the first index of this lineage (every doc is Inserted).
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            # The wire body is one OperationLine per line (newline-delimited),
+            # parsed incrementally. Modelled here as the item schema so the
+            # contract for each line is explicit and validatable.
+            schema:
+              $ref: '#/components/schemas/OperationLine'
+            examples:
+              delta:
+                value: |
+                  {"op":"Inserted","id":"terminusdb:///star-wars/People/20","string":"The person's name is Yoda. ..."}
+                  {"op":"Changed","id":"terminusdb:///star-wars/People/22","string":"The person's name is Boba Fett. ..."}
+                  {"op":"Deleted","id":"terminusdb:///star-wars/People/21"}
+                  {"op":"Error","message":"Failed to render terminusdb:///star-wars/People/99"}
+      responses:
+        '200':
+          description: Push accepted; indexing runs asynchronously. Poll `/check`.
+          content:
+            text/plain:
+              schema: { type: string, description: Opaque task id. }
+              examples: { taskId: { value: "task-7f3a9c" } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: A push for this (domain, branch) is already in progress (concurrency guard).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /check:
+    get:
+      tags: [indexing]
+      operationId: checkTask
+      summary: Poll the status of a push/index task.
+      parameters:
+        - name: task_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Task status (Pending or Complete).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/TaskPending'
+                  - $ref: '#/components/schemas/TaskComplete'
+              examples:
+                pending:  { value: { status: Pending, percentage: 42.5 } }
+                complete: { value: { status: Complete, indexed_documents: 1284, skipped: [] } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Unknown task id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: >
+            The task failed (systemic error). Body is the error message; the
+            failure is never masked as success.
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /assign:
+    post:
+      tags: [indexing]
+      operationId: assignCommit
+      summary: Point a target commit at a source commit's index (no recompute).
+      description: >
+        Binds `target_commit` to the existing snapshot of `source_commit` — used
+        when a new commit changes nothing indexable. No embedding, no data
+        movement. This mutates state (it creates a commit→snapshot binding), so it
+        is POST. Idempotent: re-assigning the same pair is a no-op.
+      parameters:
+        - $ref: '#/components/parameters/Domain'
+        - name: source_commit
+          in: query
+          required: true
+          schema: { type: string }
+        - name: target_commit
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: Assigned. }
+        '400':
+          description: Bad request (e.g. unknown source commit).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ───────────────────────────── search ────────────────────────────────────
+  /search:
+    get:
+      tags: [search]
+      operationId: searchGet
+      summary: Semantic / full-text / hybrid search via query string (hybrid default).
+      description: >
+        Read-only, cacheable search. The query text is the `q` parameter. Use this
+        for simple, link-safe, cacheable searches; use POST for a structured JSON
+        request (long queries, programmatic composition). `doc_type`/`doc_id` are
+        repeated params (e.g. `?doc_type=A&doc_type=B`), AND-ed across the two
+        sets, OR within each. Results paginate with `start` (default 0) and
+        `count` (default 50). Staleness is reported via the `TerminusDB-Data-Version`
+        response header.
+      parameters:
+        - $ref: '#/components/parameters/Domain'
+        - $ref: '#/components/parameters/Commit'
+        - name: q
+          in: query
+          required: true
+          description: The query text (required on GET).
+          schema: { type: string }
+          example: "Wise old man"
+        - $ref: '#/components/parameters/Start'
+        - $ref: '#/components/parameters/Count'
+        - $ref: '#/components/parameters/Mode'
+        - $ref: '#/components/parameters/DocType'
+        - $ref: '#/components/parameters/DocId'
+        - $ref: '#/components/parameters/Snippet'
+        - $ref: '#/components/parameters/ExpectedDataVersion'
+      responses:
+        '200': { $ref: '#/components/responses/SearchOk' }
+        '400': { $ref: '#/components/responses/SearchBadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NoIndexedLineage' }
+        '409': { $ref: '#/components/responses/DimensionMismatch' }
+        '503': { $ref: '#/components/responses/EmbeddingBackendUnavailable' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
+    post:
+      tags: [search]
+      operationId: search
+      summary: Semantic / full-text / hybrid search via JSON body (hybrid default).
+      description: >
+        Structured search. The JSON body carries the query and all parameters. In
+        `hybrid` (default) the same query text is embedded for the vector side and
+        used as full-text terms; results dedup to documents (best chunk per
+        document).
+
+
+        Parameter source & precedence: every parameter may be given EITHER as a
+        query parameter OR in the JSON body. The JSON body takes precedence — if a
+        field is present in the body, the same-named query parameter is discarded
+        (not merged). This lets a caller set defaults in the URL and override them
+        in the body. `domain`, `commit` and `q` must be present in the body OR the
+        query — absent in both gives 400. Results paginate with `start` (default
+        0) and `count` (default 50). Staleness is reported via the
+        `TerminusDB-Data-Version` response header — the response body stays the
+        bare array.
+
+
+        Every query parameter below is optional at the query layer on POST,
+        because the JSON body may supply it (and wins).
+      parameters:
+        - name: domain
+          in: query
+          required: false
+          description: Optional on POST — body `domain` wins (see SearchRequest).
+          schema: { type: string }
+        - name: commit
+          in: query
+          required: false
+          description: Optional on POST — body `commit` wins (see SearchRequest).
+          schema: { type: string }
+        - $ref: '#/components/parameters/Q'
+        - $ref: '#/components/parameters/Start'
+        - $ref: '#/components/parameters/Count'
+        - $ref: '#/components/parameters/Mode'
+        - $ref: '#/components/parameters/DocType'
+        - $ref: '#/components/parameters/DocId'
+        - $ref: '#/components/parameters/Snippet'
+        - $ref: '#/components/parameters/ExpectedDataVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SearchRequest' }
+            examples:
+              minimal:
+                value: { domain: "admin/star_wars", commit: "abc123", q: "Wise old man" }
+              filtered:
+                value:
+                  domain: "admin/star_wars"
+                  commit: "abc123"
+                  q: "Wise old man"
+                  mode: hybrid
+                  start: 0
+                  count: 20
+                  doc_type: ["People"]
+                  doc_id: ["terminusdb:///star-wars/People/20"]
+      responses:
+        '200': { $ref: '#/components/responses/SearchOk' }
+        '400': { $ref: '#/components/responses/SearchBadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NoIndexedLineage' }
+        '409': { $ref: '#/components/responses/DimensionMismatch' }
+        '503': { $ref: '#/components/responses/EmbeddingBackendUnavailable' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
+
+  /similar:
+    get:
+      tags: [search]
+      operationId: similar
+      summary: Documents similar to a known indexed document.
+      description: >
+        Looks up the document's vector(s) by id, then runs a vector search. Same
+        response shape and staleness header as `/search`; paginates with `start`
+        and `count`.
+      parameters:
+        - $ref: '#/components/parameters/Domain'
+        - $ref: '#/components/parameters/Commit'
+        - name: id
+          in: query
+          required: true
+          description: Full document IRI to find neighbours of.
+          schema: { type: string }
+        - $ref: '#/components/parameters/Start'
+        - $ref: '#/components/parameters/Count'
+        - $ref: '#/components/parameters/DocType'
+        - $ref: '#/components/parameters/Snippet'
+        - $ref: '#/components/parameters/ExpectedDataVersion'
+      responses:
+        '200':
+          description: Ranked neighbours (same shape/header as /search).
+          headers:
+            TerminusDB-Data-Version: { $ref: '#/components/headers/DataVersion' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResults' }
+        '400':
+          description: The id is not present in the index, or a param is invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NoIndexedLineage' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
+
+  /duplicates:
+    get:
+      tags: [search]
+      operationId: duplicates
+      summary: Corpus-wide near-duplicate candidate pairs (bounded).
+      description: >
+        For each indexed point, find its nearest neighbour; pairs with distance
+        below `threshold` are returned (lower id first). Bounded by `threshold`, a
+        candidate cap, and pagination — never an unbounded all-pairs scan. If a
+        safe bounded implementation is unavailable, returns 501 rather than a scan
+        that does not scale.
+      parameters:
+        - $ref: '#/components/parameters/Domain'
+        - $ref: '#/components/parameters/Commit'
+        - name: threshold
+          in: query
+          required: false
+          description: Max distance for a pair to count as a near-duplicate.
+          schema: { type: number, format: float, default: 0.0 }
+        - $ref: '#/components/parameters/Start'
+        - $ref: '#/components/parameters/Count'
+      responses:
+        '200':
+          description: Array of [id1, id2] pairs (lower id first).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DuplicatePairs' }
+              examples:
+                pairs:
+                  value:
+                    - ["terminusdb:///star-wars/People/10", "terminusdb:///star-wars/People/57"]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NoIndexedLineage' }
+        '501':
+          description: Bounded duplicates unavailable — never an unbounded scan.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ───────────────────────────── ops ───────────────────────────────────────
+  /statistics:
+    get:
+      tags: [ops]
+      operationId: statistics
+      summary: Engine statistics.
+      description: >
+        Operational counters across all indexed data. Counters are
+        best-effort/advisory (may be approximate under concurrency).
+      responses:
+        '200':
+          description: Statistics.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Statistics' }
+              examples:
+                stats:
+                  value:
+                    domains: 3
+                    branches: 9
+                    indexed_commits: 412
+                    documents: 18044
+                    chunks: 51234
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /health/live:
+    get:
+      tags: [ops]
+      operationId: healthLive
+      summary: Liveness probe (process up). Unauthenticated, answers immediately.
+      description: >
+        Near-instant; does no heavy work (no model load, no dataset open, no
+        index scan), so a fresh instance is probeable immediately. Exempt from the
+        admin secret so an orchestrator can probe an instance scaling from zero.
+      security: []
+      responses:
+        '200':
+          description: Process is alive.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Liveness' }
+              examples: { up: { value: { status: "ok" } } }
+
+  /health/ready:
+    get:
+      tags: [ops]
+      operationId: healthReady
+      summary: Readiness probe (per-capability). Unauthenticated.
+      description: >
+        Per-capability readiness so an orchestrator can scale/route on the right
+        signal: `index` (store reachable) and `search` (store + embedding backend
+        warm) are reported separately. An instance can be ready-to-index before it
+        is ready-to-search, and never claims search-ready while the embedding
+        backend is cold (which is why /search returns 503 in that window). Exempt
+        from the admin secret.
+      security: []
+      responses:
+        '200':
+          description: At least process + store are ready; see per-capability flags.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+              examples:
+                bothReady: { value: { ready: true, index: true, search: true } }
+                indexOnly: { value: { ready: true, index: true, search: false } }
+        '503':
+          description: Not yet ready to serve (e.g. store not open).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+              examples:
+                notReady: { value: { ready: false, index: false, search: false } }
+
+components:
+
+  securitySchemes:
+    adminSecret:
+      type: http
+      scheme: basic
+      description: >
+        Shared admin secret (HTTP Basic). Authentication only — no RBAC; the
+        engine is a trusted component on a private network. Checked on every
+        functional endpoint with a constant-time comparison; missing/wrong gives
+        401. The only per-request credential; the embedding provider key, if any,
+        is the engine's own server-side configuration.
+
+  parameters:
+    Domain:
+      name: domain
+      in: query
+      required: true
+      description: >
+        The database to address, as a graphspec. The repository segment is always
+        part of the address and defaults to `local`:
+          • `org/db`                          → `org/db/local/branch/main`
+          • `org/db/<repo>`                   → `org/db/<repo>/branch/main`
+          • `org/db/<repo>/branch/<branch>`   → that branch
+          • `org/db/<repo>/commit/<commit>`   → that snapshot, directly
+        A branch is resolved to a concrete commit by the caller (TerminusDB owns
+        branch heads); the searched snapshot is always explicit (`commit`), never
+        an implicit "latest".
+      schema: { type: string }
+      example: admin/star_wars
+    Branch:
+      name: branch
+      in: query
+      required: true
+      description: Branch name.
+      schema: { type: string, default: main }
+    Commit:
+      name: commit
+      in: query
+      required: true
+      description: Opaque commit hash; the searched snapshot.
+      schema: { type: string }
+    Q:
+      name: q
+      in: query
+      required: false
+      description: >
+        The query text. On POST the JSON body `q` takes precedence over this query
+        parameter. (GET /search defines its own required `q`.)
+      schema: { type: string }
+      example: "Wise old man"
+    Start:
+      name: start
+      in: query
+      required: false
+      description: Zero-based offset of the first result to return (pagination).
+      schema: { type: integer, minimum: 0, default: 0 }
+    Count:
+      name: count
+      in: query
+      required: false
+      description: Max results to return (pagination page size).
+      schema: { type: integer, minimum: 1, default: 50 }
+    Mode:
+      name: mode
+      in: query
+      required: false
+      description: Search mode. Omitted gives hybrid.
+      schema:
+        type: string
+        enum: [vector, fts, hybrid]
+        default: hybrid
+    Snippet:
+      name: snippet
+      in: query
+      required: false
+      description: >
+        When true, include the matched chunk's text as `chunk.snippet` in each
+        hit. Omitted/false keeps responses small (chunk index/count/location are
+        always returned regardless).
+      schema: { type: boolean, default: false }
+    DocType:
+      name: doc_type
+      in: query
+      required: false
+      description: >
+        Restrict to these document types (doc_type IN (...)). Stated by repeating
+        the parameter — `?doc_type=People&doc_type=Species` — not as a comma-joined
+        string. (On POST, prefer the JSON `doc_type` array.)
+      schema:
+        type: array
+        items: { type: string }
+      style: form
+      explode: true
+    DocId:
+      name: doc_id
+      in: query
+      required: false
+      description: >
+        Restrict to these full document IRIs (doc_id IN (...)). Stated by repeating
+        the parameter — `?doc_id=...&doc_id=...` — not comma-joined. (On POST,
+        prefer the JSON `doc_id` array.)
+      schema:
+        type: array
+        items: { type: string }
+      style: form
+      explode: true
+    ExpectedDataVersion:
+      name: TerminusDB-Data-Version
+      in: header
+      required: false
+      description: >
+        The data-version the caller expects, in `label:value` form (e.g.
+        `commit:<hash>`). Advisory: the response always reports the data-version
+        actually served via the same header, so a caller can compare to detect
+        staleness and trigger indexing. Malformed value gives 400.
+      schema: { type: string, pattern: '^[^:]{4,}:[^:]{4,}$' }
+      example: "commit:abc123def456"
+
+  headers:
+    DataVersion:
+      description: >
+        The data-version actually served, in `label:value` form (e.g.
+        `commit:<hash>`). Under lag this is the nearest indexed ancestor, so a
+        caller comparing it to the requested commit detects staleness.
+      schema: { type: string, pattern: '^[^:]{4,}:[^:]{4,}$' }
+      example: "commit:abc123def456"
+
+  responses:
+    BadRequest:
+      description: Missing/invalid parameter (the body names which).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    SearchOk:
+      description: >
+        Ranked results, nearest first. The `TerminusDB-Data-Version` response
+        header reports the commit actually served (the nearest indexed ancestor
+        under lag); if it differs from the requested commit, the result is stale.
+        An empty array means genuinely no match — never an error.
+      headers:
+        TerminusDB-Data-Version: { $ref: '#/components/headers/DataVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SearchResults' }
+          examples:
+            hits:
+              value:
+                - id: "terminusdb:///star-wars/People/20"
+                  distance: 0.0939
+                  chunk: { index: 0, count: 1, location: 0.0 }
+                - id: "terminusdb:///star-wars/Species/8"
+                  distance: 0.1421
+                  chunk: { index: 3, count: 12, location: 0.27 }
+            hitsWithSnippet:
+              summary: With snippet=true
+              value:
+                - id: "terminusdb:///star-wars/People/20"
+                  distance: 0.0939
+                  chunk: { index: 0, count: 1, location: 0.0, snippet: "The person's name is Yoda. A wise old Jedi master ..." }
+    SearchBadRequest:
+      description: >
+        Invalid or missing search parameter — missing domain/commit/q (in both
+        body and query), invalid mode/start/count/doc_type, or a malformed
+        TerminusDB-Data-Version. The body names which.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    DimensionMismatch:
+      description: Query embedding dimension does not match the index — fail loud, never zero-pad.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Missing or wrong admin secret.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NoIndexedLineage:
+      description: The branch has no indexed ancestor at all.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    EmbeddingBackendUnavailable:
+      description: >
+        The embedding backend is cold/unreachable, so search cannot embed the
+        query. Never a blocking wait, never a masked empty result. Retry after
+        warm-up.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    UpstreamError:
+      description: >
+        A systemic error with detail in the body (embedding provider non-2xx,
+        store read failure). Never an empty result masking an error.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      additionalProperties: true
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable cause (never a bare 500 with no detail).
+      example: { error: "missing required query parameter: domain" }
+
+    LastIndexed:
+      type: object
+      required: [branch, commit, version]
+      properties:
+        branch:  { type: string }
+        commit:  { type: [string, "null"], description: "Last-indexed commit, or null if none." }
+        version: { type: integer, description: "Opaque monotonic index version for that commit (0 if none)." }
+
+    OperationLine:
+      description: One NDJSON line of a /push body. Tagged by `op`.
+      oneOf:
+        - $ref: '#/components/schemas/OpInserted'
+        - $ref: '#/components/schemas/OpChanged'
+        - $ref: '#/components/schemas/OpDeleted'
+        - $ref: '#/components/schemas/OpError'
+      discriminator:
+        propertyName: op
+        mapping:
+          Inserted: '#/components/schemas/OpInserted'
+          Changed:  '#/components/schemas/OpChanged'
+          Deleted:  '#/components/schemas/OpDeleted'
+          Error:    '#/components/schemas/OpError'
+    OpInserted:
+      type: object
+      required: [op, id, string]
+      properties:
+        op:     { type: string, const: Inserted }
+        id:     { type: string, description: Full document IRI. }
+        string: { type: string, description: "Rendered text to embed (chunked if it exceeds the model window)." }
+    OpChanged:
+      type: object
+      required: [op, id, string]
+      properties:
+        op:     { type: string, const: Changed }
+        id:     { type: string }
+        string: { type: string, description: "New text; replaces the document's full chunk set." }
+    OpDeleted:
+      type: object
+      required: [op, id]
+      properties:
+        op: { type: string, const: Deleted }
+        id: { type: string, description: "Removes all chunk rows for this id." }
+    OpError:
+      type: object
+      required: [op, message]
+      properties:
+        op:      { type: string, const: Error }
+        message: { type: string, description: "Upstream per-doc render failure; skipped and recorded, never silently dropped." }
+
+    TaskPending:
+      type: object
+      required: [status, percentage]
+      properties:
+        status:     { type: string, const: Pending }
+        percentage: { type: number, format: float, minimum: 0, maximum: 100 }
+    TaskComplete:
+      type: object
+      required: [status, indexed_documents]
+      properties:
+        status:            { type: string, const: Complete }
+        indexed_documents: { type: integer }
+        skipped:
+          type: array
+          description: "Per-doc errors skipped during this push — visible, never silent."
+          items:
+            type: object
+            required: [id, message]
+            properties:
+              id:      { type: string }
+              message: { type: string }
+
+    SearchHit:
+      type: object
+      required: [id, distance, chunk]
+      properties:
+        id: { type: string, description: "Document IRI. Results always dedup to one hit per document; chunk ids are never separate result rows." }
+        distance:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: "Normalised cosine distance: 0 identical, 0.5 unrelated, 1 opposite. Smaller is closer. This is the distance of the document's BEST-matching chunk."
+        chunk:
+          type: object
+          description: >
+            Which part of the document matched. The document's score is its
+            best-matching chunk; this object locates that chunk so a caller can
+            jump to the relevant passage.
+          required: [index, count, location]
+          properties:
+            index:
+              type: integer
+              minimum: 0
+              description: 0-based index of the best-matching chunk within the document.
+            count:
+              type: integer
+              minimum: 1
+              description: Total number of chunks the document was split into (1 if it fit in a single chunk).
+            location:
+              type: number
+              format: float
+              minimum: 0
+              maximum: 1
+              description: >
+                Approximate fractional position of the matched chunk's start within
+                the document — 0.0 = very beginning, 1.0 = very end. Multiply by 100
+                for a percentage. Derived from token offsets, so it accounts for
+                chunk overlap; it is approximate, not a character index.
+            snippet:
+              type: string
+              description: >
+                The matched chunk's text. Present only when `snippet=true` is
+                requested (omitted by default to keep responses small).
+    SearchResults:
+      type: array
+      description: Ranked nearest-first; empty array means genuinely no match (never an error).
+      items: { $ref: '#/components/schemas/SearchHit' }
+
+    SearchRequest:
+      type: object
+      description: >
+        POST /search body. Every field may also be supplied as a query parameter;
+        when a field is present here it wins and the same-named query parameter is
+        discarded (not merged). `domain`, `commit` and `q` must be present here or
+        in the query.
+      properties:
+        domain:
+          type: string
+          description: >
+            The database to address as a graphspec; repo defaults to `local`
+            (e.g. `org/db` → `org/db/local/branch/main`). See the Domain parameter.
+          example: admin/star_wars
+        commit:
+          type: string
+          description: Opaque commit hash — the searched snapshot.
+        q:
+          type: string
+          description: Query text (embedded for vector; full-text terms for fts/hybrid).
+          example: "Wise old man"
+        mode:
+          type: string
+          enum: [vector, fts, hybrid]
+          default: hybrid
+        start:
+          type: integer
+          minimum: 0
+          default: 0
+          description: Zero-based offset of the first result to return (pagination).
+        count:
+          type: integer
+          minimum: 1
+          default: 50
+          description: Max results to return (pagination page size).
+        doc_type:
+          type: array
+          items: { type: string }
+          description: Restrict to these document types (IN).
+        doc_id:
+          type: array
+          items: { type: string }
+          description: Restrict to these full document IRIs (IN).
+        snippet:
+          type: boolean
+          default: false
+          description: Include the matched chunk's text as `chunk.snippet` in each hit.
+
+    DuplicatePairs:
+      type: array
+      items:
+        type: array
+        minItems: 2
+        maxItems: 2
+        items: { type: string }
+
+    Statistics:
+      type: object
+      required: [domains, branches, indexed_commits, documents, chunks]
+      properties:
+        domains:         { type: integer, description: Databases with at least one index. }
+        branches:        { type: integer, description: Distinct branches across all domains. }
+        indexed_commits: { type: integer, description: Searchable commits (snapshots). }
+        documents:       { type: integer, description: Distinct documents currently indexed. }
+        chunks:          { type: integer, description: Total chunk rows across active snapshots. }
+
+    Liveness:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, const: ok }
+
+    Readiness:
+      type: object
+      required: [ready, index, search]
+      properties:
+        ready:  { type: boolean, description: Coarse flag — true if any capability is serveable. }
+        index:  { type: boolean, description: Store reachable → can accept /push. }
+        search: { type: boolean, description: Store + embedding backend warm → can serve /search. }
