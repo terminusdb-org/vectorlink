@@ -222,6 +222,11 @@ pub struct Statistics {
     pub indexed_commits: u64,
     pub documents: u64,
     pub chunks: u64,
+    /// Number of data fragments not yet covered by the vector ANN index.
+    /// Reflects the indexing backlog — higher values mean more fragments are
+    /// being flat-scanned (correct but slower). Returns to 0 after
+    /// `optimize_indices(append())` drains the queue.
+    pub pending_index_fragments: u64,
 }
 
 /// Duplicate pair.

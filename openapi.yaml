@@ -404,6 +404,7 @@ paths:
                     indexed_commits: 412
                     documents: 18044
                     chunks: 51234
+                    pending_index_fragments: 0
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /health/live:
@@ -857,13 +858,21 @@ components:
 
     Statistics:
       type: object
-      required: [domains, branches, indexed_commits, documents, chunks]
+      required: [domains, branches, indexed_commits, documents, chunks, pending_index_fragments]
       properties:
         domains:         { type: integer, description: Databases with at least one index. }
         branches:        { type: integer, description: Distinct branches across all domains. }
         indexed_commits: { type: integer, description: Searchable commits (snapshots). }
         documents:       { type: integer, description: Distinct documents currently indexed. }
         chunks:          { type: integer, description: Total chunk rows across active snapshots. }
+        pending_index_fragments:
+          type: integer
+          description: >-
+            Number of data fragments not yet covered by the vector ANN index.
+            Reflects the indexing backlog — higher values mean more data is being
+            flat-scanned alongside the index (correct results, higher latency).
+            Returns to 0 after the indexing queue drains.
+          example: 0
 
     Liveness:
       type: object

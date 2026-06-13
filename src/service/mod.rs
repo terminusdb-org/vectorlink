@@ -44,7 +44,11 @@ impl std::fmt::Debug for SearchService {
 }
 
 impl SearchService {
-    pub fn new(store: Arc<LanceStore>, config: Config, tokenizer: Tokenizer) -> Self {
+    pub fn new(
+        store: Arc<LanceStore>,
+        config: Config,
+        tokenizer: Tokenizer,
+    ) -> Self {
         let prefix = match embed::prefixes_for_model(config.embed_provider.model_name()) {
             Some(p) => embed::prefix_for_role(&p, EmbeddingRole::Document).to_owned(),
             None => String::new(),
@@ -508,16 +512,36 @@ struct PipelineCtx<'a> {
     branch: &'a str,
 }
 
-/// Run the full indexing pipeline for a set of operations.
+/// Run the push pipeline for a set of operations.
 /// Returns (indexed_count, skipped_docs) on success, or error message on failure.
-/// Serialised per-(domain, branch) to prevent concurrent pushes from corrupting
-/// commit→version isolation.
+///
+/// Pipeline ordering (solves BLOCKER-1 by construction):
+///   1. Acquire per-(domain, branch) pipeline lock
+///   2. Upsert chunks → version N (data written)
+///   3. Optimize indices (FTS + vector ANN) → version N+K (indices built)
+///      - Uses an UNCACHED dataset handle so searches on other branches aren't blocked
+///   4. Tag commit → version N+K (commit becomes searchable with full index coverage)
+///   5. Update last-indexed tracking
+///   6. Release pipeline lock
+///
+/// A commit is NOT resolvable until step 4 completes — `io_search` returns
+/// "commit not indexed" (404) for uncommitted work. This is correct + fail-loud
+/// (Phase 3 upgrades to graceful nearest-ancestor fallback).
+///
+/// Serialised per-(domain, branch): at most ONE unindexed commit per branch at
+/// any time. The pipeline lock prevents a second push from starting until the
+/// current commit is fully indexed and tagged.
+///
+/// Latency is decoupled from the HTTP handler: this runs in a tokio::spawn'd
+/// background task. The HTTP /push endpoint returns the task_id immediately.
 async fn io_run_index_pipeline(
     ctx: &PipelineCtx<'_>,
     commit: &str,
     operations: Vec<Operation>,
 ) -> Result<(u64, Vec<SkippedDoc>), String> {
-    // Acquire the per-branch lock. Held for the entire upsert→tag critical section.
+    // Acquire the per-branch lock. Held for the entire upsert→optimize→tag sequence.
+    // This ensures at most one unindexed commit per branch and prevents snapshot
+    // isolation violations (a later commit's data cannot leak into an earlier tag).
     let _guard = ctx.store.acquire_pipeline_lock(ctx.domain, ctx.branch).await;
 
     let mut indexed_count: u64 = 0;
@@ -563,34 +587,71 @@ async fn io_run_index_pipeline(
         }
     }
 
-    // Tag the commit to the final version (only if we have any data).
-    // Order matters: FTS index creation produces a new version, so we must
-    // create the index FIRST, then tag the commit to the version that includes
-    // both data and the FTS index.
+    // Step 3: Optimize indices on an UNCACHED handle (Fix #2: doesn't block searches).
+    // FTS + vector ANN are built incrementally via optimize_indices(append()) — O(delta).
+    // This runs BEFORE tagging so the tagged version has full index coverage (BLOCKER-1 fix).
     if last_version > 0 {
-        // Ensure FTS index exists — this may produce a new version.
-        let fts_version = ctx
-            .store
-            .io_ensure_fts_index(ctx.domain, ctx.branch)
+        let indexed_version = io_optimize_on_uncached_handle(ctx.store, ctx.domain, ctx.branch)
             .await
-            .map_err(|e| format!("FTS index creation failed: {}", e))?;
+            .map_err(|e| format!("index optimization failed: {}", e))?;
 
-        // Tag the commit to the version that includes the FTS index.
-        let tag_version = if fts_version > 0 { fts_version } else { last_version };
+        // Step 4: Tag the commit to the INDEXED version (data + indices).
+        // After this point, the commit is resolvable and fully searchable.
+        let tag_version = indexed_version.unwrap_or(last_version);
         ctx.store
             .io_tag_commit(ctx.domain, ctx.branch, commit, tag_version)
             .await
             .map_err(|e| format!("failed to tag commit: {}", e))?;
 
-        last_version = tag_version;
+        // Step 5: Update last-indexed tracking.
+        ctx.store
+            .update_last_indexed(ctx.domain, ctx.branch, commit, tag_version)
+            .await;
     }
 
-    // Update last-indexed tracking.
-    ctx.store
-        .update_last_indexed(ctx.domain, ctx.branch, commit, last_version)
-        .await;
-
     Ok((indexed_count, skipped))
+}
+
+/// Optimize FTS + vector indices on an uncached dataset handle.
+/// Returns the version after optimization, or None if the dataset doesn't exist yet.
+///
+/// Uses `io_open_dataset_uncached` so the write operations don't hold the shared
+/// `Arc<RwLock<Dataset>>` and block concurrent search reads (Fix #2).
+/// After optimization, refreshes the cached handle.
+async fn io_optimize_on_uncached_handle(
+    store: &LanceStore,
+    domain: &str,
+    branch: &str,
+) -> Result<Option<u64>, String> {
+    let ds = store
+        .io_open_dataset_uncached(domain, branch)
+        .await
+        .map_err(|e| format!("uncached open failed: {}", e))?;
+
+    let mut ds = match ds {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+
+    // FTS: create inverted index or incrementally append new fragments.
+    crate::store::lance::io_ensure_fts_index_on_dataset(&mut ds)
+        .await
+        .map_err(|e| format!("FTS optimize failed: {}", e))?;
+
+    // Vector ANN: create IVF_PQ index (if enough rows) or incrementally append.
+    crate::store::vector_index::io_ensure_vector_index(&mut ds, store.vector_index_config())
+        .await
+        .map_err(|e| format!("vector optimize failed: {}", e))?;
+
+    let final_version = ds.version().version;
+
+    // Refresh the cached handle so subsequent reads see the optimized indices.
+    store
+        .io_refresh_cached_dataset(domain, branch)
+        .await
+        .map_err(|e| format!("cache refresh failed: {}", e))?;
+
+    Ok(Some(final_version))
 }
 
 /// Index a single document: chunk → embed → upsert.

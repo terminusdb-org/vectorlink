@@ -393,6 +393,69 @@ describe("Indexing pipeline (real embeddings)", function () {
     })
   })
 
+  describe("BLOCKER-1: FTS completeness at own commit (queue/worker decoupling gap)", function () {
+    // This test documents BLOCKER-1: with async indexing, FTS/hybrid searches
+    // at a commit's own version don't find the newly-pushed docs because:
+    // 1. The commit is tagged to the data-only version (no FTS index yet)
+    // 2. Lance FTS requires the INVERTED index to exist (no flat-scan fallback)
+    // 3. The background worker builds the index later at a higher version
+    // 4. The tag is immutable — it never gains FTS coverage of its own docs
+    //
+    // This test MUST FAIL until BLOCKER-1 is resolved (option A or B).
+    // When the fix is implemented, this test should pass.
+
+    it("FTS finds just-pushed docs at their own commit (currently failing — BLOCKER-1)", async function () {
+      // Use a fresh commit (c_blocker1) to isolate from other tests.
+      const operations = [
+        { op: "Inserted", id: "terminusdb:///itest/Blocker/quux", string: "The planet Zygerria is known for its slave trade and ancient architecture." },
+      ]
+
+      const result = await pushAndWait(DOMAIN, BRANCH, "c_blocker1", operations)
+      expect(result.status).to.equal("Complete")
+      expect(result.indexed_documents).to.equal(1)
+
+      // FTS search at the just-pushed commit should find the doc.
+      // BLOCKER-1: this currently returns empty because the INVERTED index
+      // doesn't exist at the tagged version.
+      const res = await agent()
+        .get("/search")
+        .query({
+          domain: DOMAIN,
+          commit: "c_blocker1",
+          q: "Zygerria",
+          mode: "fts",
+        })
+        .set("Authorization", authHeader())
+        .expect(200)
+
+      expect(res.body).to.be.an("array")
+      expect(res.body.length).to.be.at.least(1, "BLOCKER-1: FTS must find just-pushed docs at their own commit")
+      expect(res.body[0].id).to.equal("terminusdb:///itest/Blocker/quux")
+    })
+
+    it("hybrid finds just-pushed docs at their own commit (currently failing — BLOCKER-1)", async function () {
+      // Hybrid = vector + FTS fusion. If FTS is broken, hybrid degrades to vector-only.
+      // The doc should still be findable via vector, but we specifically test that
+      // the hybrid result includes the FTS-matchable term.
+      const res = await agent()
+        .get("/search")
+        .query({
+          domain: DOMAIN,
+          commit: "c_blocker1",
+          q: "Zygerria slave trade",
+          mode: "hybrid",
+        })
+        .set("Authorization", authHeader())
+        .expect(200)
+
+      expect(res.body).to.be.an("array")
+      expect(res.body.length).to.be.at.least(1, "BLOCKER-1: hybrid must find just-pushed docs")
+      // The Zygerria doc should be in results (via vector at minimum).
+      const found = res.body.some(h => h.id === "terminusdb:///itest/Blocker/quux")
+      expect(found).to.equal(true, "BLOCKER-1: hybrid should include the just-pushed doc")
+    })
+  })
+
   describe("GET /statistics reflects indexed data", function () {
     it("shows non-zero counts after indexing", async function () {
       const res = await agent()

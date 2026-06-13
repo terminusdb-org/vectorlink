@@ -19,6 +19,7 @@ use futures::TryStreamExt;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_index::IndexType;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
 use lance_linalg::distance::DistanceType;
 use tokio::sync::RwLock;
@@ -28,6 +29,86 @@ use crate::kernel::model::{
     BranchName, ChunkInfo, Domain, LastIndexed, SearchHit, SearchMode, Statistics, TaskStatus,
 };
 use crate::layeridx::{self, BranchIndex};
+
+/// Configuration for the vector ANN index (IVF_PQ).
+/// Parameters are pinned as constants — changing them perturbs ranking
+/// and should be treated like a model version bump.
+#[derive(Debug, Clone)]
+pub struct VectorIndexConfig {
+    /// Number of IVF partitions. More partitions = faster search at the cost of
+    /// index build time and recall. Recommended: sqrt(n) for corpus size n.
+    pub num_partitions: usize,
+    /// Number of PQ sub-vectors. Must divide the embedding dimension evenly.
+    pub num_sub_vectors: usize,
+    /// Number of probes during search (how many partitions to scan).
+    /// Higher = better recall, slower search.
+    pub nprobes: usize,
+    /// Refine factor: re-rank this many candidates with full-precision vectors.
+    /// Higher = better recall at the cost of latency. None = no refinement.
+    pub refine_factor: Option<u32>,
+}
+
+impl VectorIndexConfig {
+    /// Sane defaults for a given embedding dimension.
+    /// These are pinned — treat changes as a model bump.
+    ///
+    /// INVARIANT: `num_sub_vectors` always divides `dim` evenly (PQ requirement).
+    /// If `dim` is not evenly divisible by the target sub-vector count, we find
+    /// the largest divisor of `dim` that is <= the target. This guarantees the
+    /// index build never fails due to dimension/sub-vector mismatch.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dim == 0`. This is called at service startup; a zero-dim
+    /// embedding is a configuration error that must fail loud at boot.
+    pub fn default_for_dim(dim: usize) -> Self {
+        assert!(dim > 0, "embedding dimension must be > 0 (check TDB_SEARCH_DIM)");
+
+        // Target sub-vector counts by dimension range:
+        // 128-d → target 16 (8 dims per sub-vector)
+        // 256-d → target 32 (8 dims each)
+        // 768-d → target 48 (16 dims each)
+        // >768  → target dim/16
+        let target = match dim {
+            d if d <= 128 => (d / 8).max(1),
+            d if d <= 256 => (d / 8).max(1),
+            d if d <= 768 => (d / 16).max(1),
+            d => (d / 16).max(1),
+        };
+
+        // Find the largest divisor of `dim` that is <= target.
+        // This guarantees dim % num_sub_vectors == 0 (PQ requirement).
+        let num_sub_vectors = largest_divisor_leq(dim, target);
+
+        Self {
+            // Start with 16 partitions; scale up with corpus via
+            // `recommended_num_partitions` when corpus size is known.
+            num_partitions: 16,
+            num_sub_vectors,
+            nprobes: 8,
+            refine_factor: Some(10),
+        }
+    }
+}
+
+/// Find the largest divisor of `n` that is <= `target`.
+/// Returns 1 if no divisor in [2, target] exists (1 always divides anything).
+///
+/// Used to ensure `dim % num_sub_vectors == 0` for PQ index creation.
+fn largest_divisor_leq(n: usize, target: usize) -> usize {
+    // Search downward from target to find a divisor of n.
+    // For typical embedding dimensions (128, 256, 384, 512, 768, 1024, 1536)
+    // this terminates quickly because they have many small factors.
+    let mut candidate = target;
+    while candidate > 1 {
+        if n.is_multiple_of(candidate) {
+            return candidate;
+        }
+        candidate -= 1;
+    }
+    // 1 always divides any positive number.
+    1
+}
 
 /// A chunk row ready for insertion into Lance.
 #[derive(Debug, Clone)]
@@ -85,6 +166,8 @@ type DatasetKey = (String, String);
 pub struct LanceStore {
     base_dir: PathBuf,
     dim: usize,
+    /// Vector index configuration (nprobes, refine_factor for search).
+    vector_index_config: VectorIndexConfig,
     /// Open dataset handles, keyed by (domain, branch).
     datasets: RwLock<HashMap<DatasetKey, Arc<RwLock<Dataset>>>>,
     /// Per-(domain, branch) index tracking.
@@ -100,14 +183,27 @@ pub struct LanceStore {
 impl LanceStore {
     /// Create a new LanceStore backed by the given directory.
     pub fn new(base_dir: &Path, dim: usize) -> Self {
+        let vector_index_config = VectorIndexConfig::default_for_dim(dim);
         Self {
             base_dir: base_dir.to_owned(),
             dim,
+            vector_index_config,
             datasets: RwLock::new(HashMap::new()),
             branch_indexes: RwLock::new(HashMap::new()),
             tasks: RwLock::new(HashMap::new()),
             pipeline_locks: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Get the vector index configuration (used by the ingest pipeline).
+    pub fn vector_index_config(&self) -> &VectorIndexConfig {
+        &self.vector_index_config
+    }
+
+    /// Override the vector index configuration (used in tests to control search params).
+    #[cfg(test)]
+    pub fn set_vector_index_config(&mut self, config: VectorIndexConfig) {
+        self.vector_index_config = config;
     }
 
     /// Acquire the per-(domain, branch) pipeline lock.
@@ -208,6 +304,55 @@ impl LanceStore {
         let mut datasets = self.datasets.write().await;
         datasets.insert(key, Arc::clone(&arc_ds));
         Ok(arc_ds)
+    }
+
+    /// Open a FRESH dataset handle directly from disk (NOT from the shared cache).
+    /// Used by the background index worker to perform `optimize_indices` without
+    /// holding the cached `Arc<RwLock<Dataset>>`'s write lock — which would block
+    /// concurrent search read locks and stall queries during optimization.
+    ///
+    /// After optimization completes, the caller should refresh the cache via
+    /// `io_refresh_cached_dataset` so subsequent reads see the new version.
+    ///
+    /// Returns None if the dataset does not exist on disk (nothing to optimize).
+    pub async fn io_open_dataset_uncached(
+        &self,
+        domain: &str,
+        branch: &str,
+    ) -> Result<Option<Dataset>, StoreError> {
+        let path = self.dataset_path(domain, branch);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let uri = path.to_string_lossy().to_string();
+        let ds = Dataset::open(&uri)
+            .await
+            .map_err(|e| StoreError::Internal(format!("uncached open failed: {}", e)))?;
+        Ok(Some(ds))
+    }
+
+    /// Refresh the cached dataset handle by re-opening from disk.
+    /// Called after the background worker completes optimization to ensure
+    /// the cached handle reflects the latest version (with updated indices).
+    pub async fn io_refresh_cached_dataset(
+        &self,
+        domain: &str,
+        branch: &str,
+    ) -> Result<(), StoreError> {
+        let path = self.dataset_path(domain, branch);
+        if !path.exists() {
+            return Ok(());
+        }
+        let uri = path.to_string_lossy().to_string();
+        let ds = Dataset::open(&uri)
+            .await
+            .map_err(|e| StoreError::Internal(format!("refresh open failed: {}", e)))?;
+
+        let key = (domain.to_owned(), branch.to_owned());
+        let arc_ds = Arc::new(RwLock::new(ds));
+        let mut datasets = self.datasets.write().await;
+        datasets.insert(key, arc_ds);
+        Ok(())
     }
 
     /// Create an empty RecordBatch with the chunk schema (for dataset initialization).
@@ -354,6 +499,45 @@ impl LanceStore {
     /// Queries always scan unindexed fragments via brute-force, so correctness
     /// is guaranteed even before optimize runs. This call improves FTS query
     /// performance by ensuring all fragments are indexed.
+    /// Ensure the FTS inverted index EXISTS (create if not present, no-op otherwise).
+    /// Used inline during push to guarantee FTS is available for search immediately.
+    /// Does NOT call optimize_indices — that's deferred to the background worker.
+    ///
+    /// Unlike vector search (which flat-scans unindexed fragments), FTS REQUIRES
+    /// the inverted index to exist. Calling this inline on each push is O(1) after
+    /// the first creation because it's a metadata check only.
+    pub async fn io_ensure_fts_index_created(
+        &self,
+        domain: &str,
+        branch: &str,
+    ) -> Result<u64, StoreError> {
+        let ds_arc = self.io_open_dataset(domain, branch).await?;
+        let mut ds = ds_arc.write().await;
+
+        let indices = ds.load_indices().await
+            .map_err(|e| StoreError::Internal(format!("load indices failed: {}", e)))?;
+        let has_fts = indices.iter().any(|idx| idx.name == "content_fts");
+
+        if !has_fts {
+            // First time: create the inverted index covering all current fragments.
+            let params = InvertedIndexParams::default();
+            ds.create_index(
+                &["content"],
+                IndexType::Inverted,
+                Some("content_fts".to_owned()),
+                &params,
+                false,
+            )
+            .await
+            .map_err(|e| StoreError::Internal(format!("FTS index creation failed: {}", e)))?;
+        }
+
+        Ok(ds.version().version)
+    }
+
+    /// Ensure the FTS inverted index is fully up-to-date: create if missing, then
+    /// incrementally index any new (unindexed) fragments via optimize_indices(append).
+    /// Called by the background index worker — NOT on the push hot path.
     pub async fn io_ensure_fts_index(
         &self,
         domain: &str,
@@ -380,8 +564,10 @@ impl LanceStore {
             .await
             .map_err(|e| StoreError::Internal(format!("FTS index creation failed: {}", e)))?;
         } else {
-            // Index exists: incrementally index new fragments only.
-            ds.optimize_indices(&Default::default())
+            // Index exists: incrementally index only new (unindexed) fragments.
+            // OptimizeOptions::append() sets num_indices_to_merge=0, meaning:
+            // create a new delta index from unindexed fragments only (O(delta)).
+            ds.optimize_indices(&OptimizeOptions::append())
                 .await
                 .map_err(|e| StoreError::Internal(format!("FTS index optimize failed: {}", e)))?;
         }
@@ -503,12 +689,22 @@ impl LanceStore {
             }
         }
 
+        // Count pending index fragments across all datasets.
+        let mut pending_index_fragments: u64 = 0;
+        for (_key, ds_arc) in datasets.iter() {
+            let ds = ds_arc.read().await;
+            if let Ok(pending) = crate::store::vector_index::count_unindexed_fragments(&ds).await {
+                pending_index_fragments += pending;
+            }
+        }
+
         Statistics {
             domains: domains.len() as u64,
             branches,
             indexed_commits,
             documents: distinct_docs.len() as u64,
             chunks,
+            pending_index_fragments,
         }
     }
 
@@ -555,10 +751,19 @@ impl LanceStore {
         Ok(hits)
     }
 
-    /// Pure vector (ANN) search.
-    /// Embeddings are L2-normalised before insert, so L2² distance on unit vectors
-    /// equals cosine distance [0, 2]. This gives correct cosine semantics with
-    /// Lance's default metric.
+    /// Vector search using Lance's `nearest()` with `DistanceType::Cosine`.
+    ///
+    /// When a vector ANN index exists on the `embedding` column (created by
+    /// `io_ensure_vector_index`), Lance routes the query through the index for
+    /// sub-linear performance. Unindexed fragments are flat-searched alongside
+    /// the index (correct results, higher latency on the unindexed portion).
+    ///
+    /// Without an index (legacy path or pre-index versions), this degrades to
+    /// O(n) flat KNN — functionally correct but not suitable for large corpora.
+    ///
+    /// Distance: embeddings are L2-normalised before insert, so cosine distance
+    /// is in [0, 2]. The `DistanceType::Cosine` metric is set explicitly on the
+    /// scanner to ensure correct distance computation regardless of index type.
     async fn vector_search(
         &self,
         ds: &Dataset,
@@ -572,6 +777,12 @@ impl LanceStore {
             .nearest("embedding", &Float32Array::from(query.query_embedding.clone()), k)
             .map_err(|e| StoreError::Internal(format!("vector search setup failed: {}", e)))?;
         scanner.distance_metric(DistanceType::Cosine);
+        // ANN tuning: nprobes controls how many IVF partitions are scanned;
+        // refine re-ranks the top candidates with full-precision vectors.
+        scanner.nprobes(self.vector_index_config.nprobes);
+        if let Some(rf) = self.vector_index_config.refine_factor {
+            scanner.refine(rf);
+        }
 
         // Apply filters if present.
         if !query.doc_type_filter.is_empty() || !query.doc_id_filter.is_empty() {
@@ -625,8 +836,14 @@ impl LanceStore {
             Ok(s) => s,
             Err(e) => {
                 let msg = e.to_string();
-                // If no INVERTED index exists, gracefully return empty.
-                // This allows hybrid search to degrade to vector-only.
+                // WHY: FTS is called from hybrid_search, which fuses vector + FTS.
+                // At historical versions (checkout_version), the INVERTED index may
+                // not yet exist (created after that version was tagged). Returning
+                // empty degrades hybrid to vector-only — still useful and correct.
+                // INVARIANT: the vector side of hybrid always runs (vector_search is
+                // called independently); hybrid is never empty solely because FTS is.
+                // CONSEQUENCE: search returns vector-only results at versions that
+                // predate FTS index creation. No data loss; ranking is less rich.
                 if msg.contains("INVERTED index") || msg.contains("full text search") {
                     return Ok(Vec::new());
                 }
@@ -638,6 +855,8 @@ impl LanceStore {
             Ok(batches) => Ok(batches_to_fts_hits(&batches)),
             Err(e) => {
                 let msg = e.to_string();
+                // WHY/INVARIANT/CONSEQUENCE: same as above — historical snapshot
+                // may lack the INVERTED index; hybrid degrades to vector-only.
                 if msg.contains("INVERTED index") || msg.contains("full text search") {
                     return Ok(Vec::new());
                 }
@@ -686,6 +905,39 @@ impl LanceStore {
 
         Ok(batches_to_vector_hits(&batches))
     }
+}
+
+/// Ensure the FTS inverted index is up-to-date on an already-open Dataset handle.
+/// Used by the background index worker to operate on an uncached handle (no RwLock
+/// contention with search reads).
+///
+/// Creates the index if missing; if it already exists, runs optimize_indices(append())
+/// to index only new (unindexed) fragments — O(delta).
+pub async fn io_ensure_fts_index_on_dataset(ds: &mut Dataset) -> Result<u64, StoreError> {
+    let indices = ds
+        .load_indices()
+        .await
+        .map_err(|e| StoreError::Internal(format!("load indices failed: {}", e)))?;
+    let has_fts = indices.iter().any(|idx| idx.name == "content_fts");
+
+    if !has_fts {
+        let params = InvertedIndexParams::default();
+        ds.create_index(
+            &["content"],
+            IndexType::Inverted,
+            Some("content_fts".to_owned()),
+            &params,
+            false,
+        )
+        .await
+        .map_err(|e| StoreError::Internal(format!("FTS index creation failed: {}", e)))?;
+    } else {
+        ds.optimize_indices(&OptimizeOptions::append())
+            .await
+            .map_err(|e| StoreError::Internal(format!("FTS index optimize failed: {}", e)))?;
+    }
+
+    Ok(ds.version().version)
 }
 
 /// Build a SQL-like filter expression for doc_type and doc_id IN (...) filters.
@@ -1560,5 +1812,62 @@ mod tests {
         assert!(ids.contains(&"C"));
         assert!(ids.contains(&"D"));
         assert_eq!(ids.len(), 4);
+    }
+
+    // Fix #4: VectorIndexConfig dimension validation and divisor guarantee.
+
+    #[test]
+    fn largest_divisor_leq_standard_dims() {
+        // 768-d (nomic-embed-v2): target = 768/16 = 48, 768%48 = 0 → 48
+        assert_eq!(super::largest_divisor_leq(768, 48), 48);
+        // 128-d: target = 128/8 = 16, 128%16 = 0 → 16
+        assert_eq!(super::largest_divisor_leq(128, 16), 16);
+        // 384-d: target = 384/16 = 24, 384%24 = 0 → 24
+        assert_eq!(super::largest_divisor_leq(384, 24), 24);
+        // 1536-d: target = 1536/16 = 96, 1536%96 = 0 → 96
+        assert_eq!(super::largest_divisor_leq(1536, 96), 96);
+    }
+
+    #[test]
+    fn largest_divisor_leq_non_standard_dims() {
+        // 500-d: target = 500/16 = 31. 500%31 = 500-31*16 = 500-496 = 4 ≠ 0.
+        // Largest divisor of 500 <= 31: 500 = 2^2 * 5^3. Divisors: 1,2,4,5,10,20,25,50,100...
+        // 25 <= 31 and 500%25 = 0.
+        assert_eq!(super::largest_divisor_leq(500, 31), 25);
+        // 130-d: target = 130/8 = 16. 130%16 = 2 ≠ 0.
+        // Divisors of 130: 1,2,5,10,13,26,65,130. Largest <= 16: 13.
+        assert_eq!(super::largest_divisor_leq(130, 16), 13);
+    }
+
+    #[test]
+    fn largest_divisor_leq_prime_dim() {
+        // 127 is prime. Target = 127/8 = 15. Only divisors: 1, 127.
+        // Largest <= 15: 1.
+        assert_eq!(super::largest_divisor_leq(127, 15), 1);
+    }
+
+    #[test]
+    fn vector_index_config_guarantees_divisibility() {
+        // Test various dimensions — all must produce num_sub_vectors that divides dim.
+        let test_dims = [128, 256, 384, 500, 512, 768, 1024, 1536, 130, 127, 100, 200];
+        for dim in test_dims {
+            let config = VectorIndexConfig::default_for_dim(dim);
+            assert_eq!(
+                dim % config.num_sub_vectors, 0,
+                "dim={} must be divisible by num_sub_vectors={} (got remainder {})",
+                dim, config.num_sub_vectors, dim % config.num_sub_vectors
+            );
+            assert!(
+                config.num_sub_vectors >= 1,
+                "num_sub_vectors must be at least 1 for dim={}",
+                dim
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "embedding dimension must be > 0")]
+    fn vector_index_config_zero_dim_panics() {
+        VectorIndexConfig::default_for_dim(0);
     }
 }

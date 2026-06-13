@@ -4,8 +4,10 @@
 //!
 //! InMemoryStore: stub for contract testing.
 //! LanceStore: real LanceDB-backed persistence with versioned vector search.
+//! vector_index: ANN index creation and incremental maintenance.
 
 pub mod lance;
+pub mod vector_index;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -158,6 +160,7 @@ impl InMemoryStore {
             indexed_commits: 0,
             documents: 0,
             chunks: 0,
+            pending_index_fragments: 0,
         }
     }
 }

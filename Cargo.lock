@@ -7370,6 +7370,7 @@ dependencies = [
  "lance-linalg",
  "lancedb",
  "reqwest 0.12.28",
+ "roaring",
  "serde",
  "serde_json",
  "subtle",

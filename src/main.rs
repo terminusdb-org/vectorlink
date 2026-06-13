@@ -30,9 +30,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the LanceStore backed by the data directory.
     let dim = config.embed_provider.expected_dim();
     let data_dir = Path::new(&config.data_dir);
-    let lance_store = LanceStore::new(data_dir, dim);
+    let lance_store = Arc::new(LanceStore::new(data_dir, dim));
 
-    let service = SearchService::new(Arc::new(lance_store), config.clone(), tokenizer);
+    let service = SearchService::new(lance_store, config.clone(), tokenizer);
     let app = http_api::router(service, config);
 
     let addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 8080));
