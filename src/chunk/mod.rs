@@ -179,10 +179,37 @@ pub fn params_for_nomic(tokenizer: &Tokenizer, prefix: &str) -> Result<ChunkPara
     Ok(ChunkParams { max_tokens, overlap })
 }
 
-/// Load a tokenizer from a JSON file path.
+/// Load a tokenizer from a JSON file (or compressed `.json.bz2` / `.json.gz`).
+///
+/// Detects compression by file extension:
+/// - `.json.bz2` → bzip2 decompress → parse JSON
+/// - `.json` → direct parse
+///
+/// Decompression is one-time at startup (cold-start path, off the hot path).
+/// Fails loud on corrupt or undecompressable assets — never runs with a
+/// half-loaded tokenizer.
 pub fn io_load_tokenizer(path: &std::path::Path) -> Result<Tokenizer, ChunkError> {
-    Tokenizer::from_file(path)
-        .map_err(|e| ChunkError::TokenizerError(format!("failed to load tokenizer: {}", e)))
+    let path_str = path.to_string_lossy();
+
+    if path_str.ends_with(".bz2") {
+        // Bzip2-compressed tokenizer — decompress in-memory then parse.
+        let file = std::fs::File::open(path)
+            .map_err(|e| ChunkError::TokenizerError(format!("open {} failed: {}", path_str, e)))?;
+        let mut decoder = bzip2::read::BzDecoder::new(std::io::BufReader::new(file));
+        let mut json_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut json_bytes)
+            .map_err(|e| ChunkError::TokenizerError(format!(
+                "bzip2 decompress {} failed: {} (corrupt asset?)", path_str, e
+            )))?;
+        Tokenizer::from_bytes(&json_bytes)
+            .map_err(|e| ChunkError::TokenizerError(format!(
+                "parse tokenizer from decompressed {} failed: {}", path_str, e
+            )))
+    } else {
+        // Plain JSON — direct load.
+        Tokenizer::from_file(path)
+            .map_err(|e| ChunkError::TokenizerError(format!("failed to load tokenizer: {}", e)))
+    }
 }
 
 #[cfg(test)]

@@ -37,6 +37,8 @@ help:
 	@echo "  make docs-rebuild     Clean rebuild of the dist/api API docs"
 	@echo "  make verify           lint + test (no side effects)"
 	@echo "  make pr               Full pre-PR gate: lint + test + release build + docs"
+	@echo "  make build-image      Build the dev/CI container image (deps pre-baked)"
+	@echo "  make fix-volumes      Remediate named volume ownership for non-root user"
 	@echo "  make clean            Remove generated artifacts ($(DIST)/)"
 
 # ─────────────────────────────── lint ────────────────────────────────────
@@ -59,18 +61,33 @@ lint-openapi:
 # lints. Introducing `unsafe` is a human decision (remove the forbid in a
 # reviewed, signed commit), never a silent change.
 # Guarded: no-ops with a notice until the crate exists.
-# Build runs inside a rust:1-bookworm container (no host toolchain).
+# Build runs inside a pinned container image (Dockerfile.build) with all deps
+# pre-baked. No apt-at-runtime, no GPG workarounds.
+# TARGET_VOLUME: Docker volume for target/ (avoids virtiofs execute-bit issues on Lima,
+# and provides fast overlay-backed I/O for incremental builds).
 CARGO_VOLUME := tdb-search-cargo
+TARGET_VOLUME := tdb-search-target
+BUILD_IMAGE  := tdb-search-build:local
+
+# Run containers as the host user so bind-mounted files are owned correctly.
+# CARGO_HOME=/cargo-registry maps to the named cargo volume mount point.
+# HOME=/tmp/build-home — the entrypoint script (baked into the image) ensures
+# this directory exists before exec'ing the user's command.
+DOCKER_RUN := docker run --rm \
+	--user "$$(id -u):$$(id -g)" \
+	-e HOME=/tmp/build-home \
+	-e CARGO_HOME=/cargo-registry \
+	-v "$$(pwd)":/work \
+	-v $(CARGO_VOLUME):/cargo-registry \
+	-v $(TARGET_VOLUME):/work/target \
+	-w /work \
+	$(BUILD_IMAGE)
 
 .PHONY: clippy
 clippy:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		docker run --rm \
-			-v "$$(pwd)":/work \
-			-v $(CARGO_VOLUME):/usr/local/cargo/registry \
-			-w /work \
-			rust:1-bookworm \
-			bash -c "apt-get update -qq && apt-get install -yqq protobuf-compiler libprotobuf-dev >/dev/null 2>&1 && rustup component add clippy 2>/dev/null && cargo clippy --all-targets --all-features -- -D warnings" ; \
+		$(DOCKER_RUN) \
+			cargo clippy --all-targets --all-features -- -D warnings ; \
 	else \
 		echo "• clippy skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
@@ -81,29 +98,32 @@ clippy:
 .PHONY: dev
 dev:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		docker run --rm \
-			-v "$$(pwd)":/work \
-			-v $(CARGO_VOLUME):/usr/local/cargo/registry \
-			-w /work \
-			rust:1-bookworm \
-			bash -c "apt-get update -qq && apt-get install -yqq protobuf-compiler libprotobuf-dev >/dev/null 2>&1 && cargo build" ; \
+		$(DOCKER_RUN) \
+			cargo build ; \
 	else \
 		echo "• dev build skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
 
-# build-release: production RELEASE build with lto=thin. Slow (minutes). Only
-# run at the end of an iteration cycle via `make pr`.
+# build-release: RELEASE build (no LTO). Fast enough for `make pr` gate
+# (incremental relinks). LTO only in `make release-image` (production publish).
 .PHONY: build-release
 build-release:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		docker run --rm \
-			-v "$$(pwd)":/work \
-			-v $(CARGO_VOLUME):/usr/local/cargo/registry \
-			-w /work \
-			rust:1-bookworm \
-			bash -c "apt-get update -qq && apt-get install -yqq protobuf-compiler libprotobuf-dev >/dev/null 2>&1 && cargo build --release" ; \
+		$(DOCKER_RUN) \
+			cargo build --release ; \
 	else \
 		echo "• release build skipped — no $(CARGO_MANIFEST) yet" ; \
+	fi
+
+# release-image: PRODUCTION build with LTO + codegen-units=1 + opt-level=s.
+# Slow (15-20 min). Run ONLY when cutting a shippable image, NOT per-commit.
+.PHONY: release-image
+release-image:
+	@if [ -f $(CARGO_MANIFEST) ]; then \
+		$(DOCKER_RUN) \
+			cargo build --profile production ; \
+	else \
+		echo "• release-image build skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
 
 # ─────────────────────────────── test ────────────────────────────────────
@@ -112,12 +132,8 @@ build-release:
 .PHONY: test
 test:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		docker run --rm \
-			-v "$$(pwd)":/work \
-			-v $(CARGO_VOLUME):/usr/local/cargo/registry \
-			-w /work \
-			rust:1-bookworm \
-			bash -c "apt-get update -qq && apt-get install -yqq protobuf-compiler libprotobuf-dev >/dev/null 2>&1 && cargo test --all-features" ; \
+		$(DOCKER_RUN) \
+			cargo test --all-features ; \
 	else \
 		echo "• test skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
@@ -128,7 +144,7 @@ test:
 .PHONY: test-integration
 test-integration:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		CARGO_VOLUME=$(CARGO_VOLUME) ./scripts/run-integration-tests.sh ; \
+		CARGO_VOLUME=$(CARGO_VOLUME) TARGET_VOLUME=$(TARGET_VOLUME) BUILD_IMAGE=$(BUILD_IMAGE) ./scripts/run-integration-tests.sh ; \
 	else \
 		echo "• integration tests skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
@@ -167,6 +183,28 @@ verify: lint test
 .PHONY: pr
 pr: lint test test-integration build-release docs
 	@echo "✓ PR gate passed — review $(DOCS_OUT), then commit (GPG-signed)"
+
+# ──────────────────────── container image ────────────────────────────────
+# Build the dev/CI container image with all deps pre-baked. No apt-at-runtime.
+# Safe to run any time — does NOT touch the shared cargo/target volumes.
+.PHONY: build-image
+build-image:
+	docker build -f Dockerfile.build -t $(BUILD_IMAGE) .
+
+# ──────────────────────── volume remediation ────────────────────────────
+# One-time fix: chown the named volumes so the non-root build user can write.
+# Idempotent — safe to run repeatedly. Uses a throwaway root container (--user
+# root) to set ownership, then the non-root --user containers can do
+# incremental builds.
+.PHONY: fix-volumes
+fix-volumes:
+	@echo "→ remediating volume ownership for uid $$(id -u):$$(id -g)"
+	docker run --rm --user root \
+		-v $(CARGO_VOLUME):/cargo-registry \
+		-v $(TARGET_VOLUME):/work/target \
+		$(BUILD_IMAGE) \
+		bash -c "chown -R $$(id -u):$$(id -g) /cargo-registry /work/target"
+	@echo "✓ volumes owned by $$(id -u):$$(id -g)"
 
 # ────────────────────────────── clean ────────────────────────────────────
 .PHONY: clean

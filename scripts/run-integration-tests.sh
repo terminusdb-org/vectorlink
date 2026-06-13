@@ -5,7 +5,7 @@
 set -euo pipefail
 
 CARGO_VOLUME="${CARGO_VOLUME:-tdb-search-cargo}"
-IMAGE="${RUST_IMAGE:-rust:1-bookworm}"
+BUILD_IMAGE="${BUILD_IMAGE:-tdb-search-build:local}"
 CONTAINER="tdb-search-itest-$$"
 NETWORK="tdb-search-itest-net-$$"
 HOST_PORT="${HOST_PORT:-8089}"
@@ -13,6 +13,8 @@ EMBED_CONTAINER="tdb-search-itest-embed-$$"
 EMBED_MODEL="${TDB_SEARCH_MODEL:-nomic-embed-v2}"
 EMBED_DIM="${TDB_SEARCH_DIM:-768}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
 
 cleanup() {
   # WHY: always remove test containers even if a step fails.
@@ -32,18 +34,23 @@ BUILD_PROFILE="${BUILD_PROFILE:-debug}"
 if [ "$BUILD_PROFILE" = "release" ]; then
   CARGO_BUILD_FLAGS="--release"
   BINARY_PATH="/work/target/release/tdb-search"
-  echo "→ building RELEASE binary in $IMAGE"
+  echo "→ building RELEASE binary in $BUILD_IMAGE"
 else
   CARGO_BUILD_FLAGS=""
   BINARY_PATH="/work/target/debug/tdb-search"
-  echo "→ building DEBUG binary in $IMAGE (incremental, fast iteration)"
+  echo "→ building DEBUG binary in $BUILD_IMAGE (incremental, fast iteration)"
 fi
 
+TARGET_VOLUME="${TARGET_VOLUME:-tdb-search-target}"
 docker run --rm \
+  --user "$HOST_UID:$HOST_GID" \
+  -e HOME=/tmp/build-home \
+  -e CARGO_HOME=/cargo-registry \
   -v "$ROOT":/work \
-  -v "$CARGO_VOLUME":/usr/local/cargo/registry \
+  -v "$CARGO_VOLUME":/cargo-registry \
+  -v "$TARGET_VOLUME":/work/target \
   -w /work \
-  "$IMAGE" bash -c "apt-get update -qq && apt-get install -yqq protobuf-compiler libprotobuf-dev >/dev/null 2>&1 && cargo build $CARGO_BUILD_FLAGS"
+  "$BUILD_IMAGE" cargo build $CARGO_BUILD_FLAGS
 
 echo "→ starting Ollama embeddings sidecar"
 # Check if there's already an Ollama with the model available on the compose stack.
@@ -86,9 +93,13 @@ ENGINE_NETWORK="${EMBED_NET:-$NETWORK}"
 
 # shellcheck disable=SC2086
 docker run -d --name "$CONTAINER" \
+  --user "$HOST_UID:$HOST_GID" \
+  -e HOME=/tmp/build-home \
   --network "$ENGINE_NETWORK" \
   $EXTRA_DOCKER_ARGS \
-  -v "$ROOT":/work -w /work \
+  -v "$ROOT":/work \
+  -v "$TARGET_VOLUME":/work/target \
+  -w /work \
   -p "$HOST_PORT":8080 \
   -e TDB_SEARCH_ADMIN_USER=admin \
   -e TDB_SEARCH_ADMIN_SECRET=root \
@@ -98,7 +109,7 @@ docker run -d --name "$CONTAINER" \
   -e "TDB_SEARCH_DIM=$EMBED_DIM" \
   -e TDB_SEARCH_DATA_DIR=/tmp/tdb-search-itest-data \
   -e TDB_SEARCH_TOKENIZER_PATH=/work/spikes/tokenizer/tokenizer.json \
-  "$IMAGE" "$BINARY_PATH" >/dev/null
+  "$BUILD_IMAGE" "$BINARY_PATH" >/dev/null
 
 # If using a fresh Ollama on the test network, also connect the engine there.
 if [ "$ENGINE_NETWORK" != "$NETWORK" ]; then

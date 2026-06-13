@@ -1,0 +1,62 @@
+# Build harness image for tdb-search development and CI.
+#
+# Pre-bakes all system dependencies (protobuf, ssl, etc.) so containers can
+# run as a non-root user without needing apt at runtime. Removes the
+# --allow-insecure-repositories GPG workaround entirely.
+#
+# A non-root build user (uid 501, gid 1000) is created matching the typical
+# host user inside Colima/Lima. At runtime, --user $(id -u):$(id -g) is still
+# passed for portability, but the image's directory ownership means the common
+# case (501:1000) works without any chown.
+#
+# Usage (built by `make build-image`):
+#   docker build -f Dockerfile.build -t tdb-search-build:local .
+#
+# The image is then used by DOCKER_RUN in the Makefile for all cargo
+# operations (clippy, build, test).
+
+FROM rust:1-bookworm
+
+# Install build-time system dependencies once, at image build time.
+# protoc + libprotobuf-dev: lance-encoding needs protoc + well-known .proto includes.
+# g++ libssl-dev pkg-config: fastembed/ort static C++ link (Phase 7).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    protobuf-compiler \
+    libprotobuf-dev \
+    g++ \
+    libssl-dev \
+    pkg-config \
+  && rm -rf /var/lib/apt/lists/*
+
+# Pre-install clippy so non-root user doesn't need to download it at runtime.
+RUN rustup component add clippy
+
+# Create a non-root build user matching the host (uid 501, gid 1000).
+# This ensures named volumes created by this image are owned correctly.
+RUN groupadd -g 1000 build && useradd -u 501 -g 1000 -m -s /bin/bash build
+
+# Create and own the cargo registry and target directories that will be
+# mounted as named volumes at runtime. Pre-creating them with correct
+# ownership means the non-root user can write immediately.
+# /tmp/build-home is world-writable (mode 777) so any --user uid:gid can
+# use it as HOME without ownership issues (it's ephemeral container state).
+RUN mkdir -p /cargo-registry /work/target /tmp/build-home \
+  && chown -R 501:1000 /cargo-registry /work/target \
+  && chmod 777 /tmp/build-home
+
+# Ensure rustup toolchain is readable by the build user.
+# RUSTUP_HOME stays at /usr/local/rustup (installed by base image as root).
+# CARGO_HOME is redirected to the mounted volume at runtime.
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_HOME=/cargo-registry
+ENV HOME=/tmp/build-home
+
+# Entrypoint ensures HOME exists for arbitrary --user uid:gid values.
+COPY scripts/build-entrypoint.sh /usr/local/bin/build-entrypoint.sh
+RUN chmod +x /usr/local/bin/build-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/build-entrypoint.sh"]
+
+# Default to the build user (overridden by --user at runtime for portability).
+USER build
+
+WORKDIR /work

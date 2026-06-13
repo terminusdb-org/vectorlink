@@ -137,7 +137,7 @@ describe("Indexing pipeline (real embeddings)", function () {
       const worstDistance = Math.max(...distances)
       expect(worstDistance).to.be.lessThan(
         0.8,
-        `worst distance ${worstDistance} suggests factor-of-2 scale bug (L2 fed to cosine transform)`
+        `worst distance ${worstDistance} suggests factor-of-2 scale bug (L2 fed to cosine transform)`,
       )
     })
   })

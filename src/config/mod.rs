@@ -61,7 +61,7 @@ impl Config {
             data_dir: std::env::var("TDB_SEARCH_DATA_DIR")
                 .unwrap_or_else(|_| "/data".to_owned()),
             tokenizer_path: std::env::var("TDB_SEARCH_TOKENIZER_PATH")
-                .unwrap_or_else(|_| "/data/tokenizer.json".to_owned()),
+                .unwrap_or_else(|_| "/data/tokenizer.json.bz2".to_owned()),
         }
     }
 
