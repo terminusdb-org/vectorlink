@@ -25,7 +25,7 @@ History is **linear per branch**. Branching out at a commit forks a new line tha
 
 ## Document and chunk
 
-You index **documents** (each identified by a full IRI, e.g. `terminusdb:///star-wars/People/20`). A long document is split into **chunks** that fit the embedding model's window, with overlap so nothing is lost at boundaries — each chunk is embedded separately. Search runs over chunks but **deduplicates back to documents**: you always get documents back, never chunk fragments.
+You index **documents** (each identified by a full IRI, e.g. `terminusdb:///star-wars/People/20`). A long document is split into **chunks** that fit the embedding model's window, with overlap so nothing is lost at boundaries — each chunk is embedded separately. Search runs over chunks but **deduplicates back to documents**: you always get documents back, never chunk fragments. Each result still tells you *which* chunk matched and roughly *where* in the document it is (`chunk.index`/`count`/`location`), so you can jump to the passage — and optionally the chunk's text via `snippet=true`.
 
 ## Search modes
 
