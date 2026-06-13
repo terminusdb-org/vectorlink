@@ -1,0 +1,27 @@
+[package]
+name = "tdb-search"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone semantic search engine — push-indexed, versioned per commit."
+license = "Apache-2.0"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+hyper = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio-test = "0.4"
+
+[profile.release]
+lto = true
+strip = true

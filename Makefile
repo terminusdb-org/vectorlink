@@ -56,10 +56,18 @@ lint-openapi:
 # lints. Introducing `unsafe` is a human decision (remove the forbid in a
 # reviewed, signed commit), never a silent change.
 # Guarded: no-ops with a notice until the crate exists.
+# Build runs inside a rust:1-bookworm container (no host toolchain).
+CARGO_VOLUME := tdb-search-cargo
+
 .PHONY: clippy
 clippy:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		cargo clippy --all-targets --all-features -- -D warnings ; \
+		docker run --rm \
+			-v "$$(pwd)":/work \
+			-v $(CARGO_VOLUME):/usr/local/cargo/registry \
+			-w /work \
+			rust:1-bookworm \
+			bash -c "rustup component add clippy 2>/dev/null && cargo clippy --all-targets --all-features -- -D warnings" ; \
 	else \
 		echo "• clippy skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
@@ -70,10 +78,20 @@ clippy:
 .PHONY: test
 test:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		cargo test --all-features ; \
+		docker run --rm \
+			-v "$$(pwd)":/work \
+			-v $(CARGO_VOLUME):/usr/local/cargo/registry \
+			-w /work \
+			rust:1-bookworm \
+			cargo test --all-features ; \
 	else \
 		echo "• test skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
+
+# HTTP contract tests (mocha). Requires the engine to be running on :8080.
+.PHONY: test-contract
+test-contract:
+	npx mocha
 
 # ────────────────────────────── docs ─────────────────────────────────────
 # Generate the human-reviewable API reference from the OpenAPI contract into

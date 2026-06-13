@@ -67,9 +67,9 @@ curl -u admin:root 'http://localhost:8080/search?domain=admin/star_wars&commit=c
 ```json
 [
   { "id": "terminusdb:///star-wars/People/20", "distance": 0.0939,
-    "chunk": { "index": 0, "count": 1, "location": 0.0 } },
+    "chunk": { "index": 0, "count": 1, "token_start": 0, "doc_token_len": 41, "location": 0.0 } },
   { "id": "terminusdb:///star-wars/Species/8", "distance": 0.1421,
-    "chunk": { "index": 3, "count": 12, "location": 0.27 } }
+    "chunk": { "index": 3, "count": 12, "token_start": 1280, "doc_token_len": 4800, "location": 0.27 } }
 ]
 ```
 
@@ -78,7 +78,8 @@ curl -u admin:root 'http://localhost:8080/search?domain=admin/star_wars&commit=c
 - **`chunk`** tells you *where* in the document the match was, so you can jump to it:
   - `index` — which chunk matched (0-based).
   - `count` — how many chunks the document was split into (`1` if it fit in one).
-  - `location` — approximate fractional position of that chunk's start, `0.0` (beginning) … `1.0` (end). Multiply by 100 for a percentage — e.g. `0.27` ≈ 27% of the way through. Derived from token offsets (accounts for overlap), so it is approximate, not a character index.
+  - `token_start` / `doc_token_len` — exact **token** offsets: the chunk's start and the document's total length, in the embedding model's tokens. Use these when you want precise positioning (not character offsets).
+  - `location` — convenience fraction `token_start / doc_token_len`, `0.0` (beginning) … `1.0` (end). Multiply by 100 for a percentage — e.g. `0.27` ≈ 27% of the way through.
 - An **empty array means genuinely no match** — never an error in disguise. Errors are status codes (see [Operations](./06-operations.md)).
 
 ### Getting the matched text
@@ -90,7 +91,7 @@ curl -u admin:root 'http://localhost:8080/search?domain=admin/star_wars&commit=c
 ```
 ```json
 [ { "id": "terminusdb:///star-wars/People/20", "distance": 0.0939,
-    "chunk": { "index": 0, "count": 1, "location": 0.0,
+    "chunk": { "index": 0, "count": 1, "token_start": 0, "doc_token_len": 41, "location": 0.0,
                "snippet": "The person's name is Yoda. A wise old Jedi master ..." } } ]
 ```
 

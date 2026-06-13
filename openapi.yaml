@@ -604,16 +604,16 @@ components:
               value:
                 - id: "terminusdb:///star-wars/People/20"
                   distance: 0.0939
-                  chunk: { index: 0, count: 1, location: 0.0 }
+                  chunk: { index: 0, count: 1, token_start: 0, doc_token_len: 41, location: 0.0 }
                 - id: "terminusdb:///star-wars/Species/8"
                   distance: 0.1421
-                  chunk: { index: 3, count: 12, location: 0.27 }
+                  chunk: { index: 3, count: 12, token_start: 1280, doc_token_len: 4800, location: 0.27 }
             hitsWithSnippet:
               summary: With snippet=true
               value:
                 - id: "terminusdb:///star-wars/People/20"
                   distance: 0.0939
-                  chunk: { index: 0, count: 1, location: 0.0, snippet: "The person's name is Yoda. A wise old Jedi master ..." }
+                  chunk: { index: 0, count: 1, token_start: 0, doc_token_len: 41, location: 0.0, snippet: "The person's name is Yoda. A wise old Jedi master ..." }
     SearchBadRequest:
       description: >
         Invalid or missing search parameter — missing domain/commit/q (in both
@@ -756,7 +756,7 @@ components:
             Which part of the document matched. The document's score is its
             best-matching chunk; this object locates that chunk so a caller can
             jump to the relevant passage.
-          required: [index, count, location]
+          required: [index, count, token_start, doc_token_len, location]
           properties:
             index:
               type: integer
@@ -766,16 +766,29 @@ components:
               type: integer
               minimum: 1
               description: Total number of chunks the document was split into (1 if it fit in a single chunk).
+            token_start:
+              type: integer
+              minimum: 0
+              description: >
+                Start token offset of the matched chunk within the document (in the
+                embedding model's tokens). The raw numerator behind `location`, for
+                callers that want exact offsets rather than a fraction.
+            doc_token_len:
+              type: integer
+              minimum: 0
+              description: >
+                Document length in the embedding model's tokens — the denominator
+                behind `location`. `token_start` and `doc_token_len` are token
+                offsets, not character offsets.
             location:
               type: number
               format: float
               minimum: 0
               maximum: 1
               description: >
-                Approximate fractional position of the matched chunk's start within
-                the document — 0.0 = very beginning, 1.0 = very end. Multiply by 100
-                for a percentage. Derived from token offsets, so it accounts for
-                chunk overlap; it is approximate, not a character index.
+                Convenience fraction = `token_start / doc_token_len` (0.0 = very
+                beginning, 1.0 = very end; ×100 for a percentage). `0.0` when
+                `doc_token_len` is 0. Approximate position, not a character index.
             snippet:
               type: string
               description: >
