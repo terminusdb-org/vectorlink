@@ -102,10 +102,48 @@ describe("Indexing pipeline (real embeddings)", function () {
       const hasJediMaster = topIds.some(id => jediMasters.includes(id))
       expect(hasJediMaster).to.equal(true, `expected a Jedi master in top 3, got: ${JSON.stringify(topIds)}`)
     })
+
+    it("vector distances are correctly scaled (fix #2: cosine metric, not L2)", async function () {
+      const res = await agent()
+        .get("/search")
+        .query({
+          domain: DOMAIN,
+          commit: "c0",
+          q: "starfighter battle",
+          mode: "vector",
+        })
+        .set("Authorization", authHeader())
+        .expect(200)
+
+      expect(res.body).to.be.an("array")
+      expect(res.body.length).to.be.at.least(2)
+
+      // All distances must be strictly between 0 and 1 for distinct documents.
+      for (const hit of res.body) {
+        expect(hit.distance).to.be.greaterThan(0, `distance for ${hit.id} should be > 0`)
+        expect(hit.distance).to.be.lessThan(1, `distance for ${hit.id} should be < 1`)
+      }
+
+      // Not all distances should be identical (the old bug clamped everything to 1.0).
+      const distances = res.body.map(h => h.distance)
+      const allSame = distances.every(d => d === distances[0])
+      expect(allSame).to.equal(false, "distances should vary between documents, not all be identical")
+
+      // SCALE ASSERTION: The factor-of-2 bug causes unrelated docs to saturate at ~1.0.
+      // With correct cosine metric, the WORST (most distant) hit should be well below 1.0.
+      // Real embedding spaces: even unrelated docs rarely exceed ~0.5 cosine distance.
+      // We use 0.8 as the threshold — generous enough for real models, but catches the
+      // factor-of-2 bug where orthogonal (should be 0.5) was reported as 1.0.
+      const worstDistance = Math.max(...distances)
+      expect(worstDistance).to.be.lessThan(
+        0.8,
+        `worst distance ${worstDistance} suggests factor-of-2 scale bug (L2 fed to cosine transform)`
+      )
+    })
   })
 
   describe("GET /search — FTS mode", function () {
-    it("finds an exact rare term (Kashyyyk) via FTS", async function () {
+    it("finds an exact rare term (Kashyyyk) via FTS with non-zero distance", async function () {
       const res = await agent()
         .get("/search")
         .query({
@@ -119,7 +157,12 @@ describe("Indexing pipeline (real embeddings)", function () {
 
       expect(res.body).to.be.an("array")
       expect(res.body.length).to.be.at.least(1)
+      // The rare-term doc MUST be first (BM25 ranking preserved).
       expect(res.body[0].id).to.equal("terminusdb:///itest/Species/wookiee")
+      // Distance must be non-zero (fix #1: was 0.0 when reading _distance instead of _score).
+      expect(res.body[0].distance).to.be.a("number")
+      expect(res.body[0].distance).to.be.greaterThan(0)
+      expect(res.body[0].distance).to.be.lessThan(1)
     })
   })
 

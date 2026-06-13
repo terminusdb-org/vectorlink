@@ -20,6 +20,7 @@ use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_index::IndexType;
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
+use lance_linalg::distance::DistanceType;
 use tokio::sync::RwLock;
 
 use crate::kernel::error::StoreError;
@@ -54,11 +55,21 @@ pub struct SearchQuery {
     pub snippet: bool,
 }
 
+/// Whether a ChunkHit's distance is raw (needs transform) or already normalised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistanceKind {
+    /// Raw Lance cosine distance [0, 2] — needs `normalized_cosine_from_lance`.
+    RawCosine,
+    /// Already normalised to [0, 1] (e.g., from RRF or FTS conversion).
+    Normalised,
+}
+
 /// Internal chunk-level hit before dedup to documents.
 #[derive(Debug, Clone)]
 pub struct ChunkHit {
     pub doc_id: String,
     pub distance: f32,
+    pub distance_kind: DistanceKind,
     pub chunk_index: i32,
     pub chunk_count: i32,
     pub chunk_token_start: i32,
@@ -80,6 +91,10 @@ pub struct LanceStore {
     branch_indexes: RwLock<HashMap<DatasetKey, BranchIndex>>,
     /// Tasks by task ID.
     tasks: RwLock<HashMap<String, TaskStatus>>,
+    /// Per-(domain, branch) pipeline serialisation lock.
+    /// Ensures concurrent pushes to the same branch are serialised so that
+    /// commit→version tags are correctly isolated.
+    pipeline_locks: RwLock<HashMap<DatasetKey, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl LanceStore {
@@ -91,7 +106,36 @@ impl LanceStore {
             datasets: RwLock::new(HashMap::new()),
             branch_indexes: RwLock::new(HashMap::new()),
             tasks: RwLock::new(HashMap::new()),
+            pipeline_locks: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Acquire the per-(domain, branch) pipeline lock.
+    /// Serialises upsert→tag operations so concurrent pushes don't interleave.
+    pub async fn acquire_pipeline_lock(
+        &self,
+        domain: &str,
+        branch: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let key = (domain.to_owned(), branch.to_owned());
+
+        // Get or create the lock for this key.
+        let lock = {
+            let locks = self.pipeline_locks.read().await;
+            if let Some(l) = locks.get(&key) {
+                Arc::clone(l)
+            } else {
+                drop(locks);
+                let mut locks = self.pipeline_locks.write().await;
+                let l = locks
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                    .clone();
+                l
+            }
+        };
+
+        lock.lock_owned().await
     }
 
     /// Get the Arrow schema for chunk rows (embedding dimension from config).
@@ -301,9 +345,15 @@ impl LanceStore {
         Ok(())
     }
 
-    /// Ensure an FTS (INVERTED) index exists on the "content" column.
-    /// Idempotent: replace=true recreates if stale.
-    /// Returns the dataset version after index creation (0 if index already up-to-date).
+    /// Ensure an FTS (INVERTED) index exists on the "content" column and is
+    /// up-to-date with all fragments. On first call, creates the index; on
+    /// subsequent calls, incrementally indexes new (unindexed) fragments via
+    /// `optimize_indices` — O(new_data), not O(corpus).
+    ///
+    /// Lance tracks which fragments are covered by the index via a bitmap.
+    /// Queries always scan unindexed fragments via brute-force, so correctness
+    /// is guaranteed even before optimize runs. This call improves FTS query
+    /// performance by ensuring all fragments are indexed.
     pub async fn io_ensure_fts_index(
         &self,
         domain: &str,
@@ -312,16 +362,29 @@ impl LanceStore {
         let ds_arc = self.io_open_dataset(domain, branch).await?;
         let mut ds = ds_arc.write().await;
 
-        let params = InvertedIndexParams::default();
-        ds.create_index(
-            &["content"],
-            IndexType::Inverted,
-            Some("content_fts".to_owned()),
-            &params,
-            true, // replace if exists
-        )
-        .await
-        .map_err(|e| StoreError::Internal(format!("FTS index creation failed: {}", e)))?;
+        // Check if the FTS index already exists.
+        let indices = ds.load_indices().await
+            .map_err(|e| StoreError::Internal(format!("load indices failed: {}", e)))?;
+        let has_fts = indices.iter().any(|idx| idx.name == "content_fts");
+
+        if !has_fts {
+            // First time: create the inverted index.
+            let params = InvertedIndexParams::default();
+            ds.create_index(
+                &["content"],
+                IndexType::Inverted,
+                Some("content_fts".to_owned()),
+                &params,
+                false,
+            )
+            .await
+            .map_err(|e| StoreError::Internal(format!("FTS index creation failed: {}", e)))?;
+        } else {
+            // Index exists: incrementally index new fragments only.
+            ds.optimize_indices(&Default::default())
+                .await
+                .map_err(|e| StoreError::Internal(format!("FTS index optimize failed: {}", e)))?;
+        }
 
         Ok(ds.version().version)
     }
@@ -401,6 +464,7 @@ impl LanceStore {
         let mut branches = 0u64;
         let mut indexed_commits = 0u64;
         let mut chunks = 0u64;
+        let mut distinct_docs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for (key, _ds) in datasets.iter() {
             domains.insert(key.0.clone());
@@ -413,23 +477,37 @@ impl LanceStore {
             }
         }
 
-        // Count rows from datasets (best-effort; errors skipped for advisory counters).
+        // Count rows and distinct doc_ids from datasets (best-effort).
         for (_key, ds_arc) in datasets.iter() {
             let ds = ds_arc.read().await;
             if let Ok(count) = ds.count_rows(None).await {
                 chunks += count as u64;
             }
+            // Scan doc_id column for distinct count.
+            let mut scanner = ds.scan();
+            if scanner.project(&["doc_id"]).is_ok() {
+                if let Ok(stream) = scanner.try_into_stream().await {
+                    if let Ok(batches) = stream.try_collect::<Vec<RecordBatch>>().await {
+                        for batch in &batches {
+                            if let Some(ids) = batch
+                                .column_by_name("doc_id")
+                                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                            {
+                                for i in 0..ids.len() {
+                                    distinct_docs.insert(ids.value(i).to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
-
-        // documents = distinct doc_ids (approximate: use chunks as upper bound for now;
-        // proper distinct count requires a scan which is deferred).
-        let documents = chunks;
 
         Statistics {
             domains: domains.len() as u64,
             branches,
             indexed_commits,
-            documents,
+            documents: distinct_docs.len() as u64,
             chunks,
         }
     }
@@ -478,6 +556,9 @@ impl LanceStore {
     }
 
     /// Pure vector (ANN) search.
+    /// Embeddings are L2-normalised before insert, so L2² distance on unit vectors
+    /// equals cosine distance [0, 2]. This gives correct cosine semantics with
+    /// Lance's default metric.
     async fn vector_search(
         &self,
         ds: &Dataset,
@@ -490,6 +571,7 @@ impl LanceStore {
         scanner
             .nearest("embedding", &Float32Array::from(query.query_embedding.clone()), k)
             .map_err(|e| StoreError::Internal(format!("vector search setup failed: {}", e)))?;
+        scanner.distance_metric(DistanceType::Cosine);
 
         // Apply filters if present.
         if !query.doc_type_filter.is_empty() || !query.doc_id_filter.is_empty() {
@@ -508,7 +590,7 @@ impl LanceStore {
             .await
             .map_err(|e| StoreError::Internal(format!("batch collect failed: {}", e)))?;
 
-        Ok(batches_to_chunk_hits(&batches))
+        Ok(batches_to_vector_hits(&batches))
     }
 
     /// Full-text search.
@@ -553,7 +635,7 @@ impl LanceStore {
         };
 
         match stream.try_collect::<Vec<RecordBatch>>().await {
-            Ok(batches) => Ok(batches_to_chunk_hits(&batches)),
+            Ok(batches) => Ok(batches_to_fts_hits(&batches)),
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("INVERTED index") || msg.contains("full text search") {
@@ -602,7 +684,7 @@ impl LanceStore {
             .await
             .map_err(|e| StoreError::Internal(format!("lookup collect failed: {}", e)))?;
 
-        Ok(batches_to_chunk_hits(&batches))
+        Ok(batches_to_vector_hits(&batches))
     }
 }
 
@@ -630,8 +712,8 @@ fn build_filter_expression(doc_types: &[String], doc_ids: &[String]) -> String {
     parts.join(" AND ")
 }
 
-/// Extract ChunkHit records from RecordBatches.
-fn batches_to_chunk_hits(batches: &[RecordBatch]) -> Vec<ChunkHit> {
+/// Extract ChunkHit records from RecordBatches (vector search — reads `_distance`).
+fn batches_to_vector_hits(batches: &[RecordBatch]) -> Vec<ChunkHit> {
     let mut hits = Vec::new();
 
     for batch in batches {
@@ -666,6 +748,61 @@ fn batches_to_chunk_hits(batches: &[RecordBatch]) -> Vec<ChunkHit> {
                 hits.push(ChunkHit {
                     doc_id: ids.value(i).to_owned(),
                     distance,
+                    distance_kind: DistanceKind::RawCosine,
+                    chunk_index: ci.value(i),
+                    chunk_count: cc.value(i),
+                    chunk_token_start: cts.value(i),
+                    doc_token_len: dtl.value(i),
+                    content: cnt.value(i).to_owned(),
+                });
+            }
+        }
+    }
+
+    hits
+}
+
+/// Extract ChunkHit records from RecordBatches (FTS search — reads `_score`).
+/// BM25 scores are converted to distances: `distance = 1/(1+score)` so 0=best.
+/// Results are preserved in stream order (BM25 rank order from Lance).
+fn batches_to_fts_hits(batches: &[RecordBatch]) -> Vec<ChunkHit> {
+    let mut hits = Vec::new();
+
+    for batch in batches {
+        let n = batch.num_rows();
+        let doc_ids = batch
+            .column_by_name("doc_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let chunk_indexes = batch
+            .column_by_name("chunk_index")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+        let chunk_counts = batch
+            .column_by_name("chunk_count")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+        let chunk_token_starts = batch
+            .column_by_name("chunk_token_start")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+        let doc_token_lens = batch
+            .column_by_name("doc_token_len")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+        let contents = batch
+            .column_by_name("content")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let scores = batch
+            .column_by_name("_score")
+            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+
+        if let (Some(ids), Some(ci), Some(cc), Some(cts), Some(dtl), Some(cnt)) =
+            (doc_ids, chunk_indexes, chunk_counts, chunk_token_starts, doc_token_lens, contents)
+        {
+            for i in 0..n {
+                // BM25 score → distance: higher score = more relevant = lower distance.
+                let score = scores.map(|s| s.value(i)).unwrap_or(0.0);
+                let distance = 1.0 / (1.0 + score);
+                hits.push(ChunkHit {
+                    doc_id: ids.value(i).to_owned(),
+                    distance,
+                    distance_kind: DistanceKind::Normalised,
                     chunk_index: ci.value(i),
                     chunk_count: cc.value(i),
                     chunk_token_start: cts.value(i),
@@ -727,13 +864,15 @@ fn rrf_merge(vector_hits: Vec<ChunkHit>, fts_hits: Vec<ChunkHit>) -> Vec<ChunkHi
         .into_iter()
         .map(|(score, mut hit)| {
             hit.distance = (1.0 - score / max_score).clamp(0.0, 1.0);
+            hit.distance_kind = DistanceKind::Normalised;
             hit
         })
         .collect()
 }
 
 /// Dedup chunk-level hits to document-level hits (best chunk per doc_id).
-/// Applies the distance transform (clamp01(lance_cosine/2)).
+/// Distance transform is mode-aware: only RawCosine hits get `normalized_cosine_from_lance`;
+/// already-normalised hits (FTS, RRF) pass through unchanged.
 pub fn dedup_chunks_to_documents(hits: Vec<ChunkHit>, snippet: bool) -> Vec<SearchHit> {
     use std::collections::HashMap;
     use crate::kernel::distance::normalized_cosine_from_lance;
@@ -754,9 +893,13 @@ pub fn dedup_chunks_to_documents(hits: Vec<ChunkHit>, snippet: bool) -> Vec<Sear
         .into_values()
         .map(|hit| {
             let location = chunk_location(hit.chunk_token_start as u32, hit.doc_token_len as u32);
+            let final_distance = match hit.distance_kind {
+                DistanceKind::RawCosine => normalized_cosine_from_lance(hit.distance),
+                DistanceKind::Normalised => hit.distance,
+            };
             SearchHit {
                 id: hit.doc_id,
-                distance: normalized_cosine_from_lance(hit.distance),
+                distance: final_distance,
                 chunk: ChunkInfo {
                     index: hit.chunk_index as u32,
                     count: hit.chunk_count as u32,
@@ -948,6 +1091,7 @@ mod tests {
             ChunkHit {
                 doc_id: "doc/1".to_owned(),
                 distance: 0.8,
+                distance_kind: DistanceKind::RawCosine,
                 chunk_index: 0,
                 chunk_count: 2,
                 chunk_token_start: 0,
@@ -957,6 +1101,7 @@ mod tests {
             ChunkHit {
                 doc_id: "doc/1".to_owned(),
                 distance: 0.4, // Better (smaller distance) — this chunk wins.
+                distance_kind: DistanceKind::RawCosine,
                 chunk_index: 1,
                 chunk_count: 2,
                 chunk_token_start: 500,
@@ -966,6 +1111,7 @@ mod tests {
             ChunkHit {
                 doc_id: "doc/2".to_owned(),
                 distance: 0.6,
+                distance_kind: DistanceKind::RawCosine,
                 chunk_index: 0,
                 chunk_count: 1,
                 chunk_token_start: 0,
@@ -994,6 +1140,7 @@ mod tests {
         let hits = vec![ChunkHit {
             doc_id: "doc/s".to_owned(),
             distance: 0.2,
+            distance_kind: DistanceKind::RawCosine,
             chunk_index: 0,
             chunk_count: 1,
             chunk_token_start: 0,
@@ -1018,6 +1165,7 @@ mod tests {
         let hits = vec![ChunkHit {
             doc_id: "doc/x".to_owned(),
             distance: 0.0, // Self-distance in lance cosine.
+            distance_kind: DistanceKind::RawCosine,
             chunk_index: 0,
             chunk_count: 1,
             chunk_token_start: 0,
@@ -1026,6 +1174,126 @@ mod tests {
         }];
         let results = dedup_chunks_to_documents(hits, false);
         assert_eq!(results[0].distance, 0.0, "self-distance maps to 0");
+    }
+
+    // --- #3: normalised distances skip the transform in dedup ---
+    #[test]
+    fn dedup_normalised_distances_pass_through() {
+        let hits = vec![
+            ChunkHit {
+                doc_id: "doc/rrf".to_owned(),
+                distance: 0.42, // Already normalised (e.g., from RRF).
+                distance_kind: DistanceKind::Normalised,
+                chunk_index: 0,
+                chunk_count: 1,
+                chunk_token_start: 0,
+                doc_token_len: 10,
+                content: "rrf hit".to_owned(),
+            },
+        ];
+        let results = dedup_chunks_to_documents(hits, false);
+        // Must pass through unchanged — NOT halved by normalized_cosine_from_lance.
+        assert!(
+            (results[0].distance - 0.42).abs() < f32::EPSILON,
+            "normalised distance should pass through unchanged, got {}",
+            results[0].distance,
+        );
+    }
+
+    // --- #1: FTS distances are non-zero and ordered (BM25 score preserved) ---
+    #[test]
+    fn fts_hits_have_nonzero_ordered_distances() {
+        // Simulate FTS hits with BM25 scores converted to distances.
+        let hits = vec![
+            ChunkHit {
+                doc_id: "doc/best".to_owned(),
+                distance: 1.0 / (1.0 + 10.0), // High BM25 score → low distance.
+                distance_kind: DistanceKind::Normalised,
+                chunk_index: 0,
+                chunk_count: 1,
+                chunk_token_start: 0,
+                doc_token_len: 10,
+                content: "best match".to_owned(),
+            },
+            ChunkHit {
+                doc_id: "doc/worse".to_owned(),
+                distance: 1.0 / (1.0 + 2.0), // Lower BM25 score → higher distance.
+                distance_kind: DistanceKind::Normalised,
+                chunk_index: 0,
+                chunk_count: 1,
+                chunk_token_start: 0,
+                doc_token_len: 10,
+                content: "worse match".to_owned(),
+            },
+        ];
+
+        let results = dedup_chunks_to_documents(hits, false);
+        assert_eq!(results.len(), 2);
+        // Best match (lowest distance) should be first after sorting.
+        assert_eq!(results[0].id, "doc/best");
+        assert_eq!(results[1].id, "doc/worse");
+        // Both distances must be non-zero.
+        assert!(results[0].distance > 0.0, "FTS distance must be > 0");
+        assert!(results[1].distance > 0.0, "FTS distance must be > 0");
+        // Best has lower distance.
+        assert!(results[0].distance < results[1].distance);
+    }
+
+    // --- #2: Vector distance scale anchors (locks factor-of-2 correctness) ---
+    // With DistanceType::Cosine on the scanner, _distance is a true cosine distance
+    // in [0,2]. normalized_cosine_from_lance(d) = d/2 maps to [0,1].
+    // These anchors catch any factor-of-2 scale bug permanently.
+    #[test]
+    fn vector_distance_scale_anchors_through_dedup() {
+        // Anchor 1: self-distance (identical vectors) → 0.0
+        let hit_identical = ChunkHit {
+            doc_id: "doc/self".to_owned(),
+            distance: 0.0, // Lance cosine: identical vectors
+            distance_kind: DistanceKind::RawCosine,
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            content: "self".to_owned(),
+        };
+        let results = dedup_chunks_to_documents(vec![hit_identical], false);
+        assert_eq!(results[0].distance, 0.0, "identical → 0.0");
+
+        // Anchor 2: orthogonal vectors (Lance cosine distance = 1.0) → 0.5
+        let hit_orthogonal = ChunkHit {
+            doc_id: "doc/ortho".to_owned(),
+            distance: 1.0, // Lance cosine: orthogonal
+            distance_kind: DistanceKind::RawCosine,
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            content: "ortho".to_owned(),
+        };
+        let results = dedup_chunks_to_documents(vec![hit_orthogonal], false);
+        assert!(
+            (results[0].distance - 0.5).abs() < f32::EPSILON,
+            "orthogonal → 0.5, got {}",
+            results[0].distance,
+        );
+
+        // Anchor 3: opposite vectors (Lance cosine distance = 2.0) → 1.0
+        let hit_opposite = ChunkHit {
+            doc_id: "doc/opp".to_owned(),
+            distance: 2.0, // Lance cosine: opposite
+            distance_kind: DistanceKind::RawCosine,
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            content: "opposite".to_owned(),
+        };
+        let results = dedup_chunks_to_documents(vec![hit_opposite], false);
+        assert_eq!(results[0].distance, 1.0, "opposite → 1.0");
+
+        // The OLD bug: L2² for orthogonal unit vectors = 2.0, which would give
+        // normalized_cosine_from_lance(2.0) = 1.0 (WRONG — should be 0.5).
+        // This test catches any regression where L2² is fed to the transform.
     }
 
     // --- statistics reflect indexed data ---
@@ -1216,6 +1484,7 @@ mod tests {
             ChunkHit {
                 doc_id: "A".to_owned(),
                 distance: 0.1,
+                distance_kind: DistanceKind::RawCosine,
                 chunk_index: 0,
                 chunk_count: 1,
                 chunk_token_start: 0,
@@ -1225,6 +1494,7 @@ mod tests {
             ChunkHit {
                 doc_id: "B".to_owned(),
                 distance: 0.3,
+                distance_kind: DistanceKind::RawCosine,
                 chunk_index: 0,
                 chunk_count: 1,
                 chunk_token_start: 0,
@@ -1234,6 +1504,7 @@ mod tests {
             ChunkHit {
                 doc_id: "C".to_owned(),
                 distance: 0.5,
+                distance_kind: DistanceKind::RawCosine,
                 chunk_index: 0,
                 chunk_count: 1,
                 chunk_token_start: 0,
@@ -1246,7 +1517,8 @@ mod tests {
         let fts_hits = vec![
             ChunkHit {
                 doc_id: "B".to_owned(),
-                distance: 0.0,
+                distance: 0.1, // FTS distance (from BM25 conversion).
+                distance_kind: DistanceKind::Normalised,
                 chunk_index: 0,
                 chunk_count: 1,
                 chunk_token_start: 0,
@@ -1255,7 +1527,8 @@ mod tests {
             },
             ChunkHit {
                 doc_id: "C".to_owned(),
-                distance: 0.0,
+                distance: 0.2,
+                distance_kind: DistanceKind::Normalised,
                 chunk_index: 0,
                 chunk_count: 1,
                 chunk_token_start: 0,
@@ -1264,7 +1537,8 @@ mod tests {
             },
             ChunkHit {
                 doc_id: "D".to_owned(),
-                distance: 0.0,
+                distance: 0.3,
+                distance_kind: DistanceKind::Normalised,
                 chunk_index: 0,
                 chunk_count: 1,
                 chunk_token_start: 0,

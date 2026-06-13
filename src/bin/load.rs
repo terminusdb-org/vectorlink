@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use tdb_search::chunk;
 use tdb_search::embed::{self, EmbeddingRole};
 use tdb_search::ingest;
+use tdb_search::kernel::distance::l2_normalize;
 use tdb_search::kernel::model::Operation;
 use tdb_search::store::lance::{ChunkRow, LanceStore};
 
@@ -309,7 +310,7 @@ async fn io_index_one(
     }
 
     let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-    let embeddings =
+    let mut embeddings =
         embed::io_embed(provider, &chunk_texts, EmbeddingRole::Document, http_client)
             .await
             .map_err(|e| format!("embedding failed: {}", e))?;
@@ -320,6 +321,11 @@ async fn io_index_one(
             chunks.len(),
             embeddings.len()
         ));
+    }
+
+    // L2-normalise for cosine distance (same as the service pipeline).
+    for emb in &mut embeddings {
+        l2_normalize(emb);
     }
 
     let doc_type = ingest::extract_doc_type(doc_id);

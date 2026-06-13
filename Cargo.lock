@@ -7367,6 +7367,7 @@ dependencies = [
  "hyper",
  "lance",
  "lance-index",
+ "lance-linalg",
  "lancedb",
  "reqwest 0.12.28",
  "serde",

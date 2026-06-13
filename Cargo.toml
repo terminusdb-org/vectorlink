@@ -15,6 +15,7 @@ base64 = "0.22"
 hyper = { version = "1", features = ["full"] }
 lance = "=7.0.0"
 lance-index = "=7.0.0"
+lance-linalg = "=7.0.0"
 lancedb = "=0.30.0"
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }

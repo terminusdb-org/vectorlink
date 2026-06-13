@@ -101,17 +101,23 @@ pub fn chunk_text(
     let count = boundaries.len() as u32;
 
     // Second pass: extract text for each chunk using byte offsets from the tokenizer.
+    // Safety: tokenizer offsets may not land on char boundaries (normalising tokenizers).
+    // We clamp to the nearest valid char boundary to prevent panics.
     let chunks = boundaries
         .iter()
         .enumerate()
         .map(|(i, &(tok_start, tok_end))| {
             // Get the byte range from the tokenizer's offset mapping.
-            let byte_start = offsets[tok_start].0;
-            let byte_end = if tok_end > 0 && tok_end <= offsets.len() {
+            let raw_start = offsets[tok_start].0;
+            let raw_end = if tok_end > 0 && tok_end <= offsets.len() {
                 offsets[tok_end - 1].1
             } else {
                 text.len()
             };
+
+            // Clamp to char boundaries (round start down, end up).
+            let byte_start = snap_to_char_boundary_down(text, raw_start);
+            let byte_end = snap_to_char_boundary_up(text, raw_end);
             let chunk_text = &text[byte_start..byte_end];
 
             Chunk {
@@ -125,6 +131,28 @@ pub fn chunk_text(
         .collect();
 
     Ok(chunks)
+}
+
+/// Snap a byte offset DOWN to the nearest char boundary (or 0).
+fn snap_to_char_boundary_down(text: &str, offset: usize) -> usize {
+    let clamped = offset.min(text.len());
+    // Walk backwards until we hit a char boundary.
+    let mut pos = clamped;
+    while pos > 0 && !text.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
+
+/// Snap a byte offset UP to the nearest char boundary (or text.len()).
+fn snap_to_char_boundary_up(text: &str, offset: usize) -> usize {
+    let clamped = offset.min(text.len());
+    // Walk forwards until we hit a char boundary.
+    let mut pos = clamped;
+    while pos < text.len() && !text.is_char_boundary(pos) {
+        pos += 1;
+    }
+    pos
 }
 
 /// Compute chunk location as a fraction [0, 1].
@@ -290,5 +318,47 @@ mod tests {
         let params = ChunkParams { max_tokens: 0, overlap: 0 };
         let result = chunk_text(&tok, "hello", &params);
         assert!(result.is_err());
+    }
+
+    // --- #4: multi-byte chars don't panic ---
+    #[test]
+    fn multibyte_text_does_not_panic() {
+        let tok = test_tokenizer();
+        // Force multi-chunk by using small max_tokens.
+        let params = ChunkParams { max_tokens: 10, overlap: 2 };
+
+        // Text with multi-byte characters (3-byte UTF-8).
+        let text = "你好世界 这是一个测试句子 包含很多中文字符 用来测试分块是否正确处理多字节字符";
+        let result = chunk_text(&tok, text, &params);
+        assert!(result.is_ok(), "must not panic on multi-byte text: {:?}", result.err());
+
+        let chunks = result.unwrap();
+        assert!(!chunks.is_empty());
+        // All chunks must be valid UTF-8 (guaranteed by &str, but check non-empty).
+        for chunk in &chunks {
+            assert!(!chunk.text.is_empty() || chunk.doc_token_len == 0);
+        }
+    }
+
+    // --- char boundary helpers ---
+    #[test]
+    fn snap_to_char_boundary_ascii() {
+        let text = "hello world";
+        assert_eq!(snap_to_char_boundary_down(text, 5), 5);
+        assert_eq!(snap_to_char_boundary_up(text, 5), 5);
+    }
+
+    #[test]
+    fn snap_to_char_boundary_multibyte() {
+        // "你好" = 6 bytes (3 per char). Offset 1 is in the middle of '你'.
+        let text = "你好";
+        // Down: snap from middle of first char → 0.
+        assert_eq!(snap_to_char_boundary_down(text, 1), 0);
+        assert_eq!(snap_to_char_boundary_down(text, 2), 0);
+        assert_eq!(snap_to_char_boundary_down(text, 3), 3); // Start of '好'.
+        // Up: snap from middle of first char → 3.
+        assert_eq!(snap_to_char_boundary_up(text, 1), 3);
+        assert_eq!(snap_to_char_boundary_up(text, 2), 3);
+        assert_eq!(snap_to_char_boundary_up(text, 3), 3);
     }
 }

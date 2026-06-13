@@ -13,6 +13,7 @@ use crate::chunk::{self, ChunkParams};
 use crate::config::Config;
 use crate::embed::{self, EmbeddingRole, Provider};
 use crate::ingest;
+use crate::kernel::distance::l2_normalize;
 use crate::kernel::error::ServiceError;
 use crate::kernel::model::{
     parse_domain, BranchName, Domain, LastIndexed, Operation, Ref, SearchHit, SearchMode,
@@ -140,7 +141,10 @@ impl SearchService {
         let task_id_clone = task_id.clone();
 
         // Spawn the indexing pipeline as a background task.
-        tokio::spawn(async move {
+        // Monitor the JoinHandle so panics are captured → Error, never Pending forever.
+        let store_for_panic = Arc::clone(&store);
+        let task_id_for_panic = task_id.clone();
+        let handle = tokio::spawn(async move {
             let ctx = PipelineCtx {
                 store: &store,
                 tokenizer: &tokenizer,
@@ -172,6 +176,20 @@ impl SearchService {
                         )
                         .await;
                 }
+            }
+        });
+
+        // Monitor: if the spawned task panics, record Error (never leave Pending).
+        tokio::spawn(async move {
+            if let Err(join_err) = handle.await {
+                let msg = if join_err.is_panic() {
+                    format!("pipeline panicked: {:?}", join_err)
+                } else {
+                    format!("pipeline cancelled: {:?}", join_err)
+                };
+                store_for_panic
+                    .record_task(&task_id_for_panic, TaskStatus::Error { error: msg })
+                    .await;
             }
         });
 
@@ -283,10 +301,11 @@ impl SearchService {
         .await
         .map_err(|e| ServiceError::Internal(format!("embedding failed: {}", e)))?;
 
-        let query_embedding = embeddings
+        let mut query_embedding = embeddings
             .into_iter()
             .next()
             .ok_or_else(|| ServiceError::Internal("no embedding returned".to_owned()))?;
+        l2_normalize(&mut query_embedding);
 
         let search_query = SearchQuery {
             query_embedding,
@@ -342,6 +361,13 @@ impl SearchService {
     ) -> Result<Vec<SearchHit>, ServiceError> {
         let rp =
             parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
+
+        if !self.is_search_ready() {
+            return Err(ServiceError::Unavailable(
+                "search capability not ready (embedding backend cold)".to_owned(),
+            ));
+        }
+
         let domain = Domain::from_resource_path(&rp);
         let domain_str = domain.as_str().to_owned();
         let branch = extract_branch(&rp);
@@ -374,10 +400,11 @@ impl SearchService {
         .await
         .map_err(|e| ServiceError::Internal(format!("embedding for similar failed: {}", e)))?;
 
-        let query_embedding = embeddings
+        let mut query_embedding = embeddings
             .into_iter()
             .next()
             .ok_or_else(|| ServiceError::Internal("no embedding returned for similar".to_owned()))?;
+        l2_normalize(&mut query_embedding);
 
         let search_query = SearchQuery {
             query_embedding,
@@ -483,11 +510,16 @@ struct PipelineCtx<'a> {
 
 /// Run the full indexing pipeline for a set of operations.
 /// Returns (indexed_count, skipped_docs) on success, or error message on failure.
+/// Serialised per-(domain, branch) to prevent concurrent pushes from corrupting
+/// commit→version isolation.
 async fn io_run_index_pipeline(
     ctx: &PipelineCtx<'_>,
     commit: &str,
     operations: Vec<Operation>,
 ) -> Result<(u64, Vec<SkippedDoc>), String> {
+    // Acquire the per-branch lock. Held for the entire upsert→tag critical section.
+    let _guard = ctx.store.acquire_pipeline_lock(ctx.domain, ctx.branch).await;
+
     let mut indexed_count: u64 = 0;
     let mut skipped: Vec<SkippedDoc> = Vec::new();
     let mut last_version: u64 = 0;
@@ -575,9 +607,9 @@ async fn io_index_document(
         return Err("chunking produced zero chunks".to_owned());
     }
 
-    // 2. Embed all chunks in a single batch.
+    // 2. Embed all chunks in a single batch, then L2-normalise for cosine distance.
     let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-    let embeddings =
+    let mut embeddings =
         embed::io_embed(ctx.provider, &chunk_texts, EmbeddingRole::Document, ctx.http_client)
             .await
             .map_err(|e| format!("embedding failed: {}", e))?;
@@ -588,6 +620,11 @@ async fn io_index_document(
             chunks.len(),
             embeddings.len()
         ));
+    }
+
+    // L2-normalise embeddings so that Lance's L2² metric = cosine distance.
+    for emb in &mut embeddings {
+        l2_normalize(emb);
     }
 
     // 3. Build chunk rows.
