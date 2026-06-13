@@ -93,35 +93,68 @@ clippy:
 	fi
 
 # ─────────────────────────────── build ───────────────────────────────────
+# BINARIES: the crate's two bin targets, copied to the host target/ after a
+# build so artifacts land where developers expect (the build itself runs
+# against the named volume for Lima speed; see copy-binaries below).
+BINARIES := tdb-search tdb-search-load
+
+# copy-binaries: copy built bin artifacts from the named target VOLUME out to
+# the host ./target/$(PROFILE_DIR)/ so they are visible on the host. The build
+# runs against the volume (fast, avoids Lima virtiofs exec-bit issues), which
+# shadows host ./target inside the container — so without this step the host
+# target/ never receives the binary. Mounts the volume read-only at /vol and
+# the host target/ read-write at /host, then copies each bin if it exists.
+# PROFILE_DIR is "debug", "release", or "production".
+.PHONY: copy-binaries
+copy-binaries:
+	@mkdir -p target/$(PROFILE_DIR)
+	@docker run --rm \
+		--user "$$(id -u):$$(id -g)" \
+		-v $(TARGET_VOLUME):/vol:ro \
+		-v "$$(pwd)/target":/host \
+		$(BUILD_IMAGE) \
+		bash -c 'set -e; for b in $(BINARIES); do \
+			if [ -f "/vol/$(PROFILE_DIR)/$$b" ]; then \
+				mkdir -p "/host/$(PROFILE_DIR)"; \
+				cp -f "/vol/$(PROFILE_DIR)/$$b" "/host/$(PROFILE_DIR)/$$b"; \
+				echo "✓ target/$(PROFILE_DIR)/$$b"; \
+			fi; \
+		done'
+
 # dev: incremental DEBUG build. Fast (seconds after first build). Use during
-# development for edit-build-test cycles.
+# development for edit-build-test cycles. Binary copied to host target/debug/.
 .PHONY: dev
 dev:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
 		$(DOCKER_RUN) \
 			cargo build ; \
+		$(MAKE) copy-binaries PROFILE_DIR=debug ; \
 	else \
 		echo "• dev build skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
 
 # build-release: RELEASE build (no LTO). Fast enough for `make pr` gate
 # (incremental relinks). LTO only in `make release-image` (production publish).
+# Binary copied to host target/release/.
 .PHONY: build-release
 build-release:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
 		$(DOCKER_RUN) \
 			cargo build --release ; \
+		$(MAKE) copy-binaries PROFILE_DIR=release ; \
 	else \
 		echo "• release build skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
 
 # release-image: PRODUCTION build with LTO + codegen-units=1 + opt-level=s.
 # Slow (15-20 min). Run ONLY when cutting a shippable image, NOT per-commit.
+# Binary copied to host target/production/.
 .PHONY: release-image
 release-image:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
 		$(DOCKER_RUN) \
 			cargo build --profile production ; \
+		$(MAKE) copy-binaries PROFILE_DIR=production ; \
 	else \
 		echo "• release-image build skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
