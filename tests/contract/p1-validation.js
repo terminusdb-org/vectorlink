@@ -1,5 +1,5 @@
 /**
- * P1-VAL-* and P1-GS-* — Parameter validation and graphspec tests (Phase 1).
+ * P1-VAL-* and P1-GS-* — Parameter validation and graphspec tests.
  */
 
 const { expect } = require("chai")

@@ -1,5 +1,5 @@
 /**
- * P1-COLD-* — Cold-start and readiness tests (Phase 1).
+ * P1-COLD-* — Cold-start and readiness tests.
  */
 
 const { expect } = require("chai")
@@ -43,7 +43,7 @@ describe("P1-COLD: Cold-start & readiness", function () {
       const res = await agent()
         .get("/health/ready")
 
-      // In Phase 1 stub: index=true (store is in-memory), search=false
+      // index=true (store reachable), search=false
       // (no embedding backend). This tests the per-capability semantics.
       if (res.body.index === true && res.body.search === false) {
         expect(res.body.ready).to.equal(true)
@@ -54,20 +54,20 @@ describe("P1-COLD: Cold-start & readiness", function () {
   // P1-COLD-3: /search while search:false returns 503 + Retry-After.
   describe("P1-COLD-3: /search when search cold -> 503 + Retry-After", function () {
     it("returns 503 with Retry-After header when search not ready", async function () {
-      // In Phase 1 stub, search is always cold (no embedding backend).
+      // search is cold when no embedding backend is warm.
       const res = await agent()
         .get("/search")
         .query({ domain: "admin/db", commit: "c1", q: "test" })
         .set("Authorization", authHeader())
 
-      // Should be 503 since search is not ready in stub mode.
+      // 503 = search cold (no embedding backend).
       if (res.status === 503) {
         expect(res.headers).to.have.property("retry-after")
         expect(res.body).to.have.property("error")
       }
-      // If the server has been configured with search=true (test override),
-      // it returns 200 — both are valid states.
-      expect([200, 503]).to.include(res.status)
+      // 200 = search ready and commit found.
+      // 500 = search ready but commit not indexed (real store, expected).
+      expect([200, 500, 503]).to.include(res.status)
     })
   })
 

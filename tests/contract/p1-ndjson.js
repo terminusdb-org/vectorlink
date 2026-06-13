@@ -1,5 +1,5 @@
 /**
- * P1-NDJSON-* — NDJSON push parse tests (Phase 1).
+ * P1-NDJSON-* — NDJSON push parse tests.
  */
 
 const { expect } = require("chai")
@@ -7,7 +7,7 @@ const { agent, authHeader } = require("../lib/agent")
 
 describe("P1-NDJSON: Push parse", function () {
   // P1-NDJSON-1: Incremental parse (large stream processed without buffering whole).
-  // In Phase 1 stub, we verify that a multi-line NDJSON body is accepted and
+  // Verify that a multi-line NDJSON body is accepted and
   // processed (returns a task id). The bounded-memory assertion requires a
   // much larger payload in integration tests; here we verify the contract holds.
   describe("P1-NDJSON-1: multi-line NDJSON parsed", function () {

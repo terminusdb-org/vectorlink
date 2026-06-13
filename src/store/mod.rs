@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 
-//! Store — in-memory stub implementation.
-//! Provides the trait interface that a persistent backend implements.
-//! No real persistence; all state lives in memory for contract testing.
+//! Store — storage backends.
+//!
+//! InMemoryStore: stub for contract testing.
+//! LanceStore: real LanceDB-backed persistence with versioned vector search.
+
+pub mod lance;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,6 +20,7 @@ use crate::kernel::model::{
 type PendingKey = (String, String);
 
 /// In-memory stub store. Thread-safe via Arc<RwLock<...>>.
+/// Retained for contract tests; production uses LanceStore.
 #[derive(Debug, Clone)]
 pub struct InMemoryStore {
     inner: Arc<RwLock<StoreInner>>,
@@ -32,6 +36,12 @@ struct StoreInner {
     assignments: HashMap<(String, String), String>,
     /// Last-indexed tracking: (domain, branch) -> (commit, version).
     last_indexed: HashMap<(String, String), (Option<String>, u64)>,
+}
+
+impl Default for InMemoryStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InMemoryStore {

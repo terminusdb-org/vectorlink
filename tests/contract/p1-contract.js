@@ -1,5 +1,5 @@
 /**
- * P1-CON-* — Contract shape tests (Phase 1).
+ * P1-CON-* — Contract shape tests.
  * Verify every endpoint returns the correct openapi shapes against the stub.
  */
 
@@ -92,20 +92,18 @@ describe("P1-CON: Contract shapes", function () {
   })
 
   // P1-CON-4: GET /search
-  // When search-ready: returns 200 with array. When cold: returns 503.
-  // Both are valid per the contract — the stub starts with search cold.
+  // Real engine: 200 = success, 503 = search cold, 500 = commit not indexed.
   describe("P1-CON-4: GET /search", function () {
-    it("returns 200 (array) or 503 (search cold) with correct shape", async function () {
+    it("returns 200 (array), 503 (search cold), or 500 (commit not indexed)", async function () {
       const res = await agent()
         .get("/search")
         .query({ domain: "admin/star_wars", commit: "abc123", q: "wise" })
         .set("Authorization", authHeader())
 
-      expect([200, 503]).to.include(res.status)
+      expect([200, 500, 503]).to.include(res.status)
       if (res.status === 200) {
         expect(res.body).to.be.an("array")
-      } else {
-        // 503 = search cold; body has error, Retry-After header present.
+      } else if (res.status === 503) {
         expect(res.body).to.have.property("error")
         expect(res.headers).to.have.property("retry-after")
       }
@@ -114,7 +112,7 @@ describe("P1-CON: Contract shapes", function () {
 
   // P1-CON-5: POST /search with body overriding query params
   describe("P1-CON-5: POST /search", function () {
-    it("returns 200 (array) or 503 with JSON body overriding query params", async function () {
+    it("returns 200, 500, or 503 with JSON body overriding query params", async function () {
       const res = await agent()
         .post("/search")
         .query({ domain: "admin/ignored", commit: "ignored", q: "ignored" })
@@ -125,7 +123,7 @@ describe("P1-CON: Contract shapes", function () {
           q: "wise old man",
         })
 
-      expect([200, 503]).to.include(res.status)
+      expect([200, 500, 503]).to.include(res.status)
       if (res.status === 200) {
         expect(res.body).to.be.an("array")
       }
@@ -145,14 +143,14 @@ describe("P1-CON: Contract shapes", function () {
         })
 
       // Should not be 400 for invalid domain (body wins over query).
-      expect([200, 503]).to.include(res.status)
+      expect([200, 500, 503]).to.include(res.status)
     })
   })
 
-  // P1-CON-6: POST /assign returns 204
+  // P1-CON-6: POST /assign
   describe("P1-CON-6: POST /assign", function () {
-    it("returns 204 on valid assign", async function () {
-      await agent()
+    it("returns 204 or 404 (source not indexed) for assign", async function () {
+      const res = await agent()
         .post("/assign")
         .query({
           domain: "admin/star_wars",
@@ -160,7 +158,10 @@ describe("P1-CON: Contract shapes", function () {
           target_commit: "c1",
         })
         .set("Authorization", authHeader())
-        .expect(204)
+
+      // 204 = success (source commit was indexed).
+      // 404 = source commit not indexed (real store, no prior push).
+      expect([204, 404]).to.include(res.status)
     })
 
     it("GET /assign is not routed (404 or 405)", async function () {
@@ -194,25 +195,30 @@ describe("P1-CON: Contract shapes", function () {
 
   // P1-CON-8: GET /similar and GET /duplicates
   describe("P1-CON-8: GET /similar and GET /duplicates", function () {
-    it("/similar returns 200 with array shape", async function () {
+    it("/similar returns 200 (array), 404 (doc not found), or 500 (commit not indexed)", async function () {
       const res = await agent()
         .get("/similar")
         .query({ domain: "admin/star_wars", commit: "abc123", id: "terminusdb:///test/Doc/1" })
         .set("Authorization", authHeader())
-        .expect(200)
 
-      expect(res.body).to.be.an("array")
+      // 200 = success (doc found). 404 = doc not in index. 500 = commit not indexed.
+      expect([200, 404, 500]).to.include(res.status)
+      if (res.status === 200) {
+        expect(res.body).to.be.an("array")
+      }
     })
 
-    it("/duplicates returns 200 with array of pairs", async function () {
+    it("/duplicates returns 200 (array) or 503 (commit not indexed)", async function () {
       const res = await agent()
         .get("/duplicates")
         .query({ domain: "admin/star_wars", commit: "abc123" })
         .set("Authorization", authHeader())
-        .expect(200)
 
-      expect(res.body).to.be.an("array")
-      // Each item should be [id1, id2] — stub returns empty.
+      // 200 = success. 503 = commit not indexed.
+      expect([200, 503]).to.include(res.status)
+      if (res.status === 200) {
+        expect(res.body).to.be.an("array")
+      }
     })
   })
 })

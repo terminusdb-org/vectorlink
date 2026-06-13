@@ -31,6 +31,7 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs \
 
 # Copy full source and build for real.
 COPY src/ src/
+COPY spikes/tokenizer/tokenizer.json /build/tokenizer.json
 RUN cargo build --release
 
 # ──────────────────────────── Runtime stage ────────────────────────────────
@@ -42,10 +43,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/tdb-search /usr/local/bin/tdb-search
+COPY --from=builder /build/tokenizer.json /opt/tdb-search/tokenizer.json
+
+# Data directory for LanceDB datasets.
+RUN mkdir -p /data && chown 65534:65534 /data
 
 # Non-root user for security.
 RUN useradd -r -s /bin/false tdb-search
 USER tdb-search
+
+ENV TDB_SEARCH_TOKENIZER_PATH=/opt/tdb-search/tokenizer.json
+ENV TDB_SEARCH_DATA_DIR=/data
 
 EXPOSE 8080
 

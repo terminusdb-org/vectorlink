@@ -1,10 +1,10 @@
 /**
- * P1-AUTH-* — Admin secret gate tests (Phase 1).
+ * P1-AUTH-* — Admin secret gate tests.
  * Verify authentication enforcement on all endpoints.
  */
 
 const { expect } = require("chai")
-const { agent, authHeader, wrongAuthHeader } = require("../lib/agent")
+const { agent, wrongAuthHeader } = require("../lib/agent")
 
 describe("P1-AUTH: Admin secret gate", function () {
   const functionalEndpoints = [

@@ -3,7 +3,7 @@
 //! HTTP handlers — map wire requests to service calls and serialise responses.
 //! No business logic; thin translation only.
 
-use axum::extract::{Query, State};
+use axum::extract::{Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
@@ -165,6 +165,25 @@ fn validate_mode(mode: Option<&str>) -> Result<(), Response> {
         }
     }
     Ok(())
+}
+
+/// Extract repeated query parameters by name from a raw query string.
+/// Handles both `?key=A&key=B` (OpenAPI explode:true) and `?key[]=A&key[]=B` formats.
+fn extract_repeated_param(raw_query: Option<&str>, name: &str) -> Vec<String> {
+    let query = match raw_query {
+        Some(q) => q,
+        None => return Vec::new(),
+    };
+    let bracket_name = format!("{}[]", name);
+    form_urlencoded::parse(query.as_bytes())
+        .filter_map(|(k, v)| {
+            if k == name || k == bracket_name {
+                Some(v.into_owned())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Validate pagination parameters.
@@ -337,6 +356,7 @@ async fn handle_assign(
 async fn handle_search_get(
     State(state): State<AppState>,
     headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
     Query(params): Query<SearchGetParams>,
 ) -> Response {
     if let Err(r) = validate_data_version_header(&headers) {
@@ -378,7 +398,32 @@ async fn handle_search_get(
         return r;
     }
 
-    match state.service.search(&domain, &commit, &q).await {
+    let mode = params
+        .mode
+        .as_deref()
+        .and_then(crate::kernel::model::SearchMode::parse)
+        .unwrap_or(crate::kernel::model::SearchMode::Hybrid);
+    let start = params.start.unwrap_or(0).max(0) as usize;
+    let count = params.count.unwrap_or(10).max(1) as usize;
+    let doc_type_filter = extract_repeated_param(raw_query.as_deref(), "doc_type");
+    let doc_id_filter = extract_repeated_param(raw_query.as_deref(), "doc_id");
+    let snippet = params.snippet.unwrap_or(false);
+
+    match state
+        .service
+        .search_with_options(
+            &domain,
+            &commit,
+            &q,
+            mode,
+            start,
+            count,
+            &doc_type_filter,
+            &doc_id_filter,
+            snippet,
+        )
+        .await
+    {
         Ok(results) => {
             let mut response = Json(results).into_response();
             response.headers_mut().insert(
@@ -435,7 +480,31 @@ async fn handle_search_post(
         return r;
     }
 
-    match state.service.search(&domain, &commit, &q).await {
+    let parsed_mode = mode
+        .as_deref()
+        .and_then(crate::kernel::model::SearchMode::parse)
+        .unwrap_or(crate::kernel::model::SearchMode::Hybrid);
+    let start_val = start.unwrap_or(0).max(0) as usize;
+    let count_val = count.unwrap_or(10).max(1) as usize;
+    let doc_type_filter = body.doc_type.unwrap_or_default();
+    let doc_id_filter = body.doc_id.unwrap_or_default();
+    let snippet = body.snippet.unwrap_or(false);
+
+    match state
+        .service
+        .search_with_options(
+            &domain,
+            &commit,
+            &q,
+            parsed_mode,
+            start_val,
+            count_val,
+            &doc_type_filter,
+            &doc_id_filter,
+            snippet,
+        )
+        .await
+    {
         Ok(results) => {
             let mut response = Json(results).into_response();
             response.headers_mut().insert(

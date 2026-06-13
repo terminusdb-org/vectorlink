@@ -26,21 +26,24 @@ CARGO_MANIFEST  := Cargo.toml
 help:
 	@echo "tdb-search — make targets"
 	@echo ""
-	@echo "  make lint          Run ALL component linters (must pass before commit)"
-	@echo "  make lint-openapi  Strict OpenAPI 3.1 lint (Redocly $(REDOCLY_VERSION))"
-	@echo "  make clippy        Rust lint (-D warnings) — runs once the crate exists"
-	@echo "  make test          Unit/integration tests — run once the crate exists"
-	@echo "  make docs          Generate reviewable API docs into $(DOCS_OUT)"
-	@echo "  make docs-rebuild  Clean rebuild of the dist/api API docs"
-	@echo "  make verify        lint + test (no side effects)"
-	@echo "  make pr            Full pre-PR gate: lint + test + docs"
-	@echo "  make clean         Remove generated artifacts ($(DIST)/)"
+	@echo "  make dev              Incremental DEBUG build (fast iteration)"
+	@echo "  make build-release    Production RELEASE build (lto=thin, slow)"
+	@echo "  make lint             Run ALL component linters (must pass before commit)"
+	@echo "  make lint-openapi     Strict OpenAPI 3.1 lint (Redocly $(REDOCLY_VERSION))"
+	@echo "  make clippy           Rust lint (-D warnings) — runs once the crate exists"
+	@echo "  make test             Rust unit tests — run once the crate exists"
+	@echo "  make test-integration Run mocha integration suite against DEBUG engine"
+	@echo "  make docs             Generate reviewable API docs into $(DOCS_OUT)"
+	@echo "  make docs-rebuild     Clean rebuild of the dist/api API docs"
+	@echo "  make verify           lint + test (no side effects)"
+	@echo "  make pr               Full pre-PR gate: lint + test + release build + docs"
+	@echo "  make clean            Remove generated artifacts ($(DIST)/)"
 
 # ─────────────────────────────── lint ────────────────────────────────────
 # Aggregate linter — every component. Add new component linters as prereqs here.
 # This is the gate that MUST pass before committing code.
 .PHONY: lint
-lint: lint-openapi clippy
+lint: lint-openapi clippy lint-tests
 	@echo "✓ all linters passed"
 
 # Strict OpenAPI lint. redocly.yaml promotes the recommended ruleset to errors
@@ -67,9 +70,40 @@ clippy:
 			-v $(CARGO_VOLUME):/usr/local/cargo/registry \
 			-w /work \
 			rust:1-bookworm \
-			bash -c "rustup component add clippy 2>/dev/null && cargo clippy --all-targets --all-features -- -D warnings" ; \
+			bash -c "apt-get update -qq && apt-get install -yqq protobuf-compiler libprotobuf-dev >/dev/null 2>&1 && rustup component add clippy 2>/dev/null && cargo clippy --all-targets --all-features -- -D warnings" ; \
 	else \
 		echo "• clippy skipped — no $(CARGO_MANIFEST) yet" ; \
+	fi
+
+# ─────────────────────────────── build ───────────────────────────────────
+# dev: incremental DEBUG build. Fast (seconds after first build). Use during
+# development for edit-build-test cycles.
+.PHONY: dev
+dev:
+	@if [ -f $(CARGO_MANIFEST) ]; then \
+		docker run --rm \
+			-v "$$(pwd)":/work \
+			-v $(CARGO_VOLUME):/usr/local/cargo/registry \
+			-w /work \
+			rust:1-bookworm \
+			bash -c "apt-get update -qq && apt-get install -yqq protobuf-compiler libprotobuf-dev >/dev/null 2>&1 && cargo build" ; \
+	else \
+		echo "• dev build skipped — no $(CARGO_MANIFEST) yet" ; \
+	fi
+
+# build-release: production RELEASE build with lto=thin. Slow (minutes). Only
+# run at the end of an iteration cycle via `make pr`.
+.PHONY: build-release
+build-release:
+	@if [ -f $(CARGO_MANIFEST) ]; then \
+		docker run --rm \
+			-v "$$(pwd)":/work \
+			-v $(CARGO_VOLUME):/usr/local/cargo/registry \
+			-w /work \
+			rust:1-bookworm \
+			bash -c "apt-get update -qq && apt-get install -yqq protobuf-compiler libprotobuf-dev >/dev/null 2>&1 && cargo build --release" ; \
+	else \
+		echo "• release build skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
 
 # ─────────────────────────────── test ────────────────────────────────────
@@ -83,15 +117,26 @@ test:
 			-v $(CARGO_VOLUME):/usr/local/cargo/registry \
 			-w /work \
 			rust:1-bookworm \
-			cargo test --all-features ; \
+			bash -c "apt-get update -qq && apt-get install -yqq protobuf-compiler libprotobuf-dev >/dev/null 2>&1 && cargo test --all-features" ; \
 	else \
 		echo "• test skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
 
-# HTTP contract tests (mocha). Requires the engine to be running on :8080.
-.PHONY: test-contract
-test-contract:
-	npx mocha
+# Integration tests (mocha) against a LIVE server. Self-contained: builds the
+# engine, starts it in a container on a free host port, waits for readiness,
+# runs the suite, and tears down. Part of the `pr` gate.
+.PHONY: test-integration
+test-integration:
+	@if [ -f $(CARGO_MANIFEST) ]; then \
+		CARGO_VOLUME=$(CARGO_VOLUME) ./scripts/run-integration-tests.sh ; \
+	else \
+		echo "• integration tests skipped — no $(CARGO_MANIFEST) yet" ; \
+	fi
+
+# Lint the JS test sources (eslint, TerminusDB-style). Part of `lint`.
+.PHONY: lint-tests
+lint-tests:
+	npx eslint --ext .js tests/
 
 # ────────────────────────────── docs ─────────────────────────────────────
 # Generate the human-reviewable API reference from the OpenAPI contract into
@@ -116,9 +161,11 @@ verify: lint test
 	@echo "✓ verify passed"
 
 # pr: the full pre-PR gate. Mirrors TerminusDB's `pr` target. Must be green
-# before opening a PR. Generates the docs so the OpenAPI can be reviewed.
+# before opening a PR. Runs lint + unit tests + integration tests (debug) +
+# production release build + docs. The release build proves the production
+# binary compiles cleanly but is NOT used for tests (debug binary is used).
 .PHONY: pr
-pr: lint test docs
+pr: lint test test-integration build-release docs
 	@echo "✓ PR gate passed — review $(DOCS_OUT), then commit (GPG-signed)"
 
 # ────────────────────────────── clean ────────────────────────────────────
