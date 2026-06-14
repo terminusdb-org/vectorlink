@@ -43,16 +43,26 @@ Use it for "more like this" / recommendations.
 
 ---
 
-## 3. `/duplicates` — corpus-wide near-duplicate pairs
+## 3. `/duplicates` — scoped near-duplicate groups
 
 ```
 GET /duplicates?domain=D&commit=C[&threshold=T]
+              [&doc_type=…&doc_id=…]            # the SET population
+              [&target_doc_type=…&target_doc_id=…]  # optional TARGET population
+              [&snippet=true][&start=…&count=…]
 ```
-Mechanism: for each indexed point, find its nearest neighbour; if the distance is below `threshold` (default `0.0`), record the pair (lower id first). Returns:
+Mechanism: for each indexed point in the **set** population, run ONE ANN nearest-neighbour query whose filter EXCLUDES the point's own document (within-set) or RESTRICTS to the **target** population (cross-set). Because the filter removes the query point's own document, every returned neighbour is a genuine cross-document match — the scan can never be starved by a multi-chunk document's own sibling chunks (the defect that returned `[]` on real corpora with a fixed `k=2`). Matches reduce to document-level groups (distinct ids, best chunk distance, lower id first) below `threshold` (default `0.0`).
+
+- **Scope.** `doc_type`/`doc_id` (repeated) define the set; `target_doc_type`/`target_doc_id` (repeated) define a second population so every group straddles set↔target (cross-catalogue entity resolution). Absent target → within-set dedup.
+- **Snippets.** `snippet=true` includes each member's matched chunk text.
+
+Returns groups, sorted nearest-first:
 ```json
-[["id_a","id_b"], ...]
+[
+  { "group": [ { "id": "id_a" }, { "id": "id_b" } ], "distance": 0.06 }
+]
 ```
-Use it for entity-resolution / dedup workflows.
+With `snippet=true`, each member also carries `"snippet": "…"`. The `group` array is symmetric (lower id first) and extends to clusters of >2 members without a shape change. Use it for entity-resolution / dedup workflows.
 
 ---
 

@@ -88,6 +88,11 @@ pub struct DuplicatesParams {
     pub threshold: Option<f32>,
     pub start: Option<i64>,
     pub count: Option<i64>,
+    pub snippet: Option<bool>,
+    // Repeated scope params (doc_type, doc_id for the set; target_doc_type,
+    // target_doc_id for the target) read from the raw query via
+    // `extract_repeated_param` (see SearchGetParams note — serde_urlencoded
+    // cannot deserialize repeated keys into a Vec).
 }
 
 // ─────────────────────────── Request body structs ─────────────────────────
@@ -715,6 +720,7 @@ async fn handle_similar_post(
 
 async fn handle_duplicates(
     State(state): State<AppState>,
+    RawQuery(raw_query): RawQuery,
     Query(params): Query<DuplicatesParams>,
 ) -> Response {
     let domain = match params.domain {
@@ -740,15 +746,39 @@ async fn handle_duplicates(
         return r;
     }
 
-    match state.service.duplicates(&domain, &commit).await {
-        Ok(pairs) => {
-            // Wire format: array of [id1, id2] pairs.
-            let wire: Vec<[String; 2]> = pairs
-                .into_iter()
-                .map(|(a, b)| [a, b])
-                .collect();
-            Json(wire).into_response()
-        }
+    let threshold = params.threshold.unwrap_or(0.0);
+    if !threshold.is_finite() || threshold < 0.0 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "threshold must be a finite, non-negative number".to_owned(),
+        );
+    }
+    // validate_pagination above guarantees start >= 0 and count >= 1 when present.
+    let start = params.start.unwrap_or(0) as usize;
+    let count = params.count.map(|c| c as usize).unwrap_or(usize::MAX);
+    let snippet = params.snippet.unwrap_or(false);
+
+    // Repeated scope params: the `set` population (doc_type/doc_id) and the
+    // optional `target` population (target_doc_type/target_doc_id). Read from the
+    // raw query — serde_urlencoded cannot deserialize repeated keys into a Vec.
+    let scope = crate::store::lance::DuplicateScope {
+        set_doc_types: extract_repeated_param(raw_query.as_deref(), "doc_type"),
+        set_doc_ids: extract_repeated_param(raw_query.as_deref(), "doc_id"),
+        target_doc_types: extract_repeated_param(raw_query.as_deref(), "target_doc_type"),
+        target_doc_ids: extract_repeated_param(raw_query.as_deref(), "target_doc_id"),
+    };
+    let ancestors = extract_repeated_param(raw_query.as_deref(), "ancestor");
+
+    match state
+        .service
+        .duplicates_with_options(
+            &domain, &commit, threshold, &scope, snippet, start, count, &ancestors,
+        )
+        .await
+    {
+        // Wire format: array of { "group": [{id, snippet?}, ...], "distance" }.
+        // `DuplicateGroup` serialises directly to this shape.
+        Ok(groups) => Json(groups).into_response(),
         Err(e) => service_error_to_response(e),
     }
 }

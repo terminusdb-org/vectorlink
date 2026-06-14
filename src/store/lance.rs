@@ -24,9 +24,11 @@ use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
 use lance_linalg::distance::DistanceType;
 use tokio::sync::RwLock;
 
+use crate::kernel::distance::normalized_cosine_from_lance;
 use crate::kernel::error::StoreError;
 use crate::kernel::model::{
-    BranchName, ChunkInfo, Domain, LastIndexed, SearchHit, SearchMode, Statistics, TaskStatus,
+    BranchName, ChunkInfo, Domain, DuplicateGroup, DuplicateMember, LastIndexed, SearchHit,
+    SearchMode, Statistics, TaskStatus,
 };
 use crate::layeridx::{self, BranchIndex};
 
@@ -167,6 +169,164 @@ type BranchKey = (String, String);
 /// Default Lance branch name. Layout (A) maps TerminusDB's `main` branch to
 /// the Lance dataset's native default branch.
 pub const MAIN_BRANCH: &str = "main";
+
+/// Hard upper bound on the number of indexed points (chunk vectors) the
+/// near-duplicate scan will consider in a single snapshot. The scan issues ONE
+/// ANN `nearest(k=2)` query per point — O(n) cheap indexed queries, not O(n²) —
+/// but `n` is still bounded so a pathologically large corpus can never trigger an
+/// unbounded run. A snapshot with more points than this is rejected (fail-loud)
+/// rather than silently truncated, so duplicate results are never quietly partial.
+/// The requester needs to chunk ID:s if necessary.
+pub const DEFAULT_DUPLICATE_MAX_POINTS: usize = 50_000;
+
+/// Hard upper bound on the number of distinct document pairs the near-duplicate
+/// detector will collect before stopping. Bounds output size (and memory)
+/// independently of the point cap. The requester needs to chunk if necessary.
+pub const DEFAULT_DUPLICATE_MAX_PAIRS: usize = 10_000;
+
+/// Scope of a near-duplicate scan (Spec 02/13 set/target model).
+///
+/// The `set_*` filters define the POPULATION whose documents we look for
+/// near-duplicates within. The `target_*` filters, when non-empty, define a
+/// SECOND population: each set member's nearest neighbour is then restricted to
+/// the target, so every emitted pair STRADDLES set↔target (cross-catalogue
+/// entity resolution). When the target filters are empty, the scan is within-set
+/// dedup: each set member's nearest neighbour is any OTHER document in the set.
+///
+/// Filters are doc-type and/or doc-id IN-lists (the same machinery `/search` and
+/// `/similar` use). Empty `set_*` means "the whole snapshot" for the set side.
+#[derive(Debug, Clone, Default)]
+pub struct DuplicateScope {
+    pub set_doc_types: Vec<String>,
+    pub set_doc_ids: Vec<String>,
+    pub target_doc_types: Vec<String>,
+    pub target_doc_ids: Vec<String>,
+}
+
+impl DuplicateScope {
+    /// True when a distinct target population is configured (cross-set mode).
+    fn has_target(&self) -> bool {
+        !self.target_doc_types.is_empty() || !self.target_doc_ids.is_empty()
+    }
+}
+
+/// A single nearest-neighbour observation between two chunk vectors, with the
+/// distance already normalised to the reference [0, 1] cosine scale
+/// (`normalized_cosine_from_lance`). `doc_a`/`doc_b` are the owning document ids
+/// of the two chunks (they MAY be equal — the pairing step discards same-document
+/// observations so a document is never reported as a duplicate of itself).
+///
+/// `content_a`/`content_b` carry the two chunks' text so the pairing step can
+/// surface a snippet per member when requested; they are `None` when snippets
+/// were not collected (snippet=false), keeping the scan cheap.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NeighbourObservation {
+    pub doc_a: String,
+    pub doc_b: String,
+    pub normalized_distance: f32,
+    pub content_a: Option<String>,
+    pub content_b: Option<String>,
+}
+
+/// Reduce raw chunk-level nearest-neighbour observations to DOCUMENT-level
+/// near-duplicate pairs. Pure (no I/O) so the pairing/dedup rules are unit-tested
+/// in isolation from the Lance scan.
+///
+/// Rules (the doc-level pairing contract):
+///  - UNITS: `threshold` and every `normalized_distance` are on the reference
+///    [0, 1] cosine scale (0 = identical, 0.5 = orthogonal, 1 = opposite) — the
+///    SAME scale `/search` reports. An observation counts as a near-duplicate iff
+///    `normalized_distance <= threshold`.
+///  - DOC-LEVEL, NOT CHUNK-LEVEL: a document has multiple chunk vectors. We key
+///    pairs by the two distinct DOCUMENT ids, never by chunk. The distance kept
+///    for a document pair is the BEST (smallest) over all chunk observations
+///    between those two documents.
+///  - NEVER (docX, docX): an observation whose two chunks belong to the same
+///    document is discarded (a document is not its own duplicate).
+///  - LOWER ID FIRST: each pair is canonicalised so the lexicographically smaller
+///    document id is first, which also collapses the symmetric (a,b)/(b,a)
+///    observations into one pair.
+///  - BOUNDED + DETERMINISTIC: the result is sorted NEAREST-FIRST (smallest
+///    distance), ties broken by id1 then id2 for stable output, and truncated to
+///    `max_pairs` AFTER sorting, so the cap keeps the closest pairs.
+///  - SNIPPETS: each member carries its chunk text from the BEST (kept)
+///    observation when the scan collected content; absent otherwise.
+pub fn pairs_from_neighbours(
+    observations: &[NeighbourObservation],
+    threshold: f32,
+    max_pairs: usize,
+) -> Vec<DuplicateGroup> {
+    // Key: canonical (lower_id, higher_id) → the best (smallest-distance)
+    // observation seen for that document pair (carries distance + snippets).
+    let best_per_pair: HashMap<(String, String), CanonicalObservation> = observations
+        .iter()
+        .filter(|obs| obs.normalized_distance <= threshold)
+        .filter(|obs| obs.doc_a != obs.doc_b)
+        .map(canonical_observation)
+        .fold(HashMap::new(), |mut acc, candidate| {
+            acc.entry(candidate.pair.clone())
+                .and_modify(|best| {
+                    if candidate.distance < best.distance {
+                        *best = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
+            acc
+        });
+
+    let mut groups: Vec<DuplicateGroup> = best_per_pair
+        .into_values()
+        .map(|obs| DuplicateGroup {
+            group: vec![
+                DuplicateMember { id: obs.pair.0, snippet: obs.snippet_lo },
+                DuplicateMember { id: obs.pair.1, snippet: obs.snippet_hi },
+            ],
+            distance: obs.distance,
+        })
+        .collect();
+
+    // Nearest-first; deterministic tie-break by the canonical member ids.
+    groups.sort_by(|a, b| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.group[0].id.cmp(&b.group[0].id))
+            .then_with(|| a.group[1].id.cmp(&b.group[1].id))
+    });
+    groups.truncate(max_pairs);
+    groups
+}
+
+/// A neighbour observation canonicalised to (lower_id, higher_id) with its
+/// snippets aligned to that ordering, ready to reduce into a [`DuplicateGroup`].
+#[derive(Debug, Clone)]
+struct CanonicalObservation {
+    pair: (String, String),
+    distance: f32,
+    snippet_lo: Option<String>,
+    snippet_hi: Option<String>,
+}
+
+/// Canonicalise a neighbour observation to (lower_id, higher_id), keeping each
+/// member's snippet aligned with the reordered ids.
+/// Precondition: `doc_a != doc_b` (callers filter same-document observations).
+fn canonical_observation(obs: &NeighbourObservation) -> CanonicalObservation {
+    if obs.doc_a <= obs.doc_b {
+        CanonicalObservation {
+            pair: (obs.doc_a.clone(), obs.doc_b.clone()),
+            distance: obs.normalized_distance,
+            snippet_lo: obs.content_a.clone(),
+            snippet_hi: obs.content_b.clone(),
+        }
+    } else {
+        CanonicalObservation {
+            pair: (obs.doc_b.clone(), obs.doc_a.clone()),
+            distance: obs.normalized_distance,
+            snippet_lo: obs.content_b.clone(),
+            snippet_hi: obs.content_a.clone(),
+        }
+    }
+}
 
 /// The Lance-backed store (layout A: one dataset per domain, TerminusDB
 /// branches as Lance branches inside it; tags are dataset-global).
@@ -1599,6 +1759,305 @@ impl LanceStore {
         self.io_snapshot_from_cache(domain, branch, commit).await
     }
 
+    /// Scoped near-duplicate document groups at a commit's snapshot.
+    ///
+    /// ALGORITHM (robust against the k=2 starvation bug): for each indexed point
+    /// (chunk vector) in the SET population, issue ONE ANN `nearest()` query whose
+    /// filter EXCLUDES the point's own `doc_id` (within-set) or RESTRICTS to the
+    /// TARGET population (cross-set). Because the filter removes the query point's
+    /// own document, every returned row is GUARANTEED a genuine cross-document
+    /// neighbour — the scan can never be starved by a multi-chunk document's own
+    /// sibling chunks filling the result (the defect that returned `[]` at scale
+    /// with a fixed `nearest(k=2)`). This is O(n) cheap indexed queries, NOT an
+    /// O(n²) all-pairs scan. Reduction to DOCUMENT-level groups happens in the pure
+    /// [`pairs_from_neighbours`] (lower-id-first, best distance per pair, snippets).
+    ///
+    /// UNITS: `threshold` is on the reference [0, 1] cosine scale (matches
+    /// `/search`); raw Lance distances are converted via
+    /// `normalized_cosine_from_lance` before comparison.
+    ///
+    /// BOUNDED: the SET point count is checked against `max_points` BEFORE any
+    /// per-point query — a larger set is REJECTED (fail-loud) rather than silently
+    /// truncated, so results are never quietly partial. Group collection is bounded
+    /// by `DEFAULT_DUPLICATE_MAX_PAIRS`.
+    ///
+    /// FD: the snapshot is opened off the CACHED domain handle
+    /// (`io_open_snapshot` → `io_snapshot_from_cache`), so the scan opens NO fresh
+    /// dataset (no new object_store/session, no FD pressure — BUG-FD24). Per-point
+    /// `nearest()` queries scan the already-open snapshot handle.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn io_duplicate_groups(
+        &self,
+        domain: &str,
+        branch: &str,
+        commit: &str,
+        threshold: f32,
+        scope: &DuplicateScope,
+        snippet: bool,
+        max_points: usize,
+    ) -> Result<Vec<DuplicateGroup>, StoreError> {
+        let snapshot = self.io_open_snapshot(domain, branch, commit).await?;
+
+        let set_filter = build_filter_expression(&scope.set_doc_types, &scope.set_doc_ids);
+        let set_filter_opt = if set_filter.is_empty() {
+            None
+        } else {
+            Some(set_filter)
+        };
+
+        // Bound on the SET population (the points we iterate), not the whole
+        // snapshot — a filtered run over a small set inside a huge corpus is still
+        // safely bounded.
+        let set_point_count = snapshot
+            .count_rows(set_filter_opt.clone())
+            .await
+            .map_err(|e| StoreError::Internal(format!("count_rows for duplicates failed: {}", e)))?;
+
+        if set_point_count > max_points {
+            return Err(StoreError::Internal(format!(
+                "near-duplicate scan refused: set population has {} points, exceeds the bound of \
+                 {} (would not be a safely bounded run) — narrow the `set` scope or chunk the request",
+                set_point_count, max_points
+            )));
+        }
+
+        let points = io_scan_points(&snapshot, set_filter_opt.as_deref(), snippet).await?;
+        let observations = io_collect_neighbours(&snapshot, &points, scope, snippet).await?;
+
+        Ok(pairs_from_neighbours(
+            &observations,
+            threshold,
+            DEFAULT_DUPLICATE_MAX_PAIRS,
+        ))
+    }
+}
+
+/// A single indexed point in the SET population: its owning document id, its
+/// embedding vector, and (when snippets are requested) its chunk text.
+struct IndexedPoint {
+    doc_id: String,
+    embedding: Vec<f32>,
+    content: Option<String>,
+}
+
+/// Scan the SET population's points (doc_id + embedding, plus content for
+/// snippets) from a versioned snapshot, optionally filtered to the set scope.
+async fn io_scan_points(
+    snapshot: &Dataset,
+    set_filter: Option<&str>,
+    snippet: bool,
+) -> Result<Vec<IndexedPoint>, StoreError> {
+    let mut scanner = snapshot.scan();
+    let projection: &[&str] = if snippet {
+        &["doc_id", "embedding", "content"]
+    } else {
+        &["doc_id", "embedding"]
+    };
+    scanner
+        .project(projection)
+        .map_err(|e| StoreError::Internal(format!("duplicates projection failed: {}", e)))?;
+    if let Some(filter) = set_filter {
+        scanner
+            .filter(filter)
+            .map_err(|e| StoreError::Internal(format!("duplicates set filter failed: {}", e)))?;
+    }
+
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .map_err(|e| StoreError::Internal(format!("duplicates scan stream failed: {}", e)))?
+        .try_collect()
+        .await
+        .map_err(|e| StoreError::Internal(format!("duplicates scan collect failed: {}", e)))?;
+
+    batches_to_points(&batches, snippet)
+}
+
+/// Extract `IndexedPoint`s from projected RecordBatches (doc_id + embedding, plus
+/// content when snippets requested).
+/// FAIL-LOUD: a batch missing a required column, or an embedding row that is null,
+/// is a real schema/corruption error — never silently skipped (which would drop
+/// points and yield quietly-incomplete duplicate results).
+fn batches_to_points(batches: &[RecordBatch], snippet: bool) -> Result<Vec<IndexedPoint>, StoreError> {
+    batches.iter().try_fold(Vec::new(), |mut points, batch| {
+        let n = batch.num_rows();
+        if n == 0 {
+            return Ok(points);
+        }
+        let doc_ids = batch
+            .column_by_name("doc_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                StoreError::Internal("duplicates scan: missing `doc_id` column".to_owned())
+            })?;
+        let embeddings = batch
+            .column_by_name("embedding")
+            .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
+            .ok_or_else(|| {
+                StoreError::Internal("duplicates scan: missing `embedding` column".to_owned())
+            })?;
+        let contents = if snippet {
+            Some(
+                batch
+                    .column_by_name("content")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .ok_or_else(|| {
+                        StoreError::Internal("duplicates scan: missing `content` column".to_owned())
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        for i in 0..n {
+            if embeddings.is_null(i) {
+                return Err(StoreError::Internal(format!(
+                    "duplicates scan: null embedding for doc {}",
+                    doc_ids.value(i)
+                )));
+            }
+            let values = embeddings.value(i);
+            let floats = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| {
+                    StoreError::Internal("duplicates scan: embedding is not Float32".to_owned())
+                })?;
+            points.push(IndexedPoint {
+                doc_id: doc_ids.value(i).to_owned(),
+                embedding: floats.values().to_vec(),
+                content: contents.map(|c| c.value(i).to_owned()),
+            });
+        }
+        Ok(points)
+    })
+}
+
+/// For each SET point, run ONE filtered `nearest()` ANN query against the snapshot
+/// and record its nearest neighbour as a [`NeighbourObservation`] on the reference
+/// [0, 1] cosine scale. O(n) indexed queries.
+async fn io_collect_neighbours(
+    snapshot: &Dataset,
+    points: &[IndexedPoint],
+    scope: &DuplicateScope,
+    snippet: bool,
+) -> Result<Vec<NeighbourObservation>, StoreError> {
+    let mut observations = Vec::new();
+    for point in points {
+        if let Some(obs) = io_nearest_neighbour(snapshot, point, scope, snippet).await? {
+            observations.push(obs);
+        }
+    }
+    Ok(observations)
+}
+
+/// Run a FILTERED `nearest()` ANN query for one set point and return its nearest
+/// CROSS-DOCUMENT neighbour observation, or `None` if no neighbour exists in scope.
+///
+/// The filter is what makes this robust (vs the old `nearest(k=2)` + skip-own-doc,
+/// which was starved by a multi-chunk document's own sibling chunks at scale):
+///  - within-set (no target): exclude the point's own `doc_id` so the result can
+///    only contain OTHER documents — a genuine cross-doc neighbour, never the
+///    point's own siblings.
+///  - cross-set (target present): restrict the result to the target population
+///    (its doc_type/doc_id IN-lists) so the neighbour STRADDLES set↔target.
+///
+/// `k` is a small fixed over-fetch to absorb ANN recall slack (nprobes), then we
+/// take the first (nearest) returned row. Because the filter already guarantees
+/// cross-document rows, `k` does not need to grow with documents' chunk counts.
+async fn io_nearest_neighbour(
+    snapshot: &Dataset,
+    point: &IndexedPoint,
+    scope: &DuplicateScope,
+    snippet: bool,
+) -> Result<Option<NeighbourObservation>, StoreError> {
+    const NEIGHBOUR_K: usize = 8;
+
+    let filter = build_neighbour_filter(&point.doc_id, scope);
+
+    let mut scanner = snapshot.scan();
+    scanner
+        .nearest("embedding", &Float32Array::from(point.embedding.clone()), NEIGHBOUR_K)
+        .map_err(|e| StoreError::Internal(format!("duplicates nearest setup failed: {}", e)))?;
+    scanner.distance_metric(DistanceType::Cosine);
+    let projection: &[&str] = if snippet {
+        &["doc_id", "content"]
+    } else {
+        &["doc_id"]
+    };
+    scanner
+        .project(projection)
+        .map_err(|e| StoreError::Internal(format!("duplicates nearest projection failed: {}", e)))?;
+    scanner
+        .filter(&filter)
+        .map_err(|e| StoreError::Internal(format!("duplicates nearest filter failed: {}", e)))?;
+
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .map_err(|e| StoreError::Internal(format!("duplicates nearest stream failed: {}", e)))?
+        .try_collect()
+        .await
+        .map_err(|e| StoreError::Internal(format!("duplicates nearest collect failed: {}", e)))?;
+
+    Ok(nearest_observation(&batches, point, snippet))
+}
+
+/// Build the ANN filter for a set point's neighbour query. The query point's own
+/// document is excluded in BOTH modes (a doc is never its own duplicate); in
+/// cross-set mode the target population's IN-list is AND-ed on so the neighbour is
+/// drawn only from the target. Single-quotes in ids are escaped (SQL string).
+fn build_neighbour_filter(self_doc_id: &str, scope: &DuplicateScope) -> String {
+    let exclude_self = format!("doc_id != '{}'", self_doc_id.replace('\'', "''"));
+    if scope.has_target() {
+        let target = build_filter_expression(&scope.target_doc_types, &scope.target_doc_ids);
+        // has_target() guaranteed at least one of the target lists is non-empty,
+        // so `target` is non-empty here.
+        format!("{} AND ({})", exclude_self, target)
+    } else {
+        exclude_self
+    }
+}
+
+/// From a filtered `nearest()` result (already cross-document by construction),
+/// take the first (nearest) row and build a normalised-scale observation, with
+/// snippets when requested. Returns `None` when the result is empty (no in-scope
+/// neighbour for this point). Fails loud if the ranked result lacks `_distance`
+/// (would otherwise corrupt the distance with a default).
+fn nearest_observation(
+    batches: &[RecordBatch],
+    point: &IndexedPoint,
+    snippet: bool,
+) -> Option<NeighbourObservation> {
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let doc_ids = batch
+            .column_by_name("doc_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let distances = batch
+            .column_by_name("_distance")
+            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+        let contents = if snippet {
+            batch
+                .column_by_name("content")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        } else {
+            None
+        };
+        let (Some(ids), Some(dists)) = (doc_ids, distances) else {
+            continue;
+        };
+        return Some(NeighbourObservation {
+            doc_a: point.doc_id.clone(),
+            doc_b: ids.value(0).to_owned(),
+            normalized_distance: normalized_cosine_from_lance(dists.value(0)),
+            content_a: point.content.clone(),
+            content_b: contents.map(|c| c.value(0).to_owned()),
+        });
+    }
+    None
 }
 
 /// Ensure the FTS inverted index is up-to-date on an already-open Dataset handle.
@@ -1846,7 +2305,6 @@ fn rrf_merge(vector_hits: Vec<ChunkHit>, fts_hits: Vec<ChunkHit>) -> Vec<ChunkHi
 /// already-normalised hits (FTS, RRF) pass through unchanged.
 pub fn dedup_chunks_to_documents(hits: Vec<ChunkHit>, snippet: bool) -> Vec<SearchHit> {
     use std::collections::HashMap;
-    use crate::kernel::distance::normalized_cosine_from_lance;
     use crate::chunk::chunk_location;
 
     // Group by doc_id, keep the best (smallest distance) chunk per document.
@@ -1906,6 +2364,168 @@ mod tests {
 
     fn fake_embedding(dim: usize, seed: f32) -> Vec<f32> {
         (0..dim).map(|i| (seed + i as f32 * 0.01).sin()).collect()
+    }
+
+    fn observation(a: &str, b: &str, distance: f32) -> NeighbourObservation {
+        NeighbourObservation {
+            doc_a: a.to_owned(),
+            doc_b: b.to_owned(),
+            normalized_distance: distance,
+            content_a: None,
+            content_b: None,
+        }
+    }
+
+    /// Project a DuplicateGroup back to a (lower_id, higher_id) tuple for concise
+    /// assertions on the pairing CONTRACT (the rich shape is asserted separately).
+    fn group_pair(g: &DuplicateGroup) -> (String, String) {
+        (g.group[0].id.clone(), g.group[1].id.clone())
+    }
+
+    fn group_pairs(groups: &[DuplicateGroup]) -> Vec<(String, String)> {
+        groups.iter().map(group_pair).collect()
+    }
+
+    // --- pure pairing/dedup logic (doc-level near-duplicate contract) ---
+
+    #[test]
+    fn pairs_below_threshold_are_returned_lower_id_first() {
+        let obs = vec![observation("doc/zebra", "doc/apple", 0.02)];
+        let groups = pairs_from_neighbours(&obs, 0.05, DEFAULT_DUPLICATE_MAX_PAIRS);
+        // Lower id first regardless of observation order.
+        assert_eq!(group_pairs(&groups), vec![("doc/apple".to_owned(), "doc/zebra".to_owned())]);
+    }
+
+    #[test]
+    fn pairs_above_threshold_are_excluded() {
+        let obs = vec![observation("doc/a", "doc/b", 0.4)];
+        let groups = pairs_from_neighbours(&obs, 0.05, DEFAULT_DUPLICATE_MAX_PAIRS);
+        assert!(groups.is_empty(), "0.4 > 0.05 threshold must not pair");
+    }
+
+    #[test]
+    fn tightening_threshold_drops_pairs() {
+        let obs = vec![
+            observation("doc/a", "doc/b", 0.04),
+            observation("doc/c", "doc/d", 0.18),
+        ];
+        let loose = pairs_from_neighbours(&obs, 0.2, DEFAULT_DUPLICATE_MAX_PAIRS);
+        assert_eq!(loose.len(), 2, "loose threshold keeps both pairs");
+        let tight = pairs_from_neighbours(&obs, 0.05, DEFAULT_DUPLICATE_MAX_PAIRS);
+        assert_eq!(group_pairs(&tight), vec![("doc/a".to_owned(), "doc/b".to_owned())]);
+    }
+
+    #[test]
+    fn same_document_observations_never_pair_with_self() {
+        // A document's chunk matching another of its own chunks (docX, docX) at
+        // distance 0 must NEVER be reported as a duplicate.
+        let obs = vec![observation("doc/a", "doc/a", 0.0)];
+        let groups = pairs_from_neighbours(&obs, 0.05, DEFAULT_DUPLICATE_MAX_PAIRS);
+        assert!(groups.is_empty(), "(docX, docX) must never be a pair");
+    }
+
+    #[test]
+    fn symmetric_observations_dedup_to_one_pair() {
+        // saber1→saber2 and saber2→saber1 (each chunk finds the other) must
+        // collapse to a SINGLE canonical pair.
+        let obs = vec![
+            observation("doc/saber2", "doc/saber1", 0.03),
+            observation("doc/saber1", "doc/saber2", 0.03),
+        ];
+        let groups = pairs_from_neighbours(&obs, 0.05, DEFAULT_DUPLICATE_MAX_PAIRS);
+        assert_eq!(
+            group_pairs(&groups),
+            vec![("doc/saber1".to_owned(), "doc/saber2".to_owned())],
+            "symmetric observations must dedup to one pair"
+        );
+    }
+
+    #[test]
+    fn multiple_chunk_observations_keep_best_distance() {
+        // Two documents observed at several chunk distances reduce to ONE pair;
+        // the kept distance is the BEST (smallest) over all chunk observations.
+        let obs = vec![
+            observation("doc/a", "doc/b", 0.30), // above a 0.1 threshold
+            observation("doc/b", "doc/a", 0.04), // best chunk, below threshold
+        ];
+        let groups = pairs_from_neighbours(&obs, 0.1, DEFAULT_DUPLICATE_MAX_PAIRS);
+        assert_eq!(
+            group_pairs(&groups),
+            vec![("doc/a".to_owned(), "doc/b".to_owned())],
+            "best chunk distance below threshold must surface the doc pair"
+        );
+        assert_eq!(groups[0].distance, 0.04, "kept distance is the best (smallest) chunk distance");
+    }
+
+    #[test]
+    fn pairs_are_sorted_nearest_first_and_bounded_by_max_pairs() {
+        // Distinct distances so the NEAREST-FIRST ordering is unambiguous; the cap
+        // must keep the two CLOSEST pairs, not the lexicographically-smallest.
+        let obs = vec![
+            observation("doc/c", "doc/d", 0.03),
+            observation("doc/a", "doc/b", 0.05),
+            observation("doc/e", "doc/f", 0.01),
+        ];
+        let bounded = pairs_from_neighbours(&obs, 0.1, 2);
+        assert_eq!(
+            group_pairs(&bounded),
+            vec![
+                ("doc/e".to_owned(), "doc/f".to_owned()), // 0.01 — closest
+                ("doc/c".to_owned(), "doc/d".to_owned()), // 0.03 — next
+            ],
+            "result must be sorted nearest-first and capped at max_pairs (drops the farthest)"
+        );
+    }
+
+    #[test]
+    fn equal_distance_pairs_tie_break_by_id() {
+        // Deterministic tie-break on equal distances: by canonical member ids.
+        let obs = vec![
+            observation("doc/c", "doc/d", 0.01),
+            observation("doc/a", "doc/b", 0.01),
+        ];
+        let groups = pairs_from_neighbours(&obs, 0.05, DEFAULT_DUPLICATE_MAX_PAIRS);
+        assert_eq!(
+            group_pairs(&groups),
+            vec![
+                ("doc/a".to_owned(), "doc/b".to_owned()),
+                ("doc/c".to_owned(), "doc/d".to_owned()),
+            ],
+            "equal distances tie-break by id for stable output"
+        );
+    }
+
+    #[test]
+    fn snippets_align_to_canonical_member_order() {
+        // When ids are reordered to lower-id-first, each member's snippet must
+        // follow its own id (not stay in observation order).
+        let obs = vec![NeighbourObservation {
+            doc_a: "doc/zebra".to_owned(),
+            doc_b: "doc/apple".to_owned(),
+            normalized_distance: 0.02,
+            content_a: Some("zebra text".to_owned()),
+            content_b: Some("apple text".to_owned()),
+        }];
+        let groups = pairs_from_neighbours(&obs, 0.05, DEFAULT_DUPLICATE_MAX_PAIRS);
+        assert_eq!(groups.len(), 1);
+        let members = &groups[0].group;
+        assert_eq!(members[0].id, "doc/apple");
+        assert_eq!(members[0].snippet.as_deref(), Some("apple text"));
+        assert_eq!(members[1].id, "doc/zebra");
+        assert_eq!(members[1].snippet.as_deref(), Some("zebra text"));
+    }
+
+    #[test]
+    fn no_snippets_when_content_absent() {
+        let obs = vec![observation("doc/a", "doc/b", 0.02)];
+        let groups = pairs_from_neighbours(&obs, 0.05, DEFAULT_DUPLICATE_MAX_PAIRS);
+        assert!(groups[0].group.iter().all(|m| m.snippet.is_none()));
+    }
+
+    #[test]
+    fn empty_observations_yield_no_pairs() {
+        let groups = pairs_from_neighbours(&[], 0.5, DEFAULT_DUPLICATE_MAX_PAIRS);
+        assert!(groups.is_empty());
     }
 
     // --- upsert chunks, tag commit, verify round-trip ---
@@ -3408,6 +4028,333 @@ mod tests {
             load_iterations,
             after_fds,
             slack
+        );
+    }
+
+    /// Build a real ANN-indexed corpus of MANY MULTI-CHUNK documents with planted
+    /// near-duplicate pairs, then tag a commit. Returns (store, domain, commit).
+    ///
+    /// Geometry (deliberately reproduces the k=2 STARVATION the bug relied on):
+    /// documents are grouped into "families" of `docs_per_family` documents that
+    /// are planted near-duplicates of each other. The per-CHUNK perturbation
+    /// (`c * 0.0002`) is much SMALLER than the per-DOCUMENT offset within a family
+    /// (`d * 0.02`), so a document's OWN sibling chunks are strictly CLOSER to each
+    /// other than to the planted twin's chunks. Under the old `nearest(k=2)` +
+    /// skip-own-doc path both result slots are filled by the query point's OWN
+    /// siblings → no cross-doc row → every point yields `None` → `[]` at scale. The
+    /// filtered `nearest()` (exclude self doc) cannot be starved.
+    #[cfg(test)]
+    async fn build_duplicate_corpus(
+        dim: usize,
+        families: usize,
+        docs_per_family: usize,
+        chunks_per_doc: usize,
+        doc_type_of: impl Fn(usize, usize) -> String,
+    ) -> (LanceStore, &'static str, String) {
+        let config = VectorIndexConfig {
+            num_partitions: 4,
+            num_sub_vectors: 8,
+            nprobes: 8,
+            refine_factor: Some(20),
+        };
+        let (mut store, tmp) = make_test_store(dim);
+        // Keep the temp dir alive for the whole test by leaking it — these are
+        // short-lived test processes and the OS reclaims on exit.
+        std::mem::forget(tmp);
+        store.set_vector_index_config(config.clone());
+        let domain = "admin/dupscale";
+
+        // One big upsert of all chunk rows (fast — avoids hundreds of writes).
+        let mut rows: Vec<ChunkRow> = Vec::new();
+        for fam in 0..families {
+            // Families are far apart in embedding space.
+            let family_seed = 1.0 + fam as f32 * 7.0;
+            for d in 0..docs_per_family {
+                let doc_id = format!("doc/fam{}/d{}", fam, d);
+                let doc_type = doc_type_of(fam, d);
+                // Per-document offset WITHIN the family (0.02) — larger than the
+                // per-chunk spread below, so each doc's own siblings cluster tighter
+                // than the planted twin. This is what starves the old k=2 path.
+                let doc_seed = family_seed + d as f32 * 0.02;
+                for c in 0..chunks_per_doc {
+                    rows.push(ChunkRow {
+                        doc_id: doc_id.clone(),
+                        doc_type: doc_type.clone(),
+                        chunk_index: c as i32,
+                        chunk_count: chunks_per_doc as i32,
+                        chunk_token_start: c as i32,
+                        doc_token_len: chunks_per_doc as i32,
+                        // Per-chunk spread (0.0002) << per-doc offset (0.02): own
+                        // siblings are the nearest neighbours of any chunk.
+                        embedding: fake_embedding(dim, doc_seed + c as f32 * 0.0002),
+                        content: format!("family {} doc {} chunk {} lorem ipsum", fam, d, c),
+                    });
+                }
+            }
+        }
+        // Upsert per doc (the store keys writes by doc_id).
+        let mut by_doc: std::collections::BTreeMap<String, Vec<ChunkRow>> =
+            std::collections::BTreeMap::new();
+        for r in rows {
+            by_doc.entry(r.doc_id.clone()).or_default().push(r);
+        }
+        for (doc_id, doc_rows) in &by_doc {
+            store
+                .io_upsert_chunks(domain, "main", doc_id, doc_rows)
+                .await
+                .expect("upsert corpus doc");
+        }
+
+        // Build the ANN index, refresh the cached handle, tag the commit.
+        {
+            let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+            let mut ds = ds_arc.write().await;
+            crate::store::vector_index::io_ensure_vector_index(&mut ds, &config)
+                .await
+                .expect("ensure vector index");
+        }
+        store
+            .io_refresh_cached_dataset(domain, "main")
+            .await
+            .expect("refresh after index build");
+        let version = {
+            let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+            let guard = ds_arc.read().await;
+            guard.version().version
+        };
+        let commit = "c_dup".to_owned();
+        store
+            .io_tag_commit(domain, "main", &commit, version)
+            .await
+            .expect("tag commit");
+
+        (store, domain, commit)
+    }
+
+    /// REAL-DATA SCALE GUARD (the gap that hid BUG: `/duplicates` returned `[]` at
+    /// scale). Hundreds of MULTI-CHUNK documents with planted near-duplicate pairs:
+    /// the result must be NON-EMPTY and must contain the planted pairs. The old
+    /// `nearest(k=2)` + skip-own-doc path returned `[]` here because every query
+    /// point's two result slots were filled by its OWN sibling chunks. The filtered
+    /// `nearest()` (exclude self doc) cannot be starved that way.
+    #[tokio::test]
+    async fn duplicate_scan_finds_planted_pairs_at_scale_not_empty() {
+        let dim = 16;
+        let families = 60; // 60 families × 5 docs = 300 docs
+        let docs_per_family = 5;
+        let chunks_per_doc = 4; // multi-chunk — starves the old k=2 path
+        let (store, domain, commit) = build_duplicate_corpus(
+            dim,
+            families,
+            docs_per_family,
+            chunks_per_doc,
+            |_fam, _d| "Item".to_owned(),
+        )
+        .await;
+
+        // threshold = 1.0 is the WHOLE cosine range — the canonical "is it broken"
+        // check: every point with another doc in scope MUST produce a pair.
+        let groups = store
+            .io_duplicate_groups(
+                domain,
+                "main",
+                &commit,
+                1.0,
+                &DuplicateScope::default(),
+                false,
+                DEFAULT_DUPLICATE_MAX_POINTS,
+            )
+            .await
+            .expect("duplicate scan");
+
+        assert!(
+            !groups.is_empty(),
+            "duplicate scan returned [] on a {}-doc multi-chunk corpus — the scale bug \
+             (k=2 starved by own sibling chunks) has regressed",
+            families * docs_per_family
+        );
+
+        // Every planted same-family pair (distinct docs sharing a seed) must be
+        // surfaced at a permissive threshold. Check family 0's 5 docs all pair up.
+        let pairs: std::collections::HashSet<(String, String)> = groups
+            .iter()
+            .map(|g| (g.group[0].id.clone(), g.group[1].id.clone()))
+            .collect();
+        let contains = |a: &str, b: &str| {
+            let lo = a.min(b).to_owned();
+            let hi = a.max(b).to_owned();
+            pairs.contains(&(lo, hi))
+        };
+        // At least one planted intra-family pair from family 0 is present.
+        let fam0_paired = (0..docs_per_family).any(|i| {
+            (0..docs_per_family).any(|j| {
+                i != j
+                    && contains(&format!("doc/fam0/d{}", i), &format!("doc/fam0/d{}", j))
+            })
+        });
+        assert!(
+            fam0_paired,
+            "no planted near-duplicate pair from family 0 surfaced: {:?}",
+            pairs
+        );
+
+        // Lower-id-first canonicalisation holds for every emitted group.
+        for g in &groups {
+            assert!(
+                g.group[0].id <= g.group[1].id,
+                "group not lower-id-first: {:?}",
+                g.group
+            );
+            assert_eq!(g.group.len(), 2, "every group is currently a pair");
+        }
+    }
+
+    /// Cross-set (set/target) entity resolution: pairs must STRADDLE the two
+    /// populations only — no within-set pair leaks in when a target is specified.
+    #[tokio::test]
+    async fn duplicate_scan_cross_set_pairs_straddle_only() {
+        let dim = 16;
+        // Families alternate doc_type Abt/Buy; same-seed docs across the two types
+        // are the planted cross-catalogue near-duplicates.
+        let families = 20;
+        let docs_per_family = 4;
+        let chunks_per_doc = 3;
+        let (store, domain, commit) = build_duplicate_corpus(
+            dim,
+            families,
+            docs_per_family,
+            chunks_per_doc,
+            // Within a family, half the docs are Abt and half Buy → same-seed
+            // (near-identical) docs exist on BOTH sides of the set/target split.
+            |_fam, d| if d % 2 == 0 { "Abt".to_owned() } else { "Buy".to_owned() },
+        )
+        .await;
+
+        let scope = DuplicateScope {
+            set_doc_types: vec!["Abt".to_owned()],
+            set_doc_ids: vec![],
+            target_doc_types: vec!["Buy".to_owned()],
+            target_doc_ids: vec![],
+        };
+        let groups = store
+            .io_duplicate_groups(
+                domain,
+                "main",
+                &commit,
+                1.0,
+                &scope,
+                false,
+                DEFAULT_DUPLICATE_MAX_POINTS,
+            )
+            .await
+            .expect("cross-set duplicate scan");
+
+        assert!(!groups.is_empty(), "cross-set scan found no straddling pairs");
+
+        // EVERY pair must straddle Abt↔Buy: one member even-d (Abt), one odd-d (Buy).
+        // doc ids are doc/fam{F}/d{D}; D parity encodes the type.
+        let parity = |id: &str| -> usize {
+            let d: usize = id.rsplit("/d").next().unwrap().parse().unwrap();
+            d % 2
+        };
+        for g in &groups {
+            let p0 = parity(&g.group[0].id);
+            let p1 = parity(&g.group[1].id);
+            assert_ne!(
+                p0, p1,
+                "cross-set pair does not straddle Abt↔Buy (both same type): {:?}",
+                g.group
+            );
+        }
+    }
+
+    /// snippet=true populates each member's `snippet` from its matched chunk text.
+    #[tokio::test]
+    async fn duplicate_scan_snippet_populates_member_text() {
+        let dim = 16;
+        let (store, domain, commit) =
+            build_duplicate_corpus(dim, 10, 4, 2, |_f, _d| "Item".to_owned()).await;
+
+        let with = store
+            .io_duplicate_groups(
+                domain, "main", &commit, 1.0, &DuplicateScope::default(), true,
+                DEFAULT_DUPLICATE_MAX_POINTS,
+            )
+            .await
+            .expect("snippet scan");
+        assert!(!with.is_empty());
+        for g in &with {
+            for m in &g.group {
+                let s = m.snippet.as_deref().unwrap_or("");
+                assert!(
+                    s.contains("lorem ipsum"),
+                    "snippet missing chunk text for {}: {:?}",
+                    m.id,
+                    m.snippet
+                );
+            }
+        }
+
+        // snippet=false leaves all member snippets absent.
+        let without = store
+            .io_duplicate_groups(
+                domain, "main", &commit, 1.0, &DuplicateScope::default(), false,
+                DEFAULT_DUPLICATE_MAX_POINTS,
+            )
+            .await
+            .expect("no-snippet scan");
+        assert!(
+            without.iter().all(|g| g.group.iter().all(|m| m.snippet.is_none())),
+            "snippet=false must not populate member snippets"
+        );
+    }
+
+    /// The set-population candidate cap is fail-loud: a set larger than the bound is
+    /// REJECTED, never silently partial.
+    #[tokio::test]
+    async fn duplicate_scan_rejects_oversized_set_fail_loud() {
+        let dim = 16;
+        let (store, domain, commit) =
+            build_duplicate_corpus(dim, 10, 4, 2, |_f, _d| "Item".to_owned()).await;
+
+        // 10×4×2 = 80 chunk points; a cap of 4 must reject (not truncate).
+        let err = store
+            .io_duplicate_groups(
+                domain, "main", &commit, 1.0, &DuplicateScope::default(), false, 4,
+            )
+            .await
+            .expect_err("oversized set must be rejected");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("exceeds the bound"),
+            "expected a fail-loud cap rejection, got: {}",
+            msg
+        );
+    }
+
+    /// The duplicates scan opens NO fresh dataset — it reuses the cached domain
+    /// handle (no FD pressure; BUG-FD24). Guards against a future change that
+    /// reintroduces `Dataset::open` per scan.
+    #[tokio::test]
+    async fn duplicate_scan_reuses_cached_handle_no_fresh_open() {
+        let dim = 16;
+        let (store, domain, commit) =
+            build_duplicate_corpus(dim, 12, 3, 2, |_f, _d| "Item".to_owned()).await;
+
+        let before = store.fresh_open_count();
+        store
+            .io_duplicate_groups(
+                domain, "main", &commit, 1.0, &DuplicateScope::default(), false,
+                DEFAULT_DUPLICATE_MAX_POINTS,
+            )
+            .await
+            .expect("scan");
+        let after = store.fresh_open_count();
+        assert_eq!(
+            before, after,
+            "duplicates scan opened {} fresh dataset(s) — it must reuse the cached \
+             handle (checkout off the cached Arc), never Dataset::open (BUG-FD24)",
+            after - before
         );
     }
 }

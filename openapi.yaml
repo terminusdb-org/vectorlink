@@ -404,40 +404,94 @@ paths:
     get:
       tags: [search]
       operationId: duplicates
-      summary: Corpus-wide near-duplicate candidate pairs (bounded).
+      summary: Scoped near-duplicate document groups (bounded).
       description: >
-        For each indexed point, find its nearest neighbour; pairs with distance
-        below `threshold` are returned (lower id first). Bounded by `threshold`, a
-        candidate cap, and pagination — never an unbounded all-pairs scan. If a
-        safe bounded implementation is unavailable, returns 501 rather than a scan
-        that does not scale.
+        Scoped near-duplicate detection. For each indexed point in the SET
+        population, the engine runs one ANN nearest-neighbour query whose filter
+        EXCLUDES the point's own document (within-set) or RESTRICTS to the TARGET
+        population (cross-set), so every returned neighbour is a genuine
+        cross-document match — the scan can never be starved by a multi-chunk
+        document's own sibling chunks. Matches reduce to DOCUMENT-level groups: a
+        group is DISTINCT documents whose best chunks are within `threshold`,
+        deduplicated and canonicalised lower id first — a document is never grouped
+        with itself. O(n) cheap indexed queries, never an O(n²) all-pairs scan.
+
+
+        Scope: the repeated `doc_type`/`doc_id` params define the SET population
+        (the documents searched for near-duplicates). The repeated
+        `target_doc_type`/`target_doc_id` params, when present, define a second
+        population so every group STRADDLES set↔target (cross-catalogue entity
+        resolution); absent, the scan is within-set dedup.
+
+
+        `threshold` is on the same [0, 1] cosine distance scale `/search` reports
+        (0 = identical, 0.5 = unrelated/orthogonal, 1 = opposite), so e.g.
+        `threshold <= 0.05` surfaces near-identical documents. The run is bounded
+        by `threshold`, a candidate cap on the set population (an oversized set is
+        rejected rather than partially scanned), and `start`/`count` pagination
+        over the nearest-first group list. When `snippet=true`, each group member
+        carries its matched chunk text.
       parameters:
         - $ref: '#/components/parameters/Domain'
         - $ref: '#/components/parameters/Commit'
         - name: threshold
           in: query
           required: false
-          description: Max distance for a pair to count as a near-duplicate.
+          description: >
+            Maximum [0, 1] cosine distance for two documents to count as a
+            near-duplicate (0 = identical, 0.5 = unrelated, 1 = opposite). Same
+            scale as `/search` distances.
           schema: { type: number, format: float, default: 0.0 }
+        - $ref: '#/components/parameters/DocType'
+        - $ref: '#/components/parameters/DocId'
+        - name: target_doc_type
+          in: query
+          required: false
+          description: >
+            Restrict the near-duplicate NEIGHBOURS to these document types (the
+            TARGET population). Repeated key (`?target_doc_type=A&target_doc_type=B`).
+            When any target_* param is present, every emitted group straddles
+            set↔target (cross-set entity resolution).
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+        - name: target_doc_id
+          in: query
+          required: false
+          description: >
+            Restrict the near-duplicate NEIGHBOURS to these document ids (the
+            TARGET population). Repeated key (`?target_doc_id=X&target_doc_id=Y`).
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+        - $ref: '#/components/parameters/Snippet'
         - $ref: '#/components/parameters/Start'
         - $ref: '#/components/parameters/Count'
       responses:
         '200':
-          description: Array of [id1, id2] pairs (lower id first).
+          description: >
+            Array of near-duplicate groups, sorted nearest-first. Each group is a
+            symmetric `group` array of members (currently a pair, lower id first)
+            plus the [0, 1] cosine `distance` of the best matching chunks.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/DuplicatePairs' }
+              schema: { $ref: '#/components/schemas/DuplicateGroups' }
               examples:
-                pairs:
+                groups:
                   value:
-                    - ["terminusdb:///star-wars/People/10", "terminusdb:///star-wars/People/57"]
+                    - group:
+                        - { id: "terminusdb:///star-wars/People/10" }
+                        - { id: "terminusdb:///star-wars/People/57" }
+                      distance: 0.06
+                withSnippet:
+                  summary: With snippet=true
+                  value:
+                    - group:
+                        - { id: "terminusdb:///abt/Product/10", snippet: "Sony 5 disc CD changer ..." }
+                        - { id: "terminusdb:///buy/Product/57", snippet: "Sony 5-disc CD player ..." }
+                      distance: 0.04
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NoIndexedLineage' }
-        '501':
-          description: Bounded duplicates unavailable — never an unbounded scan.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
 
   # ───────────────────────────── ops ───────────────────────────────────────
   /statistics:
@@ -1021,13 +1075,38 @@ components:
           default: false
           description: Include the matched chunk's text as `chunk.snippet` in each hit.
 
-    DuplicatePairs:
+    DuplicateGroups:
       type: array
+      description: >
+        Near-duplicate groups, sorted nearest-first. The `group` array is
+        symmetric (member order is canonical: lower id first) and extends to
+        clusters of more than two members without a shape change.
       items:
-        type: array
-        minItems: 2
-        maxItems: 2
-        items: { type: string }
+        type: object
+        required: [group, distance]
+        properties:
+          group:
+            type: array
+            minItems: 2
+            description: The member documents of this near-duplicate group.
+            items:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+                  description: The member document id.
+                snippet:
+                  type: string
+                  description: >
+                    The member's matched chunk text. Present only when
+                    `snippet=true` was requested.
+          distance:
+            type: number
+            format: float
+            description: >
+              The [0, 1] cosine distance of the group's best matching chunks
+              (0 = identical, 0.5 = unrelated, 1 = opposite).
 
     Statistics:
       type: object

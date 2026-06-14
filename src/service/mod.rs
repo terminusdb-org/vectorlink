@@ -16,10 +16,12 @@ use crate::ingest;
 use crate::kernel::distance::l2_normalize;
 use crate::kernel::error::ServiceError;
 use crate::kernel::model::{
-    parse_domain, BranchName, Domain, LastIndexed, Operation, Ref, SearchHit, SearchMode,
-    SkippedDoc, Statistics, TaskStatus,
+    parse_domain, BranchName, Domain, DuplicateGroup, LastIndexed, Operation, Ref, SearchHit,
+    SearchMode, SkippedDoc, Statistics, TaskStatus,
 };
-use crate::store::lance::{ChunkRow, LanceStore, SearchQuery, dedup_chunks_to_documents};
+use crate::store::lance::{
+    ChunkRow, DuplicateScope, LanceStore, SearchQuery, dedup_chunks_to_documents,
+};
 
 /// The search service — owns the store and config, provides the transport-agnostic API.
 #[derive(Clone)]
@@ -715,38 +717,100 @@ impl SearchService {
         })
     }
 
-    /// Duplicates: bounded near-duplicate detection.
-    /// Returns 501 if unbounded (no commit indexed).
+    /// Duplicates: near-duplicate document groups in the whole snapshot (bounded).
+    ///
+    /// Delegates to [`duplicates_with_options`] with the contract defaults
+    /// (threshold 0.0, whole-snapshot scope, no snippets, page from 0, full page).
     pub async fn duplicates(
         &self,
         domain_raw: &str,
         commit: &str,
-    ) -> Result<Vec<(String, String)>, ServiceError> {
+    ) -> Result<Vec<DuplicateGroup>, ServiceError> {
+        self.duplicates_with_options(
+            domain_raw,
+            commit,
+            0.0,
+            &DuplicateScope::default(),
+            false,
+            0,
+            usize::MAX,
+            &[],
+        )
+        .await
+    }
+
+    /// Scoped near-duplicate document groups with full options.
+    ///
+    /// SCOPING (set/target — Spec 02/13): `scope.set_*` defines the population we
+    /// look for near-duplicates within; `scope.target_*`, when present, defines a
+    /// second population so every emitted group STRADDLES set↔target (cross-set
+    /// entity resolution). Absent target → within-set dedup.
+    ///
+    /// ALGORITHM: for each SET point in the commit's snapshot, the store runs ONE
+    /// FILTERED ANN `nearest()` query (excluding the point's own document, or
+    /// restricted to the target) — every returned row is a genuine cross-document
+    /// neighbour, so the scan is never starved by a multi-chunk document's own
+    /// sibling chunks (the defect that returned `[]` at scale). O(n) cheap indexed
+    /// queries, never an O(n²) all-pairs scan.
+    ///
+    /// UNITS: `threshold` is on the reference [0, 1] cosine scale used by
+    /// `/search` (0 = identical, 0.5 = orthogonal, 1 = opposite); e.g. `<= 0.05`
+    /// is "near-identical".
+    ///
+    /// BOUNDED: a candidate cap (`DEFAULT_DUPLICATE_MAX_POINTS`) rejects an
+    /// oversized set population (fail-loud, never a silent partial run);
+    /// `start`/`count` paginate the sorted (nearest-first) group list. Resolution
+    /// uses the SAME catch-up path as `/search`/`/similar`, so commit-resolution
+    /// and not-indexed (404) behaviour are consistent.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn duplicates_with_options(
+        &self,
+        domain_raw: &str,
+        commit: &str,
+        threshold: f32,
+        scope: &DuplicateScope,
+        snippet: bool,
+        start: usize,
+        count: usize,
+        ancestors: &[String],
+    ) -> Result<Vec<DuplicateGroup>, ServiceError> {
         let rp =
             parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
-        let _domain = Domain::from_resource_path(&rp);
 
-        // Duplicates requires a full scan which is bounded by the index size.
-        // For now, return an empty result set (feature to be fully implemented
-        // when the index supports efficient near-duplicate queries).
-        // If the commit is not indexed, return 501.
-        let domain_str = _domain.as_str().to_owned();
-        let branch = extract_branch(&rp);
-
-        let resolved = self
-            .store
-            .io_resolve_commit(&domain_str, &branch, commit)
-            .await
-            .map_err(|e| ServiceError::Internal(e.to_string()))?;
-
-        if resolved.is_none() {
+        if !self.is_search_ready() {
             return Err(ServiceError::Unavailable(
-                "commit not indexed — cannot compute duplicates".to_owned(),
+                "search capability not ready (embedding backend cold)".to_owned(),
             ));
         }
 
-        // Bounded: return empty for now (full duplicate detection is a future feature).
-        Ok(Vec::new())
+        let domain = Domain::from_resource_path(&rp);
+        let domain_str = domain.as_str().to_owned();
+        let branch = extract_branch(&rp);
+
+        // Resolve the searchable commit via the SHARED catch-up path BEFORE any
+        // store read — exact, nearest proven ancestor, or 404. Identical to
+        // `/search`/`/similar` so not-indexed behaviour is consistent.
+        let served_commit = self
+            .resolve_searchable_commit(&domain, &branch, commit, ancestors)
+            .await?;
+
+        let groups = self
+            .store
+            .io_duplicate_groups(
+                &domain_str,
+                &branch,
+                &served_commit,
+                threshold,
+                scope,
+                snippet,
+                crate::store::lance::DEFAULT_DUPLICATE_MAX_POINTS,
+            )
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        // Bounded pagination over the deterministic (sorted) group list.
+        let paginated = groups.into_iter().skip(start).take(count).collect();
+        Ok(paginated)
     }
 
     /// Statistics.

@@ -229,8 +229,26 @@ pub struct Statistics {
     pub pending_index_fragments: u64,
 }
 
-/// Duplicate pair.
-pub type DuplicatePair = (String, String);
+/// A single member of a near-duplicate group: the document id, and its chunk
+/// text when `snippet=true` was requested.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DuplicateMember {
+    pub id: String,
+    /// The matched chunk's text. Present only when `snippet=true` was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+}
+
+/// A near-duplicate group: a symmetric set of member documents whose best chunks
+/// are within `threshold`, with the [0, 1] cosine `distance` of the best pair of
+/// chunks. Currently always two members (a pair); the shape is `group` (a
+/// symmetric array) rather than `a`/`b` so it extends to clusters of >2 without a
+/// wire-shape change.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DuplicateGroup {
+    pub group: Vec<DuplicateMember>,
+    pub distance: f32,
+}
 
 #[cfg(test)]
 mod tests {

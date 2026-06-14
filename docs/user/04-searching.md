@@ -101,11 +101,14 @@ curl -u admin:root 'http://localhost:8080/search?domain=admin/star_wars&commit=c
 # more like a known document
 curl -u admin:root 'http://localhost:8080/similar?domain=admin/star_wars&commit=c1&id=terminusdb:///star-wars/People/20'
 
-# corpus-wide near-duplicate pairs (bounded by threshold + pagination)
+# near-duplicate groups within a population (bounded by threshold + pagination)
 curl -u admin:root 'http://localhost:8080/duplicates?domain=admin/star_wars&commit=c1&threshold=0.05'
+
+# cross-catalogue entity resolution: pairs that straddle Abt (set) and Buy (target)
+curl -u admin:root 'http://localhost:8080/duplicates?domain=admin/er&commit=c1&threshold=0.1&doc_type=Abt&target_doc_type=Buy&snippet=true'
 ```
 
-`/duplicates` is always bounded; it never runs an unbounded all-pairs scan.
+Each result is a `{ "group": [ {"id"[, "snippet"]}, … ], "distance": <0..1> }`, sorted nearest-first. `/duplicates` is always bounded; it never runs an unbounded all-pairs scan.
 
 ---
 

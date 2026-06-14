@@ -211,14 +211,17 @@ describe("P1-CON: Contract shapes", function () {
       }
     })
 
-    it("/duplicates returns 200 (array) or 503 (commit not indexed)", async function () {
+    it("/duplicates returns 200 (array) or a non-2xx for an unresolvable commit", async function () {
       const res = await agent()
         .get("/duplicates")
         .query({ domain: "admin/star_wars", commit: "abc123" })
         .set("Authorization", authHeader())
 
-      // 200 = success. 503 = commit not indexed.
-      expect([200, 503]).to.include(res.status)
+      // /duplicates resolves the commit via the SAME catch-up path as /search
+      // and /similar, so an unresolvable commit yields 404 (no indexed lineage)
+      // or 503 (search backend cold), and 200 when an ancestor resolves. Assert
+      // "resolved or declined", not one fixed code.
+      expect([200, 404, 503]).to.include(res.status)
       if (res.status === 200) {
         expect(res.body).to.be.an("array")
       }
