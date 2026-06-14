@@ -81,7 +81,10 @@ async function ioLoadV2(datasetKey) {
   });
   log(`push accepted, task=${taskId}; polling /check…`);
 
+  // Override with V2_INDEX_TIMEOUT_MS if a host is slower.
+  const indexTimeoutMs = Number(process.env.V2_INDEX_TIMEOUT_MS || 45 * 60 * 1000);
   const result = await ioWaitTaskComplete(taskId, {
+    timeoutMs: indexTimeoutMs,
     onProgress: (s) => log(`  indexing ${s.percentage?.toFixed?.(1) ?? "?"}%`),
   });
   log(`indexing Complete: indexed_documents=${result.indexed_documents}`);
@@ -92,7 +95,7 @@ async function ioLoadV2(datasetKey) {
   if (result.indexed_documents !== all.length) {
     throw new Error(
       `Indexed ${result.indexed_documents} documents but pushed ${all.length}. ` +
-        `Refusing to resolve against an incomplete snapshot.`
+      "Refusing to resolve against an incomplete snapshot.",
     );
   }
 
