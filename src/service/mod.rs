@@ -664,25 +664,38 @@ impl SearchService {
             )));
         }
 
-        // Use the first chunk's embedding (best available — chunk 0).
-        // Retrieve the actual embedding by re-embedding the chunk text (the store
-        // doesn't store raw embeddings in the hit). For /similar we re-embed using
-        // the Document role to get the source vector.
-        let source_text = vec![doc_chunks[0].content.clone()];
-        let embeddings = embed::io_embed(
-            &self.config.embed_provider,
-            &source_text,
-            EmbeddingRole::Document,
-            &self.http_client,
-        )
-        .await
-        .map_err(|e| ServiceError::Internal(format!("embedding for similar failed: {}", e)))?;
+        // Reuse the source document's STORED embedding (chunk 0, the best
+        // available) directly as the query vector — NO re-embedding round-trip.
+        // The lookup projects the vector from the snapshot, and every embedding is
+        // L2-normalised at insert time (both the service pipeline and the bulk
+        // loader normalise before write), so it is already on the unit sphere that
+        // Lance's cosine metric expects — no re-normalisation here.
+        //
+        // This is both faster (zero embed calls per /similar) and strictly more
+        // faithful than re-embedding the chunk text, which could drift from the
+        // stored vector due to batching/quantisation/provider non-determinism.
+        let query_embedding = doc_chunks[0].embedding.clone();
 
-        let mut query_embedding = embeddings
-            .into_iter()
-            .next()
-            .ok_or_else(|| ServiceError::Internal("no embedding returned for similar".to_owned()))?;
-        l2_normalize(&mut query_embedding);
+        // FAIL-LOUD sanity check: the stored vector must be present, the right
+        // dimension, and unit-norm. A violation means the projection or the insert
+        // invariant is broken — surface it rather than silently search on garbage.
+        let expected_dim = self.config.embed_provider.expected_dim();
+        if query_embedding.len() != expected_dim {
+            return Err(ServiceError::Internal(format!(
+                "stored embedding for {} has dimension {}, expected {}",
+                id,
+                query_embedding.len(),
+                expected_dim
+            )));
+        }
+        let norm_sq: f32 = query_embedding.iter().map(|v| v * v).sum();
+        if (norm_sq - 1.0).abs() > 1e-3 {
+            return Err(ServiceError::Internal(format!(
+                "stored embedding for {} is not L2-normalised (norm^2 = {}); \
+                 the insert-time normalisation invariant is violated",
+                id, norm_sq
+            )));
+        }
 
         let search_query = SearchQuery {
             query_embedding,

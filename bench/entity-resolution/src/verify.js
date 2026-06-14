@@ -10,6 +10,7 @@ const { getDataset } = require("./datasets");
 const { ioWaitReady, ioSearch } = require("./engine");
 const { ioLoadSide, ioLoadMapping } = require("./load-records");
 const { scoreResults } = require("./score");
+const { idFromIri } = require("./iri");
 
 const TOP_K = 10; // request enough to score recall@10
 const KS = [1, 5, 10];
@@ -30,10 +31,8 @@ function log(msg) {
 }
 
 // Strip the corpus IRI back to its raw id, so scoring compares ids to ids.
-function corpusIdFromIri(iri) {
-  const parts = iri.split("/");
-  return parts[parts.length - 1];
-}
+// Thin alias over the shared helper (kept exported for backward compatibility).
+const corpusIdFromIri = idFromIri;
 
 // One /search per query record (the current path). Returns ranked corpus ids.
 // Swap point: a future bulk implementation can produce the same shape from

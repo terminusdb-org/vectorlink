@@ -85,7 +85,7 @@ function isTransientFdPressure(message) {
   return /Too many open files|os error 24/.test(message);
 }
 
-async function ioSearch({ domain, commit, q, mode, count, start }, { maxRetries = 5 } = {}) {
+async function ioSearch({ domain, commit, q, mode, count, start, docTypes = [] }, { maxRetries = 8 } = {}) {
   const body = JSON.stringify({
     domain,
     commit,
@@ -93,6 +93,10 @@ async function ioSearch({ domain, commit, q, mode, count, start }, { maxRetries 
     ...(mode ? { mode } : {}),
     ...(count !== undefined ? { count } : {}),
     ...(start !== undefined ? { start } : {}),
+    // Server-side scope to a target population (e.g. ["Buy"]) so we fetch exactly
+    // `count` opposite-side hits — no client over-fetch, smaller per-query reader
+    // footprint (reduces the transient Lance FD spike under a long sweep).
+    ...(docTypes.length > 0 ? { doc_type: docTypes } : {}),
   });
   let attempt = 0;
   // @allowloop: bounded retry of a transient engine back-pressure error.
@@ -158,13 +162,18 @@ async function ioSimilar({ domain, commit, id, count, docTypes = [] }, { maxRetr
 // shape [{ group: [{id}, ...], distance }]. ONE nearest neighbour per set point
 // (the endpoint takes the single nearest of an over-fetched k=8), so this is a
 // TOP-1-per-direction cross-NN — not top-K (see README v2 "mode caveats").
-async function ioDuplicates({ domain, commit, threshold, setDocTypes = [], targetDocTypes = [], count }) {
+async function ioDuplicates({ domain, commit, threshold, setDocTypes = [], setDocIds = [], targetDocTypes = [], count }) {
   const params = new URLSearchParams();
   params.set("domain", domain);
   params.set("commit", commit);
   if (threshold !== undefined) params.set("threshold", String(threshold));
   if (count !== undefined) params.set("count", String(count));
   for (const t of setDocTypes) params.append("doc_type", t);
+  // setDocIds narrows the SET population to specific ids — used to BATCH a large
+  // set across several calls (the duplicates scan opens FDs per set-point and
+  // leaks them within one scan at scale; small batches keep each scan's FD
+  // footprint bounded — see README v2 "duplicates engine FD finding").
+  for (const id of setDocIds) params.append("doc_id", id);
   for (const t of targetDocTypes) params.append("target_doc_type", t);
   const { text } = await ioRequest("GET", `/duplicates?${params.toString()}`, {
     accept: "application/json",

@@ -158,6 +158,12 @@ pub struct ChunkHit {
     pub chunk_token_start: i32,
     pub doc_token_len: i32,
     pub content: String,
+    /// The L2-normalised embedding vector as STORED at insert time. Populated only
+    /// by the plain doc-chunk lookup path (`io_lookup_doc_chunks`), where it is
+    /// projected from the snapshot so `/similar` can reuse the stored vector
+    /// directly instead of re-embedding the source text. Ranked search/FTS paths
+    /// leave this empty (they rank by `_distance`/`_score`, not the raw vector).
+    pub embedding: Vec<f32>,
 }
 
 /// Per-branch metadata key: (domain_str, branch_str).
@@ -1910,22 +1916,10 @@ fn batches_to_points(batches: &[RecordBatch], snippet: bool) -> Result<Vec<Index
         };
 
         for i in 0..n {
-            if embeddings.is_null(i) {
-                return Err(StoreError::Internal(format!(
-                    "duplicates scan: null embedding for doc {}",
-                    doc_ids.value(i)
-                )));
-            }
-            let values = embeddings.value(i);
-            let floats = values
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| {
-                    StoreError::Internal("duplicates scan: embedding is not Float32".to_owned())
-                })?;
+            let embedding = extract_embedding_row(embeddings, i, doc_ids.value(i))?;
             points.push(IndexedPoint {
                 doc_id: doc_ids.value(i).to_owned(),
-                embedding: floats.values().to_vec(),
+                embedding,
                 content: contents.map(|c| c.value(i).to_owned()),
             });
         }
@@ -2117,6 +2111,36 @@ fn build_filter_expression(doc_types: &[String], doc_ids: &[String]) -> String {
     parts.join(" AND ")
 }
 
+/// Extract one row's embedding from a `FixedSizeListArray` of Float32 values.
+///
+/// FAIL-LOUD: a null embedding or a non-Float32 inner array is a real
+/// schema/corruption error (every stored vector is a non-null Float32 list at
+/// insert time), never silently coerced to an empty/zero vector — that would
+/// corrupt downstream ANN ranking. `doc_id` is included for diagnosability.
+fn extract_embedding_row(
+    embeddings: &FixedSizeListArray,
+    row: usize,
+    doc_id: &str,
+) -> Result<Vec<f32>, StoreError> {
+    if embeddings.is_null(row) {
+        return Err(StoreError::Internal(format!(
+            "embedding extraction: null embedding for doc {}",
+            doc_id
+        )));
+    }
+    let values = embeddings.value(row);
+    let floats = values
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| {
+            StoreError::Internal(format!(
+                "embedding extraction: embedding is not Float32 for doc {}",
+                doc_id
+            ))
+        })?;
+    Ok(floats.values().to_vec())
+}
+
 /// Extract ChunkHit records from RecordBatches.
 ///
 /// `require_distance` distinguishes the two read shapes:
@@ -2157,6 +2181,12 @@ fn batches_to_vector_hits(
         let distances = batch
             .column_by_name("_distance")
             .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+        // The stored embedding is present only on the plain doc-chunk lookup scan
+        // (which selects all columns); ranked vector search projects it away. When
+        // present, `/similar` reuses it directly instead of re-embedding.
+        let embeddings = batch
+            .column_by_name("embedding")
+            .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>());
 
         // FAIL LOUD (#E): a ranked vector search with no usable `_distance`
         // column is a real error — never default to 0.0 and corrupt ranking.
@@ -2175,6 +2205,10 @@ fn batches_to_vector_hits(
                 // For a ranked search `distances` is guaranteed Some by the guard
                 // above; for a plain scan a neutral 0.0 is correct (no ranking).
                 let distance = distances.map(|d| d.value(i)).unwrap_or(0.0);
+                let embedding = match embeddings {
+                    Some(arr) => extract_embedding_row(arr, i, ids.value(i))?,
+                    None => Vec::new(),
+                };
                 hits.push(ChunkHit {
                     doc_id: ids.value(i).to_owned(),
                     distance,
@@ -2184,6 +2218,7 @@ fn batches_to_vector_hits(
                     chunk_token_start: cts.value(i),
                     doc_token_len: dtl.value(i),
                     content: cnt.value(i).to_owned(),
+                    embedding,
                 });
             }
         }
@@ -2238,6 +2273,8 @@ fn batches_to_fts_hits(batches: &[RecordBatch]) -> Vec<ChunkHit> {
                     chunk_token_start: cts.value(i),
                     doc_token_len: dtl.value(i),
                     content: cnt.value(i).to_owned(),
+                    // FTS path ranks by `_score`; the raw vector is not projected.
+                    embedding: Vec::new(),
                 });
             }
         }
@@ -2631,6 +2668,58 @@ mod tests {
         assert_eq!(chunks.len(), 3);
     }
 
+    // --- lookup carries the STORED embedding (the /similar reuse path) ---
+    // Asserts that io_lookup_doc_chunks projects and populates the embedding
+    // exactly as inserted, so /similar can reuse the stored vector instead of
+    // re-embedding the source text.
+    #[tokio::test]
+    async fn lookup_doc_chunks_carries_stored_embedding() {
+        let (store, _tmp) = make_test_store(8);
+        let emb0 = fake_embedding(8, 1.0);
+        let emb1 = fake_embedding(8, 2.0);
+        let rows = vec![
+            ChunkRow {
+                doc_id: "doc/emb".to_owned(),
+                doc_type: "Article".to_owned(),
+                chunk_index: 0,
+                chunk_count: 2,
+                chunk_token_start: 0,
+                doc_token_len: 100,
+                embedding: emb0.clone(),
+                content: "chunk zero".to_owned(),
+            },
+            ChunkRow {
+                doc_id: "doc/emb".to_owned(),
+                doc_type: "Article".to_owned(),
+                chunk_index: 1,
+                chunk_count: 2,
+                chunk_token_start: 50,
+                doc_token_len: 100,
+                embedding: emb1.clone(),
+                content: "chunk one".to_owned(),
+            },
+        ];
+
+        store
+            .io_upsert_chunks("admin/test", "main", "doc/emb", &rows)
+            .await
+            .expect("upsert");
+
+        let mut chunks = store
+            .io_lookup_doc_chunks("admin/test", "main", "doc/emb")
+            .await
+            .expect("lookup");
+        chunks.sort_by_key(|c| c.chunk_index);
+
+        assert_eq!(chunks.len(), 2);
+        // The stored vector is returned verbatim (right dimension, exact values).
+        assert_eq!(chunks[0].embedding.len(), 8, "embedding dimension preserved");
+        assert_eq!(chunks[0].embedding, emb0, "chunk 0 embedding matches insert");
+        assert_eq!(chunks[1].embedding, emb1, "chunk 1 embedding matches insert");
+        // The vector is non-empty (regression guard: not the empty default).
+        assert!(!chunks[0].embedding.is_empty(), "embedding must be populated");
+    }
+
     // --- delete removes all chunks ---
     #[tokio::test]
     async fn delete_doc_removes_all_chunks() {
@@ -2688,6 +2777,7 @@ mod tests {
                 chunk_token_start: 0,
                 doc_token_len: 1000,
                 content: "first chunk".to_owned(),
+                embedding: Vec::new(),
             },
             ChunkHit {
                 doc_id: "doc/1".to_owned(),
@@ -2698,6 +2788,7 @@ mod tests {
                 chunk_token_start: 500,
                 doc_token_len: 1000,
                 content: "second chunk".to_owned(),
+                embedding: Vec::new(),
             },
             ChunkHit {
                 doc_id: "doc/2".to_owned(),
@@ -2708,6 +2799,7 @@ mod tests {
                 chunk_token_start: 0,
                 doc_token_len: 200,
                 content: "only chunk".to_owned(),
+                embedding: Vec::new(),
             },
         ];
 
@@ -2737,6 +2829,7 @@ mod tests {
             chunk_token_start: 0,
             doc_token_len: 41,
             content: "short doc".to_owned(),
+            embedding: Vec::new(),
         }];
 
         let results = dedup_chunks_to_documents(hits, true);
@@ -2762,6 +2855,7 @@ mod tests {
             chunk_token_start: 0,
             doc_token_len: 10,
             content: "x".to_owned(),
+            embedding: Vec::new(),
         }];
         let results = dedup_chunks_to_documents(hits, false);
         assert_eq!(results[0].distance, 0.0, "self-distance maps to 0");
@@ -2780,6 +2874,7 @@ mod tests {
                 chunk_token_start: 0,
                 doc_token_len: 10,
                 content: "rrf hit".to_owned(),
+                embedding: Vec::new(),
             },
         ];
         let results = dedup_chunks_to_documents(hits, false);
@@ -2805,6 +2900,7 @@ mod tests {
                 chunk_token_start: 0,
                 doc_token_len: 10,
                 content: "best match".to_owned(),
+                embedding: Vec::new(),
             },
             ChunkHit {
                 doc_id: "doc/worse".to_owned(),
@@ -2815,6 +2911,7 @@ mod tests {
                 chunk_token_start: 0,
                 doc_token_len: 10,
                 content: "worse match".to_owned(),
+                embedding: Vec::new(),
             },
         ];
 
@@ -2846,6 +2943,7 @@ mod tests {
             chunk_token_start: 0,
             doc_token_len: 10,
             content: "self".to_owned(),
+            embedding: Vec::new(),
         };
         let results = dedup_chunks_to_documents(vec![hit_identical], false);
         assert_eq!(results[0].distance, 0.0, "identical → 0.0");
@@ -2860,6 +2958,7 @@ mod tests {
             chunk_token_start: 0,
             doc_token_len: 10,
             content: "ortho".to_owned(),
+            embedding: Vec::new(),
         };
         let results = dedup_chunks_to_documents(vec![hit_orthogonal], false);
         assert!(
@@ -2878,6 +2977,7 @@ mod tests {
             chunk_token_start: 0,
             doc_token_len: 10,
             content: "opposite".to_owned(),
+            embedding: Vec::new(),
         };
         let results = dedup_chunks_to_documents(vec![hit_opposite], false);
         assert_eq!(results[0].distance, 1.0, "opposite → 1.0");
@@ -3392,6 +3492,7 @@ mod tests {
                 chunk_token_start: 0,
                 doc_token_len: 10,
                 content: "a".to_owned(),
+                embedding: Vec::new(),
             },
             ChunkHit {
                 doc_id: "B".to_owned(),
@@ -3402,6 +3503,7 @@ mod tests {
                 chunk_token_start: 0,
                 doc_token_len: 10,
                 content: "b".to_owned(),
+                embedding: Vec::new(),
             },
             ChunkHit {
                 doc_id: "C".to_owned(),
@@ -3412,6 +3514,7 @@ mod tests {
                 chunk_token_start: 0,
                 doc_token_len: 10,
                 content: "c".to_owned(),
+                embedding: Vec::new(),
             },
         ];
 
@@ -3426,6 +3529,7 @@ mod tests {
                 chunk_token_start: 0,
                 doc_token_len: 10,
                 content: "b".to_owned(),
+                embedding: Vec::new(),
             },
             ChunkHit {
                 doc_id: "C".to_owned(),
@@ -3436,6 +3540,7 @@ mod tests {
                 chunk_token_start: 0,
                 doc_token_len: 10,
                 content: "c".to_owned(),
+                embedding: Vec::new(),
             },
             ChunkHit {
                 doc_id: "D".to_owned(),
@@ -3446,6 +3551,7 @@ mod tests {
                 chunk_token_start: 0,
                 doc_token_len: 10,
                 content: "d".to_owned(),
+                embedding: Vec::new(),
             },
         ];
 

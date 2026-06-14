@@ -10,6 +10,7 @@
     "verify:abt-buy": "node src/verify.js abt-buy",
     "bench:abt-buy": "node src/bench.js abt-buy",
     "bench:v2": "node src/bench-v2.js abt-buy-v2",
+    "bench:v2:reload": "node src/bench-v2.js --mode search --reload abt-buy-v2",
     "bench:v2:search": "node src/bench-v2.js --mode search abt-buy-v2",
     "bench:v2:duplicates": "node src/bench-v2.js --mode duplicates abt-buy-v2",
     "bench:v2:similar": "node src/bench-v2.js --mode similar abt-buy-v2",

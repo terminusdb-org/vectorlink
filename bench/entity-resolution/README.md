@@ -130,7 +130,25 @@ an incomplete corpus).
 engine returned and the ground-truth Buy-id set:
 - `precision@1` = fraction whose top-1 Buy id is in the truth set.
 - `recall@K` = fraction with at least one truth id within the top K.
-Only Abt records that have a ground-truth mapping are scored.
+Only Abt records that have a ground-truth mapping are scored. *(Verified: the v1
+83.16% = 899/1081 precision@1 is computed correctly — top-1-in-truth over the 1081
+mapped Abt.)*
+
+### v2 scoring (`src/score-v2.js`, pure) — PAIR-BASED, consistent denominators
+
+v2 emits resolved **pairs** and scores them against the set of perfect pairs
+(`Σ|truth(abt)|`, the ~1097 many-to-one pairs):
+- Predicted pairs are **deduplicated** first (a pair emitted by both grounding and
+  assignment counts **once** — no double-counting).
+- `precision` (headline) `= TP / |all unique predicted pairs|`. A predicted pair
+  whose Abt has **no** truth mapping is a genuine **false positive** (the truth says
+  that Abt matches nothing) and **counts against precision** — it is NOT excluded.
+- `precision (mapped)` is the v1-comparable view that *excludes* unmapped-Abt
+  predictions (the universe v1 scored), reported alongside for comparison.
+- `recall = TP / |perfect pairs|`, `F1 = 2PR/(P+R)`. Precision and recall share the
+  **same pair universe** (TP), so they are consistent.
+- `best-pick precision` collapses each Abt to its single nearest predicted Buy — the
+  one-pick-per-Abt view directly comparable to v1 `precision@1`.
 
 ## Adding another dataset (extensibility)
 
@@ -183,10 +201,14 @@ Given each record's top-K cross-catalogue neighbours in **both** directions
    can never hang the run.
 6. **Leave the rest unmatched** — abstain rather than force a least-bad pair.
 
-**Performance contract (§6):** the O(n³) assignment is structurally confined to
-clusters whose size **k** bounds. `k`, `τ`, and grounding-first are simultaneously
-the recall knobs and the cost knobs. Each run reports cluster-size distribution,
-the max component observed, runaway count, and per-cluster assignment time.
+**Performance contract (§6):** the residual fragments into independent **connected
+components**, and the per-component assignment runs per cluster (never a global
+solve). Under `per-source` the assignment is **linear** in residual edges (no cubic
+step); under `optimal` the O(n³) Hungarian is structurally confined to clusters
+whose size **k** bounds, with the runaway guard as backstop. `k`, `τ`, and
+grounding-first are simultaneously the recall knobs and the cost knobs. Each run
+reports cluster-size distribution, the max component observed, runaway count, and
+per-cluster assignment time.
 
 ## Refinements baked in (A, E)
 
@@ -231,21 +253,37 @@ top-K bulk would need an engine change to return k>1 per set point.
 
 ## Run it (after the engine is confirmed up)
 
+**Reuse is the default — the vectors do not change between runs, only the
+algorithm/mode/knobs do.** A run REUSES the already-indexed snapshot (verified
+present + complete first; it **fails loud** and tells you to `--reload` if the
+snapshot is absent, partial, or still indexing). The **first** run on a fresh
+engine must `--reload` to index both catalogues.
+
 ```bash
-# search mode FIRST (loads both catalogues, scores, prints config + scorecard)
-node src/bench-v2.js --mode search abt-buy-v2          # or: npm run bench:v2:search
+# FIRST run on a fresh engine: index both catalogues (DELETE + push + wait).
+node src/bench-v2.js --mode search --reload abt-buy-v2   # or: npm run bench:v2:search
 
-# duplicates mode SECOND (reuses the snapshot already indexed by the first run)
-node src/bench-v2.js --mode duplicates --no-load abt-buy-v2   # npm run bench:v2:duplicates
+# Subsequent runs REUSE the indexed snapshot (no re-embed) — default, no flag.
+node src/bench-v2.js --mode search abt-buy-v2
 
-# similar mode — wired, RUN DEFERRED until the reuse-stored-vector engine fix lands
-node src/bench-v2.js --mode similar --no-load abt-buy-v2      # npm run bench:v2:similar
+# duplicates / similar reuse the same snapshot too (default reuse).
+node src/bench-v2.js --mode duplicates abt-buy-v2        # npm run bench:v2:duplicates
+node src/bench-v2.js --mode similar abt-buy-v2           # RUN DEFERRED (engine re-embeds anchor)
 ```
 
 Knobs (all printed per run): `--mode search|duplicates|similar`, `--k N`
-(fan-out, default 5), `--threshold T` (τ cap, default 0.5), `--max-component N`
-(runaway guard, default 200), `--no-load` (reuse an already-indexed snapshot for
-cheap A/B sweeps), `--query-delay-ms N`. Unknown flags **fail loud**.
+(fan-out, default 5), `--threshold T` (τ cap, default 0.5), `--assignment
+per-source|optimal` (default `per-source`, the many-to-one-correct path),
+`--max-component N` (runaway guard for `optimal`, default 200), `--reload`/`--force`
+(conscious re-index; `--no-load` is a reuse alias), `--no-cache` (ignore the
+candidate cache), `--gather-k N`, `--query-delay-ms N`. Unknown flags **fail loud**.
+
+The **candidate cache** (`.candidate-cache/`) stores the gathered cross-NN lists so
+k/τ sweeps re-score for free. It is keyed by mode and validated against the snapshot
+**commit**, the cached **gatherK** (≥ requested k), and — for `duplicates` (whose
+gather applies τ server-side) — the cached **gather τ** (≥ requested τ). A reload, a
+tighter cached τ, or a commit mismatch all correctly **miss** the cache. A cache-hit
+gather time is printed as `[REPLAYED from cache]`.
 
 The scorecard reports: grounded (Step 4) vs assigned (Step 5) **pair counts and
 per-stage precision**, overall precision + recall vs the perfect mapping,
