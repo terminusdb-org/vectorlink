@@ -407,6 +407,40 @@ paths:
                     pending_index_fragments: 0
         '401': { $ref: '#/components/responses/Unauthorized' }
 
+  /domain:
+    delete:
+      tags: [ops]
+      operationId: deleteDomain
+      summary: Delete a database's entire search footprint.
+      description: >
+        Removes everything the engine holds for a database: all of its branches,
+        versions, tags, indexed commits and the stored vectors/chunks, plus the
+        in-memory tracking for every branch. Used when a database is deleted at
+        the source so no orphaned, stale, still-searchable data is left behind.
+
+
+        Idempotent: deleting a database that is unknown or already removed returns
+        `204` (NOT `404`), so the caller may safely retry. Failure is reported only
+        for a genuine internal error (e.g. the stored data exists but cannot be
+        removed) — a partial deletion is never left silently in place.
+      parameters:
+        - name: domain
+          in: query
+          required: true
+          description: >
+            The database to delete, as a graphspec (e.g. `org/db`). The whole
+            database footprint is removed regardless of branch.
+          schema: { type: string }
+          example: admin/star_wars
+      responses:
+        '204':
+          description: >
+            The database footprint has been removed (or was already absent —
+            idempotent).
+        '400': { $ref: '#/components/responses/SearchBadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
+
   /health/live:
     get:
       tags: [ops]

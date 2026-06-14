@@ -7,7 +7,7 @@ use axum::extract::{Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +44,14 @@ pub struct AssignParams {
     pub target_commit: Option<String>,
 }
 
+// WHY: These query-param structs are deserialized by Serde from the HTTP request.
+//   Fields declared in openapi.yaml are present for wire-contract compliance even
+//   when the handler does not yet consume them (Phase-3 features: doc_type filtering,
+//   snippet mode, similarity threshold).
+// INVARIANT: All fields match the OpenAPI spec and are accepted/parsed; unused ones
+//   are silently ignored by the handler — no user-facing error, no silent data loss.
+// CONSEQUENCE: Removing a field would reject valid API requests that include it.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct SearchGetParams {
     pub domain: Option<String>,
@@ -57,6 +65,7 @@ pub struct SearchGetParams {
     pub snippet: Option<bool>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct SimilarParams {
     pub domain: Option<String>,
@@ -68,6 +77,7 @@ pub struct SimilarParams {
     pub snippet: Option<bool>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct DuplicatesParams {
     pub domain: Option<String>,
@@ -424,14 +434,7 @@ async fn handle_search_get(
         )
         .await
     {
-        Ok(results) => {
-            let mut response = Json(results).into_response();
-            response.headers_mut().insert(
-                "terminusdb-data-version",
-                format!("commit:{}", commit).parse().expect("valid header"),
-            );
-            response
-        }
+        Ok(outcome) => search_response(outcome),
         Err(e) => service_error_to_response(e),
     }
 }
@@ -505,15 +508,34 @@ async fn handle_search_post(
         )
         .await
     {
-        Ok(results) => {
-            let mut response = Json(results).into_response();
-            response.headers_mut().insert(
-                "terminusdb-data-version",
-                format!("commit:{}", commit).parse().expect("valid header"),
-            );
+        Ok(outcome) => search_response(outcome),
+        Err(e) => service_error_to_response(e),
+    }
+}
+
+/// Build a search response: the bare `[{id,distance}]` array body plus the
+/// `TerminusDB-Data-Version` header reporting the commit ACTUALLY served. Under
+/// lag this is the nearest indexed ancestor (≠ requested ⇒ the caller detects
+/// staleness) — staleness is never hidden (RISK-15, P3-LAG-1).
+fn search_response(outcome: crate::service::SearchOutcome) -> Response {
+    let mut response = Json(outcome.hits).into_response();
+    // The served commit is an opaque id; sanitise to a valid header value. If it
+    // somehow cannot form a header (non-ASCII control chars), that is an internal
+    // invariant violation — fail loud rather than drop the staleness signal.
+    match format!("commit:{}", outcome.served_commit).parse() {
+        Ok(value) => {
+            response
+                .headers_mut()
+                .insert("terminusdb-data-version", value);
             response
         }
-        Err(e) => service_error_to_response(e),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "served commit '{}' cannot be encoded as a data-version header",
+                outcome.served_commit
+            ),
+        ),
     }
 }
 
@@ -618,6 +640,35 @@ async fn handle_statistics(State(state): State<AppState>) -> Response {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DeleteDomainParams {
+    pub domain: Option<String>,
+}
+
+/// DELETE /domain?domain=<org/db> — remove a domain's entire search footprint.
+/// Admin-secret gated. Idempotent: an unknown/already-removed domain returns
+/// 204 (NOT 404) — TerminusDB may retry. Fails loud (500) only on a genuine I/O
+/// error (e.g. the dataset dir exists but can't be removed).
+async fn handle_delete_domain(
+    State(state): State<AppState>,
+    Query(params): Query<DeleteDomainParams>,
+) -> Response {
+    let domain = match params.domain {
+        Some(d) if !d.is_empty() => d,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing required query parameter: domain".to_owned(),
+            );
+        }
+    };
+
+    match state.service.delete_domain(&domain).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => service_error_to_response(e),
+    }
+}
+
 async fn handle_health_live() -> Response {
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
@@ -653,6 +704,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/similar", get(handle_similar))
         .route("/duplicates", get(handle_duplicates))
         .route("/statistics", get(handle_statistics))
+        .route("/domain", delete(handle_delete_domain))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Unauthenticated routes (health probes).

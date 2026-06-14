@@ -92,15 +92,17 @@ describe("P1-CON: Contract shapes", function () {
   })
 
   // P1-CON-4: GET /search
-  // Real engine: 200 = success, 503 = search cold, 500 = commit not indexed.
+  // Real engine: 200 = success (exact or stale ancestor), 404 = no indexed
+  // lineage (the documented NoIndexedLineage contract response for an unindexed
+  // commit on a domain that was never pushed), 503 = search cold.
   describe("P1-CON-4: GET /search", function () {
-    it("returns 200 (array), 503 (search cold), or 500 (commit not indexed)", async function () {
+    it("returns 200 (array), 404 (no indexed lineage), or 503 (search cold)", async function () {
       const res = await agent()
         .get("/search")
         .query({ domain: "admin/star_wars", commit: "abc123", q: "wise" })
         .set("Authorization", authHeader())
 
-      expect([200, 500, 503]).to.include(res.status)
+      expect([200, 404, 503]).to.include(res.status)
       if (res.status === 200) {
         expect(res.body).to.be.an("array")
       } else if (res.status === 503) {
@@ -112,7 +114,7 @@ describe("P1-CON: Contract shapes", function () {
 
   // P1-CON-5: POST /search with body overriding query params
   describe("P1-CON-5: POST /search", function () {
-    it("returns 200, 500, or 503 with JSON body overriding query params", async function () {
+    it("returns 200, 404, or 503 with JSON body overriding query params", async function () {
       const res = await agent()
         .post("/search")
         .query({ domain: "admin/ignored", commit: "ignored", q: "ignored" })
@@ -123,7 +125,7 @@ describe("P1-CON: Contract shapes", function () {
           q: "wise old man",
         })
 
-      expect([200, 500, 503]).to.include(res.status)
+      expect([200, 404, 503]).to.include(res.status)
       if (res.status === 200) {
         expect(res.body).to.be.an("array")
       }
@@ -142,8 +144,9 @@ describe("P1-CON: Contract shapes", function () {
           q: "wise old man",
         })
 
-      // Should not be 400 for invalid domain (body wins over query).
-      expect([200, 500, 503]).to.include(res.status)
+      // Should not be 400 for invalid domain (body wins over query); 404 is the
+      // valid no-indexed-lineage response for the unindexed body domain/commit.
+      expect([200, 404, 503]).to.include(res.status)
     })
   })
 

@@ -6,6 +6,7 @@
 //! LanceStore: real LanceDB-backed persistence with versioned vector search.
 //! vector_index: ANN index creation and incremental maintenance.
 
+pub mod branch;
 pub mod lance;
 pub mod vector_index;
 

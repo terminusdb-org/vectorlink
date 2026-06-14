@@ -158,26 +158,36 @@ pub struct ChunkHit {
     pub content: String,
 }
 
-/// Dataset key: (domain_str, branch_str).
-type DatasetKey = (String, String);
+/// Per-branch metadata key: (domain_str, branch_str).
+/// Used for last-indexed, pipeline locks, and index tracking — branch-precise
+/// state per RISK-22. The Lance DATASET itself is domain-keyed (layout A): one
+/// `{domain}.lance` dataset holds all TerminusDB branches as Lance branches.
+type BranchKey = (String, String);
 
-/// The Lance-backed store (single-branch linear history).
+/// Default Lance branch name. Layout (A) maps TerminusDB's `main` branch to
+/// the Lance dataset's native default branch.
+pub const MAIN_BRANCH: &str = "main";
+
+/// The Lance-backed store (layout A: one dataset per domain, TerminusDB
+/// branches as Lance branches inside it; tags are dataset-global).
 #[derive(Debug)]
 pub struct LanceStore {
     base_dir: PathBuf,
     dim: usize,
     /// Vector index configuration (nprobes, refine_factor for search).
     vector_index_config: VectorIndexConfig,
-    /// Open dataset handles, keyed by (domain, branch).
-    datasets: RwLock<HashMap<DatasetKey, Arc<RwLock<Dataset>>>>,
-    /// Per-(domain, branch) index tracking.
-    branch_indexes: RwLock<HashMap<DatasetKey, BranchIndex>>,
+    /// Open dataset handles, keyed by DOMAIN (layout A). The cached handle is
+    /// the domain dataset opened at its default (main) branch head; branch
+    /// writes check out a branch-bound handle without mutating this one.
+    datasets: RwLock<HashMap<String, Arc<RwLock<Dataset>>>>,
+    /// Per-(domain, branch) index tracking (branch-precise).
+    branch_indexes: RwLock<HashMap<BranchKey, BranchIndex>>,
     /// Tasks by task ID.
     tasks: RwLock<HashMap<String, TaskStatus>>,
     /// Per-(domain, branch) pipeline serialisation lock.
     /// Ensures concurrent pushes to the same branch are serialised so that
     /// commit→version tags are correctly isolated.
-    pipeline_locks: RwLock<HashMap<DatasetKey, Arc<tokio::sync::Mutex<()>>>>,
+    pipeline_locks: RwLock<HashMap<BranchKey, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl LanceStore {
@@ -213,7 +223,7 @@ impl LanceStore {
         domain: &str,
         branch: &str,
     ) -> tokio::sync::OwnedMutexGuard<()> {
-        let key = (domain.to_owned(), branch.to_owned());
+        let key: BranchKey = (domain.to_owned(), branch.to_owned());
 
         // Get or create the lock for this key.
         let lock = {
@@ -255,30 +265,39 @@ impl LanceStore {
         ]))
     }
 
-    /// Get the dataset path for a (domain, branch) pair.
-    fn dataset_path(&self, domain: &str, branch: &str) -> PathBuf {
+    /// Get the on-disk path for a domain's Lance dataset (layout A: one dataset
+    /// per domain; branches live inside it as Lance branches).
+    fn dataset_path(&self, domain: &str) -> PathBuf {
         // Use a safe directory name: domain slashes replaced with double-underscore.
         let safe_domain = domain.replace('/', "__");
-        self.base_dir.join(format!("{}_{}.lance", safe_domain, branch))
+        self.base_dir.join(format!("{}.lance", safe_domain))
     }
 
-    /// Open or create the dataset for a (domain, branch) pair.
+    /// Open or create the cached domain dataset handle (at its default branch
+    /// head). The `branch` argument is accepted for signature stability across
+    /// the store API; branch selection for reads/writes happens via
+    /// `checkout_branch` / `checkout_version` on the returned handle's data, not
+    /// by opening separate directories (layout A).
+    ///
+    /// INVARIANT: the cached handle is opened at the dataset's native default
+    /// branch. Callers that need a specific branch's head check out a branch-
+    /// bound handle (`io_open_branch_for_write`); callers that need a commit's
+    /// snapshot check out a version (`io_search`). The cache is never advanced
+    /// to a non-default branch.
     pub async fn io_open_dataset(
         &self,
         domain: &str,
-        branch: &str,
+        _branch: &str,
     ) -> Result<Arc<RwLock<Dataset>>, StoreError> {
-        let key = (domain.to_owned(), branch.to_owned());
-
-        // Check cache first.
+        // Check cache first (keyed by domain — layout A).
         {
             let datasets = self.datasets.read().await;
-            if let Some(ds) = datasets.get(&key) {
+            if let Some(ds) = datasets.get(domain) {
                 return Ok(Arc::clone(ds));
             }
         }
 
-        let path = self.dataset_path(domain, branch);
+        let path = self.dataset_path(domain);
         let uri = path.to_string_lossy().to_string();
 
         // Try to open existing dataset.
@@ -302,8 +321,147 @@ impl LanceStore {
 
         let arc_ds = Arc::new(RwLock::new(ds));
         let mut datasets = self.datasets.write().await;
-        datasets.insert(key, Arc::clone(&arc_ds));
+        // Re-check: a concurrent opener may have inserted while we were opening.
+        if let Some(existing) = datasets.get(domain) {
+            return Ok(Arc::clone(existing));
+        }
+        datasets.insert(domain.to_owned(), Arc::clone(&arc_ds));
         Ok(arc_ds)
+    }
+
+    /// Open a FRESH, branch-bound dataset handle for WRITING to `branch`
+    /// (layout A). Opens the domain dataset from disk and checks out the named
+    /// branch so that appends/deletes target that branch's head, leaving sibling
+    /// branches (and the cached main handle) untouched.
+    ///
+    /// INVARIANT: the returned handle is bound to `branch`; an append on it
+    /// advances only `branch`'s head. For `branch == MAIN_BRANCH` the dataset's
+    /// native default branch is the write target (no checkout needed).
+    ///
+    /// Returns an error if the dataset or the branch does not exist — callers
+    /// must ensure the dataset (and any non-main branch) exists first.
+    async fn io_open_branch_for_write(
+        &self,
+        domain: &str,
+        branch: &str,
+    ) -> Result<Dataset, StoreError> {
+        let path = self.dataset_path(domain);
+        let uri = path.to_string_lossy().to_string();
+        let ds = Dataset::open(&uri)
+            .await
+            .map_err(|e| StoreError::Internal(format!("failed to open dataset for write: {}", e)))?;
+
+        if branch == MAIN_BRANCH {
+            // Native default branch — writes already target it.
+            return Ok(ds);
+        }
+
+        ds.checkout_branch(branch).await.map_err(|e| {
+            StoreError::Internal(format!(
+                "failed to checkout branch '{}' for write (does it exist?): {}",
+                branch, e
+            ))
+        })
+    }
+
+    /// List the Lance branch names that currently exist in the domain dataset.
+    /// Returns an empty list if the dataset doesn't exist yet.
+    pub async fn io_list_branches(&self, domain: &str) -> Result<Vec<String>, StoreError> {
+        let path = self.dataset_path(domain);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let uri = path.to_string_lossy().to_string();
+        let ds = Dataset::open(&uri)
+            .await
+            .map_err(|e| StoreError::Internal(format!("open for list_branches failed: {}", e)))?;
+        let branches = ds
+            .list_branches()
+            .await
+            .map_err(|e| StoreError::Internal(format!("list_branches failed: {}", e)))?;
+        Ok(branches.into_keys().collect())
+    }
+
+    /// Create a new Lance branch `branch` forked from `from_version` (layout A,
+    /// block reuse). The new branch shares the parent version's fragment files
+    /// (shallow clone — no data copied; RISK-01, proven by Phase-0 spike 0a1.3).
+    /// Subsequent writes on the branch add only delta fragments.
+    ///
+    /// INVARIANT: `from_version` must be a real version of the domain dataset
+    /// (typically resolved from a parent commit's tag). Creating a branch that
+    /// already exists is an error (fail loud — the caller decides idempotency).
+    ///
+    /// After creation the cache is left untouched (it tracks the default branch);
+    /// the new branch is reached via `checkout_branch` on subsequent operations.
+    pub async fn io_create_branch(
+        &self,
+        domain: &str,
+        branch: &str,
+        from_version: u64,
+    ) -> Result<(), StoreError> {
+        if branch == MAIN_BRANCH {
+            return Err(StoreError::Internal(
+                "cannot create the default 'main' branch — it always exists".to_owned(),
+            ));
+        }
+
+        // The domain dataset must already exist (the parent was indexed there).
+        let path = self.dataset_path(domain);
+        if !path.exists() {
+            return Err(StoreError::Internal(format!(
+                "cannot branch domain '{}': dataset does not exist (index the parent first)",
+                domain
+            )));
+        }
+        let uri = path.to_string_lossy().to_string();
+        let mut ds = Dataset::open(&uri)
+            .await
+            .map_err(|e| StoreError::Internal(format!("open for create_branch failed: {}", e)))?;
+
+        ds.create_branch(branch, from_version, None)
+            .await
+            .map_err(|e| {
+                StoreError::Internal(format!(
+                    "create_branch '{}' from version {} failed: {}",
+                    branch, from_version, e
+                ))
+            })?;
+
+        Ok(())
+    }
+
+    /// Collect the set of physical data-file paths referenced by a branch's
+    /// current head (layout A). Used to PROVE block reuse by path identity
+    /// (P3-BR-1): a branch forked from a parent shares the parent's fragment
+    /// files, so the two path sets intersect on the shared fragments.
+    pub async fn io_branch_data_file_paths(
+        &self,
+        domain: &str,
+        branch: &str,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let path = self.dataset_path(domain);
+        if !path.exists() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let uri = path.to_string_lossy().to_string();
+        let ds = Dataset::open(&uri)
+            .await
+            .map_err(|e| StoreError::Internal(format!("open for data-file paths failed: {}", e)))?;
+        let ds = if branch == MAIN_BRANCH {
+            ds
+        } else {
+            ds.checkout_branch(branch).await.map_err(|e| {
+                StoreError::Internal(format!("checkout '{}' for data-file paths failed: {}", branch, e))
+            })?
+        };
+
+        let mut set = std::collections::HashSet::new();
+        for frag in ds.get_fragments() {
+            for df in &frag.metadata().files {
+                set.insert(df.path.clone());
+            }
+        }
+        Ok(set)
     }
 
     /// Open a FRESH dataset handle directly from disk (NOT from the shared cache).
@@ -311,8 +469,9 @@ impl LanceStore {
     /// holding the cached `Arc<RwLock<Dataset>>`'s write lock — which would block
     /// concurrent search read locks and stall queries during optimization.
     ///
-    /// After optimization completes, the caller should refresh the cache via
-    /// `io_refresh_cached_dataset` so subsequent reads see the new version.
+    /// Layout A: opens the domain dataset and checks out `branch` so the optimize
+    /// targets the right branch head. After optimization completes, the caller
+    /// should refresh the cache via `io_refresh_cached_dataset`.
     ///
     /// Returns None if the dataset does not exist on disk (nothing to optimize).
     pub async fn io_open_dataset_uncached(
@@ -320,7 +479,7 @@ impl LanceStore {
         domain: &str,
         branch: &str,
     ) -> Result<Option<Dataset>, StoreError> {
-        let path = self.dataset_path(domain, branch);
+        let path = self.dataset_path(domain);
         if !path.exists() {
             return Ok(None);
         }
@@ -328,18 +487,32 @@ impl LanceStore {
         let ds = Dataset::open(&uri)
             .await
             .map_err(|e| StoreError::Internal(format!("uncached open failed: {}", e)))?;
-        Ok(Some(ds))
+
+        if branch == MAIN_BRANCH {
+            return Ok(Some(ds));
+        }
+
+        let branch_ds = ds.checkout_branch(branch).await.map_err(|e| {
+            StoreError::Internal(format!(
+                "uncached checkout branch '{}' failed: {}",
+                branch, e
+            ))
+        })?;
+        Ok(Some(branch_ds))
     }
 
-    /// Refresh the cached dataset handle by re-opening from disk.
-    /// Called after the background worker completes optimization to ensure
-    /// the cached handle reflects the latest version (with updated indices).
+    /// Refresh the cached domain dataset handle by re-opening from disk at the
+    /// default branch head. Called after the background worker completes
+    /// optimization so subsequent reads see the new version/indices.
+    ///
+    /// `_branch` is accepted for signature stability; the cache is domain-keyed
+    /// and always reflects the dataset's default branch (layout A).
     pub async fn io_refresh_cached_dataset(
         &self,
         domain: &str,
-        branch: &str,
+        _branch: &str,
     ) -> Result<(), StoreError> {
-        let path = self.dataset_path(domain, branch);
+        let path = self.dataset_path(domain);
         if !path.exists() {
             return Ok(());
         }
@@ -348,10 +521,9 @@ impl LanceStore {
             .await
             .map_err(|e| StoreError::Internal(format!("refresh open failed: {}", e)))?;
 
-        let key = (domain.to_owned(), branch.to_owned());
         let arc_ds = Arc::new(RwLock::new(ds));
         let mut datasets = self.datasets.write().await;
-        datasets.insert(key, arc_ds);
+        datasets.insert(domain.to_owned(), arc_ds);
         Ok(())
     }
 
@@ -419,8 +591,13 @@ impl LanceStore {
         .map_err(|e| StoreError::Internal(format!("batch construction failed: {}", e)))
     }
 
-    /// Upsert chunk rows for a document. First deletes all existing rows for the
-    /// doc_id, then appends the new rows.
+    /// Upsert chunk rows for a document on `branch` (layout A). First deletes all
+    /// existing rows for the doc_id, then appends the new rows — the
+    /// delete-then-append that implements real `Changed` (replace full chunk set,
+    /// no stale chunks; RISK-13).
+    ///
+    /// Writes target `branch`'s head via a branch-bound handle so sibling
+    /// branches are untouched. Ensures the domain dataset exists first.
     pub async fn io_upsert_chunks(
         &self,
         domain: &str,
@@ -432,10 +609,13 @@ impl LanceStore {
             return Ok(0);
         }
 
-        let ds_arc = self.io_open_dataset(domain, branch).await?;
-        let mut ds = ds_arc.write().await;
+        // Ensure the domain dataset exists (creates the main branch on first use).
+        self.io_open_dataset(domain, branch).await?;
 
-        // Delete existing rows for this doc_id.
+        // Open a fresh branch-bound handle so the write targets `branch`'s head.
+        let mut ds = self.io_open_branch_for_write(domain, branch).await?;
+
+        // Delete existing rows for this doc_id (replace semantics).
         let filter = format!("doc_id = '{}'", doc_id.replace('\'', "''"));
         ds.delete(&filter)
             .await
@@ -449,28 +629,45 @@ impl LanceStore {
             .await
             .map_err(|e| StoreError::Internal(format!("append failed: {}", e)))?;
 
+        // Keep the cache consistent with the branch we just advanced (main).
+        // For non-main branches the cached main handle is unaffected; refreshing
+        // is harmless (re-opens at default branch head).
+        self.io_refresh_cached_dataset(domain, branch).await?;
+
         Ok(ds.version().version)
     }
 
-    /// Delete all chunks for a doc_id.
+    /// Delete all chunks for a doc_id on `branch` (`Deleted` op; RISK-13).
+    /// Writes target `branch`'s head via a branch-bound handle.
     pub async fn io_delete_doc(
         &self,
         domain: &str,
         branch: &str,
         doc_id: &str,
     ) -> Result<u64, StoreError> {
-        let ds_arc = self.io_open_dataset(domain, branch).await?;
-        let mut ds = ds_arc.write().await;
+        // Ensure the domain dataset exists.
+        self.io_open_dataset(domain, branch).await?;
+
+        let mut ds = self.io_open_branch_for_write(domain, branch).await?;
 
         let filter = format!("doc_id = '{}'", doc_id.replace('\'', "''"));
         ds.delete(&filter)
             .await
             .map_err(|e| StoreError::Internal(format!("delete failed: {}", e)))?;
 
+        self.io_refresh_cached_dataset(domain, branch).await?;
+
         Ok(ds.version().version)
     }
 
     /// Bind a commit to a Lance version via a tag.
+    ///
+    /// Layout A: Lance versions are scoped to the branch that created them (the
+    /// version number `v` means "version v on `branch`'s lineage"). The tag MUST
+    /// therefore be created on a handle checked out to `branch` — otherwise Lance
+    /// rejects it ("version <branch>:<v> does not exist"). Tag *resolution* is
+    /// dataset-global (a tag created on any branch resolves from any other —
+    /// Phase-0 spike 0a2.2), which is what gives us branch-from-anywhere.
     pub async fn io_tag_commit(
         &self,
         domain: &str,
@@ -478,16 +675,69 @@ impl LanceStore {
         commit: &str,
         version: u64,
     ) -> Result<(), StoreError> {
-        let ds_arc = self.io_open_dataset(domain, branch).await?;
-        let ds = ds_arc.read().await;
-
         let tag = layeridx::encode_commit_tag(commit);
-        ds.tags()
+
+        if branch == MAIN_BRANCH {
+            // Default branch — the cached handle is on main; tag there.
+            let ds_arc = self.io_open_dataset(domain, branch).await?;
+            let ds = ds_arc.read().await;
+            ds.tags()
+                .create(&tag, version)
+                .await
+                .map_err(|e| StoreError::Internal(format!("tag creation failed: {}", e)))?;
+            return Ok(());
+        }
+
+        // Non-main: create the tag on a branch-bound handle so `version` resolves
+        // on the branch's own lineage.
+        let path = self.dataset_path(domain);
+        let uri = path.to_string_lossy().to_string();
+        let base = Dataset::open(&uri)
+            .await
+            .map_err(|e| StoreError::Internal(format!("open for tag failed: {}", e)))?;
+        let branch_ds = base.checkout_branch(branch).await.map_err(|e| {
+            StoreError::Internal(format!("checkout '{}' for tag failed: {}", branch, e))
+        })?;
+        branch_ds
+            .tags()
             .create(&tag, version)
             .await
             .map_err(|e| StoreError::Internal(format!("tag creation failed: {}", e)))?;
-
         Ok(())
+    }
+
+    /// Assign `target_commit` to point at `source_commit`'s already-indexed
+    /// version — a pure tag pointer, NO data movement and NO embedding
+    /// (`/assign` semantics; P3-ASSIGN-1). Resolves the source via the
+    /// dataset-global tag and tags the target to the same version.
+    ///
+    /// INVARIANT (fail loud): the source commit MUST already be indexed; an
+    /// unindexed source is an error, never a silent no-op.
+    ///
+    /// This touches only Lance tags (no `io_upsert_chunks`, no `io_embed`), so by
+    /// construction `/assign` performs zero embed-provider calls and creates no
+    /// new dataset version.
+    pub async fn io_assign_commit(
+        &self,
+        domain: &str,
+        branch: &str,
+        source_commit: &str,
+        target_commit: &str,
+    ) -> Result<u64, StoreError> {
+        let source_version = self
+            .io_resolve_commit(domain, branch, source_commit)
+            .await?
+            .ok_or_else(|| {
+                StoreError::Internal(format!(
+                    "cannot assign: source commit '{}' is not indexed",
+                    source_commit
+                ))
+            })?;
+
+        self.io_tag_commit(domain, branch, target_commit, source_version)
+            .await?;
+
+        Ok(source_version)
     }
 
     /// Ensure an FTS (INVERTED) index exists on the "content" column and is
@@ -592,6 +842,51 @@ impl LanceStore {
         }
     }
 
+    /// Delete a domain's ENTIRE store footprint (layout A): drop the single
+    /// `{domain}.lance` dataset (all branches/versions/tags) AND purge the
+    /// domain's in-memory state (dataset cache entry, every `(domain, *)` entry
+    /// in `branch_indexes` and `pipeline_locks`).
+    ///
+    /// IDEMPOTENT: deleting an unknown/already-removed domain succeeds (returns
+    /// `Ok(())`) — TerminusDB may retry. We fail loud only on a genuine I/O error
+    /// (the directory exists but cannot be removed).
+    ///
+    /// FAIL-LOUD partial-delete guard: the on-disk dataset is removed FIRST; only
+    /// if that succeeds (or there was nothing on disk) do we purge in-memory
+    /// state. If the disk removal errors, we surface it and leave in-memory state
+    /// intact — never a half-deleted footprint (searchable map entry with no
+    /// dataset, or a dataset with no map entry).
+    pub async fn io_delete_domain(&self, domain: &str) -> Result<(), StoreError> {
+        // 1. Drop the on-disk dataset directory first.
+        let path = self.dataset_path(domain);
+        if path.exists() {
+            tokio::fs::remove_dir_all(&path).await.map_err(|e| {
+                StoreError::Internal(format!(
+                    "failed to remove dataset directory {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+        }
+
+        // 2. Disk removal succeeded (or nothing was there) — purge in-memory
+        //    state. Each map is purged under its own lock.
+        {
+            let mut datasets = self.datasets.write().await;
+            datasets.remove(domain);
+        }
+        {
+            let mut indexes = self.branch_indexes.write().await;
+            indexes.retain(|(d, _b), _| d != domain);
+        }
+        {
+            let mut locks = self.pipeline_locks.write().await;
+            locks.retain(|(d, _b), _| d != domain);
+        }
+
+        Ok(())
+    }
+
     /// Get last-indexed for a (domain, branch) pair.
     pub async fn last_indexed(&self, domain: &Domain, branch: &BranchName) -> LastIndexed {
         let key = (domain.as_str().to_owned(), branch.as_str().to_owned());
@@ -646,22 +941,27 @@ impl LanceStore {
         let datasets = self.datasets.read().await;
         let indexes = self.branch_indexes.read().await;
 
+        // Layout A: each cache entry is one domain dataset. Branch count comes
+        // from the per-(domain, branch) index map, not the dataset count.
         let mut domains = std::collections::HashSet::new();
-        let mut branches = 0u64;
+        let mut distinct_branches: std::collections::HashSet<BranchKey> =
+            std::collections::HashSet::new();
         let mut indexed_commits = 0u64;
         let mut chunks = 0u64;
         let mut distinct_docs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        for (key, _ds) in datasets.iter() {
-            domains.insert(key.0.clone());
-            branches += 1;
+        for domain in datasets.keys() {
+            domains.insert(domain.clone());
         }
 
-        for (_key, bi) in indexes.iter() {
+        for (key, bi) in indexes.iter() {
+            distinct_branches.insert(key.clone());
+            domains.insert(key.0.clone());
             if bi.commit.is_some() {
                 indexed_commits += 1;
             }
         }
+        let branches = distinct_branches.len() as u64;
 
         // Count rows and distinct doc_ids from datasets (best-effort).
         for (_key, ds_arc) in datasets.iter() {
@@ -718,34 +1018,49 @@ impl LanceStore {
         commit: &str,
         query: &SearchQuery,
     ) -> Result<Vec<ChunkHit>, StoreError> {
-        let ds_arc = self.io_open_dataset(domain, branch).await?;
-        let ds = ds_arc.read().await;
+        // Layout A: Lance versions are branch-scoped, so we must resolve the tag
+        // and check out the version on a handle bound to `branch`. For main, the
+        // cached handle is the default branch; for a feature branch we open a
+        // fresh branch-bound handle. (Tag *resolution* is global, but
+        // `checkout_version(v)` interprets `v` on the handle's branch lineage.)
+        let owned_branch_ds;
+        let base: &Dataset;
+        let _guard;
+        if branch == MAIN_BRANCH {
+            let ds_arc = self.io_open_dataset(domain, branch).await?;
+            _guard = ds_arc.read_owned().await;
+            base = &_guard;
+        } else {
+            let path = self.dataset_path(domain);
+            let uri = path.to_string_lossy().to_string();
+            let opened = Dataset::open(&uri)
+                .await
+                .map_err(|e| StoreError::Internal(format!("open for search failed: {}", e)))?;
+            owned_branch_ds = opened.checkout_branch(branch).await.map_err(|e| {
+                StoreError::Internal(format!("checkout '{}' for search failed: {}", branch, e))
+            })?;
+            base = &owned_branch_ds;
+        }
 
-        // Resolve commit to version via tag.
+        // Resolve commit to version via tag (global resolution).
         let tag = layeridx::encode_commit_tag(commit);
-        let version = ds
+        let version = base
             .tags()
             .get_version(&tag)
             .await
             .map_err(|e| StoreError::Internal(format!("commit not indexed: {}", e)))?;
 
-        // Snapshot isolation: checkout the dataset at the resolved version.
-        let snapshot = ds
+        // Snapshot isolation: checkout the version on the branch-bound handle.
+        let snapshot = base
             .checkout_version(version)
             .await
             .map_err(|e| StoreError::Internal(format!("checkout version {} failed: {}", version, e)))?;
 
         // Build the search based on mode — always against the versioned snapshot.
         let hits = match query.mode {
-            SearchMode::Vector => {
-                self.vector_search(&snapshot, query).await?
-            }
-            SearchMode::Fts => {
-                self.fts_search(&snapshot, query).await?
-            }
-            SearchMode::Hybrid => {
-                self.hybrid_search(&snapshot, query).await?
-            }
+            SearchMode::Vector => self.vector_search(&snapshot, query).await?,
+            SearchMode::Fts => self.fts_search(&snapshot, query).await?,
+            SearchMode::Hybrid => self.hybrid_search(&snapshot, query).await?,
         };
 
         Ok(hits)
@@ -878,17 +1193,45 @@ impl LanceStore {
         Ok(rrf_merge(vector_hits, fts_hits))
     }
 
-    /// Look up a document's chunks by doc_id (indexed lookup for /similar).
+    /// Look up a document's chunks by doc_id at the head of `branch` (indexed
+    /// lookup for /similar).
     /// INVARIANT: uses a filter on the doc_id column (indexed), NOT a full scan.
+    /// Layout A: reads the BRANCH head (checked out), not the cached main handle —
+    /// so a lookup on a feature branch sees the branch's data, not main's.
     pub async fn io_lookup_doc_chunks(
         &self,
         domain: &str,
         branch: &str,
         doc_id: &str,
     ) -> Result<Vec<ChunkHit>, StoreError> {
-        let ds_arc = self.io_open_dataset(domain, branch).await?;
-        let ds = ds_arc.read().await;
+        // Read the branch head. For main, the cached handle is the default
+        // branch; for a feature branch, check out a branch-bound handle.
+        let path = self.dataset_path(domain);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let owned_ds;
+        let ds: &Dataset = if branch == MAIN_BRANCH {
+            let ds_arc = self.io_open_dataset(domain, branch).await?;
+            let guard = ds_arc.read().await;
+            // Read+collect under the guard, then return early — simplest correct path.
+            return Self::scan_doc_chunks(&guard, doc_id).await;
+        } else {
+            let uri = path.to_string_lossy().to_string();
+            let base = Dataset::open(&uri)
+                .await
+                .map_err(|e| StoreError::Internal(format!("lookup open failed: {}", e)))?;
+            owned_ds = base.checkout_branch(branch).await.map_err(|e| {
+                StoreError::Internal(format!("lookup checkout '{}' failed: {}", branch, e))
+            })?;
+            &owned_ds
+        };
 
+        Self::scan_doc_chunks(ds, doc_id).await
+    }
+
+    /// Scan a dataset handle for all chunks of `doc_id` (filter on indexed column).
+    async fn scan_doc_chunks(ds: &Dataset, doc_id: &str) -> Result<Vec<ChunkHit>, StoreError> {
         let filter = format!("doc_id = '{}'", doc_id.replace('\'', "''"));
         let mut scanner = ds.scan();
         scanner
@@ -1726,6 +2069,317 @@ mod tests {
             doc_ids_c1.contains(&"doc/B"),
             "c1 snapshot should contain doc/B"
         );
+    }
+
+    // --- P3-ASSIGN-1: assign is a pure tag pointer — no new version, target == source ---
+    // The store assign primitive touches only Lance tags. It creates NO new
+    // dataset version (so no fragments, so — by construction — zero embed calls),
+    // and search at the target commit returns exactly the source commit's data.
+    #[tokio::test]
+    async fn assign_is_tag_pointer_no_recompute() {
+        let (store, _tmp) = make_test_store(8);
+        let domain = "admin/assign";
+
+        // Index doc/A and doc/B, tag c0 at the final version.
+        let emb_a = fake_embedding(8, 1.0);
+        let rows_a = vec![ChunkRow {
+            doc_id: "doc/A".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: emb_a.clone(),
+            content: "alpha".to_owned(),
+        }];
+        store
+            .io_upsert_chunks(domain, "main", "doc/A", &rows_a)
+            .await
+            .expect("upsert A");
+        let rows_b = vec![ChunkRow {
+            doc_id: "doc/B".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: fake_embedding(8, 2.0),
+            content: "beta".to_owned(),
+        }];
+        let v0 = store
+            .io_upsert_chunks(domain, "main", "doc/B", &rows_b)
+            .await
+            .expect("upsert B");
+        store.io_tag_commit(domain, "main", "c0", v0).await.expect("tag c0");
+
+        // Record the dataset version BEFORE assign.
+        let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+        let version_before = ds_arc.read().await.version().version;
+
+        // Assign c0 → c2 (pure tag pointer).
+        let assigned_version = store
+            .io_assign_commit(domain, "main", "c0", "c2")
+            .await
+            .expect("assign c0→c2");
+        assert_eq!(assigned_version, v0, "c2 must point at c0's version");
+
+        // No new dataset version was created (assign moved no data → no embeds possible).
+        let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+        let version_after = ds_arc.read().await.version().version;
+        assert_eq!(
+            version_after, version_before,
+            "assign must not create a new dataset version (no recompute)"
+        );
+
+        // c2 resolves to the same version as c0.
+        let r_c0 = store.io_resolve_commit(domain, "main", "c0").await.unwrap();
+        let r_c2 = store.io_resolve_commit(domain, "main", "c2").await.unwrap();
+        assert_eq!(r_c0, Some(v0));
+        assert_eq!(r_c2, Some(v0), "c2 must resolve to c0's version");
+
+        // Search at c2 returns exactly the same docs as search at c0.
+        let query = SearchQuery {
+            query_embedding: emb_a.clone(),
+            query_text: "alpha".to_owned(),
+            mode: crate::kernel::model::SearchMode::Vector,
+            start: 0,
+            count: 10,
+            doc_type_filter: Vec::new(),
+            doc_id_filter: Vec::new(),
+            snippet: false,
+        };
+        let mut hits_c0: Vec<String> = store
+            .io_search(domain, "main", "c0", &query)
+            .await
+            .expect("search c0")
+            .into_iter()
+            .map(|h| h.doc_id)
+            .collect();
+        let mut hits_c2: Vec<String> = store
+            .io_search(domain, "main", "c2", &query)
+            .await
+            .expect("search c2")
+            .into_iter()
+            .map(|h| h.doc_id)
+            .collect();
+        hits_c0.sort();
+        hits_c2.sort();
+        assert_eq!(hits_c0, hits_c2, "search at c2 must equal search at c0");
+    }
+
+    // --- assign of an unindexed source fails loud ---
+    #[tokio::test]
+    async fn assign_unindexed_source_fails_loud() {
+        let (store, _tmp) = make_test_store(8);
+        // Create the dataset so resolve doesn't fail on a missing dataset.
+        let r = vec![ChunkRow {
+            doc_id: "doc/X".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: fake_embedding(8, 1.0),
+            content: "x".to_owned(),
+        }];
+        store.io_upsert_chunks("admin/a", "main", "doc/X", &r).await.unwrap();
+
+        let result = store
+            .io_assign_commit("admin/a", "main", "never_indexed", "target")
+            .await;
+        assert!(result.is_err(), "assigning from an unindexed source must fail loud");
+    }
+
+    // --- P3-CHG-1: Changed replaces the full chunk set — no stale chunks ---
+    // A doc indexed as a 3-chunk document, then re-pushed as a 1-chunk document,
+    // must leave EXACTLY the new chunk set (the 2 old tail chunks are gone).
+    #[tokio::test]
+    async fn changed_replaces_full_chunk_set_no_stale() {
+        let (store, _tmp) = make_test_store(8);
+        let domain = "admin/chg";
+
+        // Initial: doc/big with 3 chunks.
+        let big_v1 = vec![
+            ChunkRow {
+                doc_id: "doc/big".to_owned(),
+                doc_type: "Article".to_owned(),
+                chunk_index: 0,
+                chunk_count: 3,
+                chunk_token_start: 0,
+                doc_token_len: 1500,
+                embedding: fake_embedding(8, 1.0),
+                content: "original beginning".to_owned(),
+            },
+            ChunkRow {
+                doc_id: "doc/big".to_owned(),
+                doc_type: "Article".to_owned(),
+                chunk_index: 1,
+                chunk_count: 3,
+                chunk_token_start: 500,
+                doc_token_len: 1500,
+                embedding: fake_embedding(8, 2.0),
+                content: "original middle".to_owned(),
+            },
+            ChunkRow {
+                doc_id: "doc/big".to_owned(),
+                doc_type: "Article".to_owned(),
+                chunk_index: 2,
+                chunk_count: 3,
+                chunk_token_start: 1000,
+                doc_token_len: 1500,
+                embedding: fake_embedding(8, 3.0),
+                content: "original end".to_owned(),
+            },
+        ];
+        store
+            .io_upsert_chunks(domain, "main", "doc/big", &big_v1)
+            .await
+            .expect("upsert v1");
+        assert_eq!(
+            store.io_lookup_doc_chunks(domain, "main", "doc/big").await.unwrap().len(),
+            3,
+            "should have 3 chunks initially"
+        );
+
+        // Changed: same doc now renders to a SINGLE shorter chunk.
+        let big_v2 = vec![ChunkRow {
+            doc_id: "doc/big".to_owned(),
+            doc_type: "Article".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 40,
+            embedding: fake_embedding(8, 9.0),
+            content: "shortened content".to_owned(),
+        }];
+        store
+            .io_upsert_chunks(domain, "main", "doc/big", &big_v2)
+            .await
+            .expect("upsert v2 (Changed)");
+
+        // Exactly 1 chunk remains — the 2 stale tail chunks must be gone.
+        let after = store
+            .io_lookup_doc_chunks(domain, "main", "doc/big")
+            .await
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "Changed must replace the FULL chunk set — no stale chunks (got {})",
+            after.len()
+        );
+        assert_eq!(after[0].content, "shortened content");
+    }
+
+    // --- P3-DEL-1: Deleted removes ALL chunks for a doc_id ---
+    #[tokio::test]
+    async fn deleted_removes_all_chunks_for_doc() {
+        let (store, _tmp) = make_test_store(8);
+        let domain = "admin/del";
+
+        // Two docs, doc/keep and doc/gone (multi-chunk).
+        let keep = vec![ChunkRow {
+            doc_id: "doc/keep".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: fake_embedding(8, 1.0),
+            content: "keep me".to_owned(),
+        }];
+        let gone = vec![
+            ChunkRow {
+                doc_id: "doc/gone".to_owned(),
+                doc_type: "T".to_owned(),
+                chunk_index: 0,
+                chunk_count: 2,
+                chunk_token_start: 0,
+                doc_token_len: 200,
+                embedding: fake_embedding(8, 2.0),
+                content: "gone part 1".to_owned(),
+            },
+            ChunkRow {
+                doc_id: "doc/gone".to_owned(),
+                doc_type: "T".to_owned(),
+                chunk_index: 1,
+                chunk_count: 2,
+                chunk_token_start: 100,
+                doc_token_len: 200,
+                embedding: fake_embedding(8, 3.0),
+                content: "gone part 2".to_owned(),
+            },
+        ];
+        store.io_upsert_chunks(domain, "main", "doc/keep", &keep).await.unwrap();
+        store.io_upsert_chunks(domain, "main", "doc/gone", &gone).await.unwrap();
+
+        // Delete doc/gone.
+        store.io_delete_doc(domain, "main", "doc/gone").await.unwrap();
+
+        // doc/gone: zero chunks. doc/keep: untouched.
+        assert_eq!(
+            store.io_lookup_doc_chunks(domain, "main", "doc/gone").await.unwrap().len(),
+            0,
+            "all chunks of doc/gone must be removed"
+        );
+        assert_eq!(
+            store.io_lookup_doc_chunks(domain, "main", "doc/keep").await.unwrap().len(),
+            1,
+            "doc/keep must be untouched by deleting doc/gone"
+        );
+    }
+
+    // --- DELETE /domain: removes the dataset + purges state; idempotent ---
+    #[tokio::test]
+    async fn delete_domain_removes_footprint_and_is_idempotent() {
+        let (store, tmp) = make_test_store(8);
+        let domain = "admin/doomed";
+
+        // Index a doc on main + a branch, tag commits, record last-indexed.
+        let r = vec![ChunkRow {
+            doc_id: "doc/1".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: fake_embedding(8, 1.0),
+            content: "doomed".to_owned(),
+        }];
+        let v = store.io_upsert_chunks(domain, "main", "doc/1", &r).await.unwrap();
+        store.io_tag_commit(domain, "main", "c0", v).await.unwrap();
+        store.update_last_indexed(domain, "main", "c0", v).await;
+        store.io_create_branch(domain, "feature", v).await.unwrap();
+        store.update_last_indexed(domain, "feature", "c0", v).await;
+
+        // The dataset dir exists on disk.
+        let path = tmp.path().join("admin__doomed.lance");
+        assert!(path.exists(), "dataset dir should exist before delete");
+
+        // Delete the domain.
+        store.io_delete_domain(domain).await.expect("delete domain");
+
+        // On-disk dataset gone.
+        assert!(!path.exists(), "dataset dir must be removed");
+
+        // In-memory state purged: a fresh search at c0 must now fail (no dataset).
+        // resolve_commit opens the dataset, which no longer exists → None or error.
+        // statistics must no longer count this domain.
+        let stats = store.statistics().await;
+        assert_eq!(stats.domains, 0, "deleted domain must not be counted");
+        assert_eq!(stats.branches, 0, "deleted domain's branches must not be counted");
+
+        // Idempotent: a second delete of the same (now-gone) domain succeeds.
+        store
+            .io_delete_domain(domain)
+            .await
+            .expect("second delete must be idempotent (not an error)");
+
+        // Idempotent: deleting a never-seen domain succeeds.
+        store
+            .io_delete_domain("admin/never_existed")
+            .await
+            .expect("deleting an unknown domain must succeed (idempotent)");
     }
 
     // --- RRF merge produces correct ranking ---

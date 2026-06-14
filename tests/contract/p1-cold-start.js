@@ -65,9 +65,11 @@ describe("P1-COLD: Cold-start & readiness", function () {
         expect(res.headers).to.have.property("retry-after")
         expect(res.body).to.have.property("error")
       }
-      // 200 = search ready and commit found.
-      // 500 = search ready but commit not indexed (real store, expected).
-      expect([200, 500, 503]).to.include(res.status)
+      // 200 = search ready and commit found (or served from an ancestor).
+      // 404 = search ready but the domain/branch has no indexed lineage at all
+      //       (NoIndexedLineage — the documented contract response).
+      // 503 = search cold (no embedding backend warm).
+      expect([200, 404, 503]).to.include(res.status)
     })
   })
 

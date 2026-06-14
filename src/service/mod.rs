@@ -33,6 +33,21 @@ pub struct SearchService {
     /// readiness (search additionally requires a warm embedding backend).
     ready_index: Arc<std::sync::atomic::AtomicBool>,
     ready_search: Arc<std::sync::atomic::AtomicBool>,
+    /// Process-local per-branch state: indexing-enablement + 404 negative cache
+    /// for catch-up resolution (truth is always the layer index / Lance tags).
+    branch_state: Arc<crate::layeridx::BranchState>,
+}
+
+/// Outcome of a search that resolves through the catch-up layer (RISK-15).
+/// Carries the commit actually SERVED so the transport can report it truthfully
+/// via `TerminusDB-Data-Version` — a stale (ancestor) result is never dressed up
+/// as fresh.
+#[derive(Debug, Clone)]
+pub struct SearchOutcome {
+    pub hits: Vec<SearchHit>,
+    /// The commit whose snapshot was actually searched. Equals the requested
+    /// commit when exact; the nearest indexed ancestor under lag (⇒ stale).
+    pub served_commit: String,
 }
 
 impl std::fmt::Debug for SearchService {
@@ -70,6 +85,7 @@ impl SearchService {
             http_client: reqwest::Client::new(),
             ready_index,
             ready_search,
+            branch_state: Arc::new(crate::layeridx::BranchState::default()),
         }
     }
 
@@ -115,7 +131,7 @@ impl SearchService {
         domain_raw: &str,
         branch_raw: &str,
         target_commit: &str,
-        _parent_commit: Option<&str>,
+        parent_commit: Option<&str>,
         operations: Vec<Operation>,
     ) -> Result<String, ServiceError> {
         let rp =
@@ -124,6 +140,37 @@ impl SearchService {
         let domain_str = domain.as_str().to_owned();
         let branch = branch_raw.to_owned();
         let commit = target_commit.to_owned();
+
+        // Branch-out: if a parent commit is supplied and the target branch does
+        // not yet exist, fork it from the parent's indexed version (block reuse).
+        // A push to "main" or to an existing branch skips this (no-op). Fail loud
+        // if the parent isn't indexed (cannot fork from nothing).
+        if branch != crate::store::lance::MAIN_BRANCH {
+            if let Some(parent) = parent_commit {
+                crate::store::branch::io_ensure_branch_forked(
+                    &self.store,
+                    &domain_str,
+                    &branch,
+                    parent,
+                )
+                .await
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.contains("not indexed") || msg.contains("does not exist") {
+                        ServiceError::NotFound(msg)
+                    } else {
+                        ServiceError::Internal(msg)
+                    }
+                })?;
+            }
+        }
+
+        // An indexing request for this branch directly busts its 404 negative
+        // cache and enrolls it (Spec 10 §5: invalidate immediately on a direct
+        // index request) — so a search that 404'd before this push will resolve
+        // on its next attempt.
+        self.branch_state.invalidate_negative(&domain_str, &branch);
+        self.branch_state.enable(&domain_str, &branch);
 
         // Generate a task ID immediately.
         let task_id = format!("task-{}", uuid::Uuid::new_v4().as_simple());
@@ -223,36 +270,37 @@ impl SearchService {
         // Resolve the branch (default to "main").
         let branch = "main";
 
-        // Check if source commit is indexed.
-        let source_version = self
+        // Pure tag-pointer assign: resolve source → tag target to the same
+        // version. NO embedding, NO recompute (P3-ASSIGN-1). Fail loud if the
+        // source commit is not indexed.
+        match self
             .store
-            .io_resolve_commit(domain_str, branch, source_commit)
+            .io_assign_commit(domain_str, branch, source_commit, target_commit)
             .await
-            .map_err(|e| ServiceError::Internal(e.to_string()))?;
-
-        match source_version {
-            Some(version) => {
-                // Tag the target commit to the same version.
-                self.store
-                    .io_tag_commit(domain_str, branch, target_commit, version)
-                    .await
-                    .map_err(|e| ServiceError::Internal(e.to_string()))?;
-                Ok(())
+        {
+            Ok(_version) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("is not indexed") {
+                    Err(ServiceError::NotFound(format!(
+                        "source commit {} is not indexed",
+                        source_commit
+                    )))
+                } else {
+                    Err(ServiceError::Internal(msg))
+                }
             }
-            None => Err(ServiceError::NotFound(format!(
-                "source commit {} is not indexed",
-                source_commit
-            ))),
         }
     }
 
     /// Search: embed query → vector/fts/hybrid search → dedup → return.
+    /// Returns the `SearchOutcome` (hits + served commit for staleness reporting).
     pub async fn search(
         &self,
         domain_raw: &str,
         commit: &str,
         q: &str,
-    ) -> Result<Vec<SearchHit>, ServiceError> {
+    ) -> Result<SearchOutcome, ServiceError> {
         self.search_with_options(
             domain_raw,
             commit,
@@ -267,7 +315,17 @@ impl SearchService {
         .await
     }
 
-    /// Full search with all options.
+    /// Full search with all options. Returns a `SearchOutcome` carrying the
+    /// commit actually SERVED (exact, or the nearest indexed ancestor under lag)
+    /// so the transport reports staleness truthfully (RISK-15, P3-LAG-1).
+    ///
+    /// Catch-up resolution (never blocks, never silently stale):
+    ///  1. Exact: requested commit is indexed → serve it.
+    ///  2. Lag: not indexed → serve the branch's durable last-indexed commit (the
+    ///     nearest indexed ancestor on a linear-per-branch history) and report it
+    ///     as the served commit (⇒ caller sees served ≠ requested = stale).
+    ///  3. None: branch has no indexed ancestor → `NotFound` (404), negatively
+    ///     cached per branch (TTL) so a repeat search doesn't re-walk history.
     #[allow(clippy::too_many_arguments)]
     pub async fn search_with_options(
         &self,
@@ -280,7 +338,7 @@ impl SearchService {
         doc_type_filter: &[String],
         doc_id_filter: &[String],
         snippet: bool,
-    ) -> Result<Vec<SearchHit>, ServiceError> {
+    ) -> Result<SearchOutcome, ServiceError> {
         let rp =
             parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
 
@@ -293,6 +351,11 @@ impl SearchService {
         let domain = Domain::from_resource_path(&rp);
         let domain_str = domain.as_str().to_owned();
         let branch = extract_branch(&rp);
+
+        // Resolve the searchable commit via catch-up (exact → nearest ancestor → 404).
+        let served_commit = self
+            .resolve_searchable_commit(&domain_str, &branch, commit)
+            .await?;
 
         // Embed the query text.
         let query_texts = vec![q.to_owned()];
@@ -324,7 +387,7 @@ impl SearchService {
 
         let chunk_hits = self
             .store
-            .io_search(&domain_str, &branch, commit, &search_query)
+            .io_search(&domain_str, &branch, &served_commit, &search_query)
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
@@ -337,7 +400,74 @@ impl SearchService {
             .take(count)
             .collect();
 
-        Ok(paginated)
+        Ok(SearchOutcome {
+            hits: paginated,
+            served_commit,
+        })
+    }
+
+    /// Resolve the requested commit to the commit whose snapshot will actually
+    /// be searched (catch-up, RISK-15). Exact if indexed; else the branch's
+    /// durable last-indexed commit (nearest ancestor on linear-per-branch); else
+    /// `NotFound`, negatively cached per branch.
+    ///
+    /// Auto-enroll: any successful resolution marks the branch indexing-enabled,
+    /// so a descendant branch that resolves through an ancestor is enrolled on
+    /// first search (propagation; one explicit bootstrap per lineage).
+    async fn resolve_searchable_commit(
+        &self,
+        domain: &str,
+        branch: &str,
+        requested_commit: &str,
+    ) -> Result<String, ServiceError> {
+        // 1. Exact match: the requested commit is itself indexed.
+        let exact = self
+            .store
+            .io_resolve_commit(domain, branch, requested_commit)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+        if exact.is_some() {
+            self.branch_state.enable(domain, branch);
+            self.branch_state.invalidate_negative(domain, branch);
+            return Ok(requested_commit.to_owned());
+        }
+
+        // 2. Negative cache: a recent search already found no indexed ancestor.
+        if self.branch_state.is_negative_cached(domain, branch) {
+            return Err(ServiceError::NotFound(format!(
+                "no indexed ancestor for commit {} on branch {} (negatively cached)",
+                requested_commit, branch
+            )));
+        }
+
+        // 3. Lag: serve the branch's durable last-indexed commit (the nearest
+        //    indexed ancestor on a linear-per-branch history). TerminusDB owns
+        //    the DAG and pushes the missing delta on seeing served ≠ requested.
+        let last = self
+            .store
+            .last_indexed(
+                &Domain::from_resource_path(
+                    &parse_domain(domain).map_err(|e| ServiceError::Internal(e.to_string()))?,
+                ),
+                &BranchName::new(branch.to_owned()),
+            )
+            .await;
+
+        match last.commit {
+            Some(ancestor) => {
+                // Enroll the branch (auto-enroll on first resolved search).
+                self.branch_state.enable(domain, branch);
+                Ok(ancestor)
+            }
+            None => {
+                // 4. No indexed ancestor at all → 404, negatively cached.
+                self.branch_state.record_negative(domain, branch);
+                Err(ServiceError::NotFound(format!(
+                    "no indexed ancestor for commit {} on branch {}",
+                    requested_commit, branch
+                )))
+            }
+        }
     }
 
     /// Similar: look up doc by id → use its best embedding → vector search.
@@ -477,6 +607,31 @@ impl SearchService {
     /// Statistics.
     pub async fn statistics(&self) -> Result<Statistics, ServiceError> {
         Ok(self.store.statistics().await)
+    }
+
+    /// Delete a domain's ENTIRE footprint: the `{domain}.lance` dataset (all
+    /// branches/versions/tags) plus every in-memory trace (store caches +
+    /// per-branch enablement/negative-cache). IDEMPOTENT — an unknown/already-
+    /// gone domain succeeds (TerminusDB may retry). Fail-loud on a real I/O error.
+    ///
+    /// Order: the store removes the on-disk dataset FIRST, then purges its own
+    /// in-memory maps (fail-loud partial guard inside the store). Only after the
+    /// store succeeds do we purge the service-owned per-branch state — so we
+    /// never leave searchable per-branch state pointing at a deleted dataset.
+    pub async fn delete_domain(&self, domain_raw: &str) -> Result<(), ServiceError> {
+        let rp =
+            parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
+        let domain = Domain::from_resource_path(&rp);
+        let domain_str = domain.as_str().to_owned();
+
+        self.store
+            .io_delete_domain(&domain_str)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        self.branch_state.purge_domain(&domain_str);
+
+        Ok(())
     }
 
     /// Validate a domain string without side effects.
