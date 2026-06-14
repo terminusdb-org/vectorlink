@@ -60,6 +60,50 @@ const datasets = {
   },
 };
 
+// ── v2 reciprocal cross-NN dataset (spec 17 §4) ─────────────────────────────
+// Both catalogues are indexed into ONE snapshot in DISTINCT id namespaces
+// (.../Abt/<id> and .../Buy/<id>) so a pair's provenance is recoverable from its
+// ids alone, and so the engine's set/target scoping (doc_type IN-list) can scope
+// each cross-NN direction to the opposite catalogue. The doc_type the engine
+// derives from an IRI is its second-to-last path segment (ingest::extract_doc_type),
+// i.e. "Abt" / "Buy" here — used directly as the set/target filter value.
+datasets["abt-buy-v2"] = {
+  name: "abt-buy-v2",
+  domain: "admin/bench_abt_buy_v2", // distinct from v1's domain — no collision
+  branch: "main",
+  commit: "bench-abt-buy-v2-c1",
+  iriBase: "terminusdb:///bench/abt_buy_v2",
+  download: datasets["abt-buy"].download, // same Leipzig zip + CSVs
+  dataDir: DATA_DIR,
+  // Both populations are indexed (v1 indexed only Buy). Each side: which CSV,
+  // its id field, its v2 (price-free, brand-aligned) template, and the doc_type
+  // its IRIs resolve to (= the side label).
+  sides: {
+    abt: {
+      side: "Abt",
+      docType: "Abt",
+      file: "Abt.csv",
+      encoding: DEFAULT_ENCODING,
+      idField: "id",
+      template: path.join(TEMPLATES_DIR, "abt.v2.hbs"),
+    },
+    buy: {
+      side: "Buy",
+      docType: "Buy",
+      file: "Buy.csv",
+      encoding: DEFAULT_ENCODING,
+      idField: "id",
+      template: path.join(TEMPLATES_DIR, "buy.v2.hbs"),
+    },
+  },
+  mapping: {
+    file: "abt_buy_perfectMapping.csv",
+    encoding: DEFAULT_ENCODING,
+    queryIdColumn: "idAbt",
+    corpusIdColumn: "idBuy",
+  },
+};
+
 function getDataset(key) {
   const ds = datasets[key];
   if (!ds) {

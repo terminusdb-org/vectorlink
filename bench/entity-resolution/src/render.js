@@ -8,6 +8,12 @@
 
 const fs = require("fs");
 const Handlebars = require("handlebars");
+const { sentenceCase } = require("./text");
+
+// Register the v2 brand-alignment helper (refinement E). Idempotent — registering
+// the same name twice just overwrites with the same function. Pure helper: it
+// performs no I/O, only string normalisation (see src/text.js).
+Handlebars.registerHelper("sentenceCase", (value) => sentenceCase(value));
 
 // The raw Leipzig price fields carry a leading "$" and trailing ".00"
 // (e.g. "$399.00"). The spec templates render `${{price}}` and the spec's

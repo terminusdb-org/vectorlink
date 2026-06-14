@@ -8,7 +8,12 @@
     "fetch:abt-buy": "node src/fetch.js abt-buy",
     "load:abt-buy": "node src/load.js abt-buy",
     "verify:abt-buy": "node src/verify.js abt-buy",
-    "bench:abt-buy": "node src/bench.js abt-buy"
+    "bench:abt-buy": "node src/bench.js abt-buy",
+    "bench:v2": "node src/bench-v2.js abt-buy-v2",
+    "bench:v2:search": "node src/bench-v2.js --mode search abt-buy-v2",
+    "bench:v2:duplicates": "node src/bench-v2.js --mode duplicates abt-buy-v2",
+    "bench:v2:similar": "node src/bench-v2.js --mode similar abt-buy-v2",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "handlebars": "^4.7.7"

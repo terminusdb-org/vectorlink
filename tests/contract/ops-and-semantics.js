@@ -334,7 +334,20 @@ describe("Search semantics — /similar, /duplicates, empty-query, multilingual"
   })
 
   describe("/duplicates", function () {
-    it("returns 200 + an array for an indexed commit (current contract)", async function () {
+    // Response shape (CHANGED): array of { group: [{id, snippet?}, ...], distance }.
+    const SABER1 = "terminusdb:///ss/Topic/saber1"
+    const SABER2 = "terminusdb:///ss/Topic/saber2"
+    const COOKING = "terminusdb:///ss/Topic/cooking"
+
+    // A group's member ids (order-independent set membership helper).
+    const groupIds = g => g.group.map(m => m.id)
+    const containsGroup = (groups, a, b) =>
+      groups.some(g => {
+        const ids = groupIds(g)
+        return ids.includes(a) && ids.includes(b)
+      })
+
+    it("returns 200 + an array of groups for an indexed commit", async function () {
       const res = await agent()
         .get("/duplicates")
         .query({ domain: DOMAIN, commit: "ss_c0" })
@@ -348,32 +361,144 @@ describe("Search semantics — /similar, /duplicates, empty-query, multilingual"
         .get("/duplicates")
         .query({ domain: "admin/dup_noindex", commit: "never_indexed" })
         .set("Authorization", authHeader())
-      // Not-indexed → the engine declines rather than scanning. The running
-      // contract returns 503 for a not-indexed commit (matches p1-contract.js);
-      // 404 (no indexed lineage) and 501 (bounded duplicates unavailable) are the
-      // other documented non-2xx outcomes. Assert "declined, not a scan", not one code.
-      expect([404, 501, 503]).to.include(res.status)
+      // Not-indexed → the engine declines rather than scanning. Resolution uses the
+      // same catch-up path as /search and /similar, so 404 (no indexed lineage) or
+      // 503 (search backend cold) are the documented non-2xx outcomes.
+      expect([404, 503]).to.include(res.status)
     })
 
-    // DEFERRED — PRODUCT GAP, not a test gap: `/duplicates` is currently a stub
-    // (src/service/mod.rs `duplicates()` always returns an empty array for an
-    // indexed commit; only the not-indexed path is non-trivial, returning 501).
-    // The OpenAPI advertises near-duplicate [id1,id2] pairs, but no near-duplicate
-    // detection is implemented yet ("full duplicate detection is a future
-    // feature"). A FUNCTIONAL relevance test (near-identical docs are actually
-    // surfaced) cannot pass until the feature is built — that is a product task,
-    // not test work. This skipped test marks the gap so it is tracked, not hidden.
-    it.skip("DEFERRED: surfaces genuinely near-identical docs as a pair (needs /duplicates implementation)", async function () {
-      // When implemented: two near-identical docs at a low threshold should be
-      // returned as a [id1, id2] pair (lower id first).
+    it("surfaces genuinely near-identical docs as a group (the rich shape)", async function () {
       const res = await agent()
         .get("/duplicates")
         .query({ domain: DOMAIN, commit: "ss_c0", threshold: 0.2 })
         .set("Authorization", authHeader())
         .expect(200)
-      const flat = res.body.flat()
-      expect(flat).to.include("terminusdb:///ss/Topic/saber1")
-      expect(flat).to.include("terminusdb:///ss/Topic/saber2")
+      expect(res.body).to.be.an("array")
+      // The two Soresu docs are returned together in one group.
+      expect(containsGroup(res.body, SABER1, SABER2),
+        `expected a group with [${SABER1}, ${SABER2}] in ${JSON.stringify(res.body)}`).to.equal(true)
+      // Rich shape: every entry has a symmetric `group` array (lower id first) and
+      // a numeric [0,1] distance. No bare [id1,id2] tuples.
+      for (const g of res.body) {
+        expect(g).to.have.property("group").that.is.an("array")
+        expect(g.group.length).to.be.at.least(2)
+        expect(g).to.have.property("distance").that.is.a("number")
+        expect(g.distance).to.be.within(0, 1)
+        for (const m of g.group) {
+          expect(m).to.have.property("id").that.is.a("string")
+          // snippet omitted by default (snippet=false)
+          expect(m).to.not.have.property("snippet")
+        }
+        expect(g.group[0].id <= g.group[1].id,
+          `group not lower-id-first: ${JSON.stringify(g.group)}`).to.equal(true)
+      }
+      // The unrelated cooking doc is not grouped with either Soresu doc.
+      expect(containsGroup(res.body, COOKING, SABER1), "cooking must not group with saber1").to.equal(false)
+      expect(containsGroup(res.body, COOKING, SABER2), "cooking must not group with saber2").to.equal(false)
     })
+
+    it("tightening the threshold yields fewer or no groups", async function () {
+      const loose = await agent()
+        .get("/duplicates")
+        .query({ domain: DOMAIN, commit: "ss_c0", threshold: 0.2 })
+        .set("Authorization", authHeader())
+        .expect(200)
+      const tight = await agent()
+        .get("/duplicates")
+        .query({ domain: DOMAIN, commit: "ss_c0", threshold: 0.0 })
+        .set("Authorization", authHeader())
+        .expect(200)
+      expect(loose.body).to.be.an("array")
+      expect(tight.body).to.be.an("array")
+      // A near-zero threshold can only return a subset of the permissive run.
+      expect(tight.body.length).to.be.at.most(loose.body.length)
+      // The genuine near-duplicate is present at the permissive threshold.
+      expect(containsGroup(loose.body, SABER1, SABER2)).to.equal(true)
+    })
+
+    it("snippet=true populates group[].snippet for each member", async function () {
+      const res = await agent()
+        .get("/duplicates")
+        .query({ domain: DOMAIN, commit: "ss_c0", threshold: 0.2, snippet: true })
+        .set("Authorization", authHeader())
+        .expect(200)
+      expect(res.body).to.be.an("array")
+      expect(res.body.length).to.be.at.least(1)
+      for (const g of res.body) {
+        for (const m of g.group) {
+          expect(m).to.have.property("snippet").that.is.a("string")
+          expect(m.snippet.length).to.be.at.least(1)
+        }
+      }
+    })
+  })
+})
+
+// REAL-DATA SCALE: a corpus of MANY MULTI-CHUNK documents with planted
+// near-duplicate pairs must surface as NON-EMPTY groups — the gap that hid the
+// "[] at scale" bug (the old 3-doc single-chunk fixture could not exhibit the
+// k=2 starvation). Reproduces the canonical "is it broken" check end-to-end.
+describe("Duplicates at scale — multi-chunk corpus must NOT return [] (e2e)", function () {
+  this.timeout(300000)
+
+  const D = "admin/dup_scale"
+  const NUM_FAMILIES = 40 // 40 families × 3 docs = 120 docs
+  const DOCS_PER_FAMILY = 3
+  const CHUNKS = 4 // multi-chunk: the condition that starved k=2
+
+  // Build a doc as a long body of several near-identical paragraphs (forces
+  // multi-chunk indexing). Same `theme` text across a family → planted
+  // near-duplicate docs. doc_type is derived from the IRI path segment ("Item").
+  const docOps = (id, theme) => ({
+    op: "Inserted",
+    id,
+    string: Array.from({ length: CHUNKS }, (_, c) =>
+      `${theme}. Section ${c}: ${theme} ${theme} ${theme} described in detail with extra words ${c}.`,
+    ).join("\n\n"),
+  })
+
+  before(async function () {
+    const ops = []
+    for (let f = 0; f < NUM_FAMILIES; f++) {
+      const theme = `Topic family ${f} unique subject matter alpha${f} beta${f} gamma${f}`
+      for (let d = 0; d < DOCS_PER_FAMILY; d++) {
+        ops.push(docOps(`terminusdb:///dup/Item/f${f}_d${d}`, theme))
+      }
+    }
+    await pushAndWait(D, "main", "dup_c0", ops)
+  })
+
+  after(async function () {
+    await agent().delete("/domain").query({ domain: D }).set("Authorization", authHeader())
+  })
+
+  it("returns NON-EMPTY groups at threshold=1.0 on a multi-chunk corpus", async function () {
+    const res = await agent()
+      .get("/duplicates")
+      .query({ domain: D, commit: "dup_c0", threshold: 1.0, count: 500 })
+      .set("Authorization", authHeader())
+      .expect(200)
+    expect(res.body).to.be.an("array")
+    expect(res.body.length,
+      `duplicates returned [] on a ${NUM_FAMILIES * DOCS_PER_FAMILY}-doc multi-chunk corpus ` +
+      "— the [] -at-scale bug has regressed").to.be.at.least(1)
+  })
+
+  it("surfaces planted intra-family near-duplicates as groups", async function () {
+    const res = await agent()
+      .get("/duplicates")
+      .query({ domain: D, commit: "dup_c0", threshold: 0.5, count: 500 })
+      .set("Authorization", authHeader())
+      .expect(200)
+    const groups = res.body
+    // At least one planted family's documents are grouped together.
+    const memberSets = groups.map(g => new Set(g.group.map(m => m.id)))
+    const planted = (a, b) => memberSets.some(s => s.has(a) && s.has(b))
+    const f0d0 = "terminusdb:///dup/Item/f0_d0"
+    const f0d1 = "terminusdb:///dup/Item/f0_d1"
+    const f0d2 = "terminusdb:///dup/Item/f0_d2"
+    expect(planted(f0d0, f0d1) || planted(f0d0, f0d2) || planted(f0d1, f0d2),
+      `expected a planted family-0 near-duplicate group in ${JSON.stringify(groups).slice(0, 500)}`)
+      .to.equal(true)
   })
 })

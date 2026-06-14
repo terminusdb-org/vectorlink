@@ -118,6 +118,60 @@ async function ioSearch({ domain, commit, q, mode, count, start }, { maxRetries 
   }
 }
 
+// Per-record anchored similarity over a STORED vector (the `similar` mode).
+// Scopes the candidate pool to a target population via doc_type (e.g. "Buy").
+// Returns ranked [{ id, distance }] nearest-first.
+// NOTE: the engine currently RE-EMBEDS the anchor's source text rather than
+// reusing its stored vector (service/mod.rs) — so this mode is correct but its
+// headline speed-up is pending the engine fix. Wired now, run deferred.
+async function ioSimilar({ domain, commit, id, count, docTypes = [] }, { maxRetries = 5 } = {}) {
+  const body = JSON.stringify({
+    domain,
+    commit,
+    id,
+    ...(count !== undefined ? { count } : {}),
+    ...(docTypes.length > 0 ? { doc_type: docTypes } : {}),
+  });
+  let attempt = 0;
+  // @allowloop: bounded retry of the same transient FD-pressure 500 as /search.
+  for (;;) {
+    try {
+      const { text } = await ioRequest("POST", "/similar", {
+        body,
+        contentType: "application/json",
+        accept: "application/json",
+      });
+      return JSON.parse(text);
+    } catch (e) {
+      // WHY/INVARIANT/CONSEQUENCE: identical to ioSearch's transient-FD retry —
+      // only the Lance "too many open files" 500 is retried, bounded by
+      // maxRetries; any other error or exhaustion re-throws unchanged (fail loud).
+      if (!isTransientFdPressure(e.message) || attempt >= maxRetries) throw e;
+      attempt += 1;
+      await sleep(500 * attempt);
+    }
+  }
+}
+
+// Bulk cross-set near-duplicates over STORED vectors (the `duplicates` mode).
+// set = one catalogue (doc_type), target = the other. Returns the engine's group
+// shape [{ group: [{id}, ...], distance }]. ONE nearest neighbour per set point
+// (the endpoint takes the single nearest of an over-fetched k=8), so this is a
+// TOP-1-per-direction cross-NN — not top-K (see README v2 "mode caveats").
+async function ioDuplicates({ domain, commit, threshold, setDocTypes = [], targetDocTypes = [], count }) {
+  const params = new URLSearchParams();
+  params.set("domain", domain);
+  params.set("commit", commit);
+  if (threshold !== undefined) params.set("threshold", String(threshold));
+  if (count !== undefined) params.set("count", String(count));
+  for (const t of setDocTypes) params.append("doc_type", t);
+  for (const t of targetDocTypes) params.append("target_doc_type", t);
+  const { text } = await ioRequest("GET", `/duplicates?${params.toString()}`, {
+    accept: "application/json",
+  });
+  return JSON.parse(text);
+}
+
 async function ioStatistics() {
   const { text } = await ioRequest("GET", "/statistics");
   return JSON.parse(text);
@@ -136,5 +190,7 @@ module.exports = {
   ioCheck,
   ioWaitTaskComplete,
   ioSearch,
+  ioSimilar,
+  ioDuplicates,
   ioStatistics,
 };
