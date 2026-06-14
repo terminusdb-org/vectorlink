@@ -132,7 +132,13 @@ fi
 echo "  engine live at http://localhost:$HOST_PORT"
 
 echo "→ running mocha integration suite against http://localhost:$HOST_PORT"
+# TDB_SEARCH_ITEST_CONTAINER lets the restart-invariant test (P3-LAG-4) genuinely
+# `docker restart` this engine to prove durable index state survives a restart.
+# `docker restart` preserves the container's writable layer (where
+# TDB_SEARCH_DATA_DIR=/tmp/tdb-search-itest-data lives), so the Lance tags persist
+# across the restart while the in-memory state is reset — the exact restart effect.
 TDB_SEARCH_URL="http://localhost:$HOST_PORT" \
   TDB_SEARCH_ADMIN_USER=admin \
   TDB_SEARCH_ADMIN_SECRET=root \
+  TDB_SEARCH_ITEST_CONTAINER="$CONTAINER" \
   npx mocha --timeout 60000

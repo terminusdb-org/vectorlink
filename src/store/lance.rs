@@ -1067,6 +1067,9 @@ impl LanceStore {
             // see this tag. Tag listing reads disk live, but refreshing makes the
             // contract explicit and robust against any future handle-level caching.
             self.io_refresh_cached_dataset(domain, branch).await?;
+            // CACHE COHERENCE (task-durable-index-state): keep the in-memory
+            // last-indexed cache from EVER lagging the durable tag we just wrote.
+            self.cache_last_indexed(domain, branch, commit, version).await;
             return Ok(());
         }
 
@@ -1087,7 +1090,28 @@ impl LanceStore {
         // cached (default-branch) handle must be refreshed to guarantee this
         // branch-scoped tag is visible to subsequent cached-handle reads.
         self.io_refresh_cached_dataset(domain, branch).await?;
+        // CACHE COHERENCE (task-durable-index-state): the just-written tag is the
+        // newest indexed commit on this branch — update the cache so it never
+        // lags the durable truth (the resume base after any restart).
+        self.cache_last_indexed(domain, branch, commit, version).await;
         Ok(())
+    }
+
+    /// Update the in-memory `branch_indexes` last-indexed CACHE to reflect a
+    /// just-tagged commit. The durable authority is always the Lance tag (read
+    /// by `io_derive_last_indexed`); this keeps the accelerator coherent so a
+    /// cache HIT can never report a commit OLDER than the latest durable tag.
+    /// Called from every path that writes a commit tag.
+    async fn cache_last_indexed(&self, domain: &str, branch: &str, commit: &str, version: u64) {
+        let key = (domain.to_owned(), branch.to_owned());
+        let mut indexes = self.branch_indexes.write().await;
+        indexes.insert(
+            key,
+            BranchIndex {
+                commit: Some(commit.to_owned()),
+                version,
+            },
+        );
     }
 
     /// Assign `target_commit` to point at `source_commit`'s already-indexed
@@ -1299,6 +1323,68 @@ impl LanceStore {
         Ok(out)
     }
 
+    /// DURABLE per-branch last-indexed, derived ENTIRELY from the on-disk Lance
+    /// tags (task-durable-index-state). This is the authority that survives a
+    /// process restart — the in-memory `branch_indexes` map is only a cache that
+    /// is rebuilt from this on a miss.
+    ///
+    /// HOW IT WORKS: every indexed commit is a dataset-global Lance tag, and
+    /// Lance records the branch it was created on in `TagContents.branch`
+    /// (`None` == the default/main branch; `Some(b)` for a non-main branch — see
+    /// Lance `standardize_branch`). We therefore filter the tag set to the tags
+    /// belonging to `branch` and pick the most-recently-created one. "Last
+    /// indexed" is ordered by `created_at` (the durable wall-clock the tag was
+    /// written), with the Lance `version` as a deterministic tie-break for the
+    /// rare same-instant case. The version returned is the tagged dataset
+    /// version, identical to what `update_last_indexed` would have cached.
+    ///
+    /// INVARIANT (the restart fix): a branch with an on-disk tag NEVER resolves
+    /// to `None` here just because the process was restarted — the answer comes
+    /// from disk, not from a volatile map. A branch with no matching tag (never
+    /// indexed) correctly resolves to `None`.
+    ///
+    /// READ-ONLY: an absent dataset → `None` (never auto-creates — resurrection
+    /// guard). FAIL-LOUD: a real `tags().list()` I/O error propagates.
+    async fn io_derive_last_indexed(
+        &self,
+        domain: &str,
+        branch: &str,
+    ) -> Result<Option<(String, u64)>, StoreError> {
+        let cached = match self.io_open_dataset_readonly(domain).await? {
+            Some(ds) => ds,
+            None => return Ok(None),
+        };
+        let ds = cached.read().await;
+        let tags = ds
+            .tags()
+            .list()
+            .await
+            .map_err(|e| StoreError::Internal(format!("tag list failed: {}", e)))?;
+        drop(ds);
+
+        // A tag belongs to `branch` iff its recorded branch matches Lance's
+        // canonical form: `None` for main, `Some(branch)` otherwise.
+        let want_branch: Option<&str> = if branch == MAIN_BRANCH { None } else { Some(branch) };
+
+        let best = tags
+            .into_iter()
+            .filter_map(|(tag_name, contents)| {
+                layeridx::decode_commit_tag(&tag_name)
+                    .ok()
+                    .map(|commit| (commit, contents))
+            })
+            .filter(|(_, contents)| contents.branch.as_deref() == want_branch)
+            .max_by(|(_, a), (_, b)| {
+                // Latest wins: order by creation time, then version as a stable
+                // tie-break. `created_at` is the durable ordering signal.
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then(a.version.cmp(&b.version))
+            });
+
+        Ok(best.map(|(commit, contents)| (commit, contents.version)))
+    }
+
     /// Delete a domain's ENTIRE store footprint (layout A): drop the single
     /// `{domain}.lance` dataset (all branches/versions/tags) AND purge the
     /// domain's in-memory state (dataset cache entry, every `(domain, *)` entry
@@ -1359,24 +1445,73 @@ impl LanceStore {
     }
 
     /// Get last-indexed for a (domain, branch) pair.
-    pub async fn last_indexed(&self, domain: &Domain, branch: &BranchName) -> LastIndexed {
+    ///
+    /// DURABLE-FIRST (task-durable-index-state): the authority is the on-disk
+    /// Lance tags, NOT the in-memory `branch_indexes` map. The map is only a
+    /// cache. On a cache HIT we serve it (the fast path for a freshly-pushed
+    /// branch in this process). On a cache MISS — which is exactly the state
+    /// after a restart, when the map is empty but the tags are on disk — we
+    /// derive the answer from disk and populate the cache so the next read is
+    /// fast. This is the fix for "a restart makes an indexed branch look
+    /// un-indexed": the answer can never be a spurious `None` for a branch whose
+    /// index is on disk.
+    ///
+    /// FAIL-LOUD: a real tag-list I/O error during derivation propagates as the
+    /// durable-derivation error rather than being silently downgraded to `None`
+    /// — a corrupt/unreadable store must not masquerade as "never indexed".
+    pub async fn last_indexed(
+        &self,
+        domain: &Domain,
+        branch: &BranchName,
+    ) -> Result<LastIndexed, StoreError> {
         let key = (domain.as_str().to_owned(), branch.as_str().to_owned());
-        let indexes = self.branch_indexes.read().await;
-        match indexes.get(&key) {
-            Some(bi) => LastIndexed {
-                branch: branch.as_str().to_owned(),
-                commit: bi.commit.clone(),
-                version: bi.version,
-            },
-            None => LastIndexed {
+
+        // Fast path: cache hit.
+        {
+            let indexes = self.branch_indexes.read().await;
+            if let Some(bi) = indexes.get(&key) {
+                return Ok(LastIndexed {
+                    branch: branch.as_str().to_owned(),
+                    commit: bi.commit.clone(),
+                    version: bi.version,
+                });
+            }
+        }
+
+        // Cache miss (cold process / post-restart): derive from durable disk.
+        match self.io_derive_last_indexed(domain.as_str(), branch.as_str()).await? {
+            Some((commit, version)) => {
+                // Populate the cache so subsequent reads are O(1). A concurrent
+                // writer's entry (if any) is authoritative — it reflects a more
+                // recent push — so only insert when still absent.
+                {
+                    let mut indexes = self.branch_indexes.write().await;
+                    indexes.entry(key).or_insert(BranchIndex {
+                        commit: Some(commit.clone()),
+                        version,
+                    });
+                }
+                Ok(LastIndexed {
+                    branch: branch.as_str().to_owned(),
+                    commit: Some(commit),
+                    version,
+                })
+            }
+            None => Ok(LastIndexed {
                 branch: branch.as_str().to_owned(),
                 commit: None,
                 version: 0,
-            },
+            }),
         }
     }
 
     /// Update last-indexed tracking.
+    ///
+    /// NOTE (task-durable-index-state): this refreshes the in-memory cache only.
+    /// `io_tag_commit` ALREADY refreshes the same cache entry as part of writing
+    /// the durable tag, so calling this after a tag is now redundant-but-harmless
+    /// (it writes the identical value). The durable authority is the Lance tag,
+    /// read by `io_derive_last_indexed`; this cache is only an accelerator.
     pub async fn update_last_indexed(
         &self,
         domain: &str,
@@ -1384,15 +1519,7 @@ impl LanceStore {
         commit: &str,
         version: u64,
     ) {
-        let key = (domain.to_owned(), branch.to_owned());
-        let mut indexes = self.branch_indexes.write().await;
-        indexes.insert(
-            key,
-            BranchIndex {
-                commit: Some(commit.to_owned()),
-                version,
-            },
-        );
+        self.cache_last_indexed(domain, branch, commit, version).await;
     }
 
     /// Record a task status.
@@ -3083,6 +3210,372 @@ mod tests {
         assert_eq!(r0, Some(v1));
         assert_eq!(r1, Some(v2));
         assert_ne!(v1, v2, "versions must differ");
+    }
+
+    // ─────────────── DURABLE STATE / RESTART INVARIANT (task-durable-index) ───
+    // The headline regression: index state must be derived from the on-disk
+    // Lance tags, NOT the in-memory `branch_indexes` map. A fresh `LanceStore`
+    // over the SAME directory (the exact effect of a container restart — empty
+    // in-memory maps, full on-disk data) must report the same last-indexed.
+
+    /// Helper: open a SECOND store over the same dir — simulates a restart with
+    /// cold in-memory state but warm disk.
+    fn reopen_store(tmp: &tempfile::TempDir, dim: usize) -> LanceStore {
+        LanceStore::new(tmp.path(), dim)
+    }
+
+    /// Helper: build a validated `Domain` from a "org/db" string (test-only).
+    fn dom(s: &str) -> Domain {
+        Domain::from_resource_path(
+            &crate::kernel::model::parse_domain(s).expect("valid test domain"),
+        )
+    }
+
+    /// Helper: build a `BranchName` (test-only).
+    fn br(s: &str) -> BranchName {
+        BranchName::new(s.to_owned())
+    }
+
+    // --- RESTART INVARIANT: last_indexed survives a restart (derived from tags) ---
+    #[tokio::test]
+    async fn last_indexed_survives_restart_derived_from_disk() {
+        let (store, tmp) = make_test_store(8);
+        let domain = "admin/restart";
+
+        let r = one_row(8, 1.0, "restart doc");
+        let v = store
+            .io_upsert_chunks(domain, "main", "doc/1", std::slice::from_ref(&r))
+            .await
+            .expect("upsert");
+        store
+            .io_tag_commit(domain, "main", "c0", v)
+            .await
+            .expect("tag c0");
+        store.update_last_indexed(domain, "main", "c0", v).await;
+
+        // Sanity: the live store reports c0.
+        let before = store
+            .last_indexed(&dom(domain), &br("main"))
+            .await
+            .expect("last_indexed read");
+        assert_eq!(before.commit.as_deref(), Some("c0"));
+
+        // RESTART: drop the in-memory state, re-open over the same dir.
+        drop(store);
+        let restarted = reopen_store(&tmp, 8);
+
+        // The in-memory branch_indexes is EMPTY now — but the answer must STILL
+        // be c0, derived from the durable on-disk tag.
+        let after = restarted
+            .last_indexed(&dom(domain), &br("main"))
+            .await
+            .expect("last_indexed read");
+        assert_eq!(
+            after.commit.as_deref(),
+            Some("c0"),
+            "after restart, last_indexed MUST be derived from the on-disk tag, not the empty in-memory map"
+        );
+        assert_eq!(after.version, v, "the derived version must match the tag");
+    }
+
+    // --- RESTART INVARIANT: resolve sees the commit on disk after restart ---
+    #[tokio::test]
+    async fn resolve_commit_survives_restart() {
+        let (store, tmp) = make_test_store(8);
+        let domain = "admin/restart_resolve";
+
+        let r = one_row(8, 1.0, "doc");
+        let v = store
+            .io_upsert_chunks(domain, "main", "doc/1", std::slice::from_ref(&r))
+            .await
+            .expect("upsert");
+        store.io_tag_commit(domain, "main", "c0", v).await.expect("tag");
+
+        drop(store);
+        let restarted = reopen_store(&tmp, 8);
+
+        let resolved = restarted
+            .io_resolve_commit(domain, "main", "c0")
+            .await
+            .expect("resolve after restart");
+        assert_eq!(
+            resolved,
+            Some(v),
+            "a commit tagged on disk must resolve after a restart"
+        );
+    }
+
+    // --- last_indexed is BRANCH-PRECISE and derived from disk after restart ---
+    #[tokio::test]
+    async fn last_indexed_branch_precise_after_restart() {
+        let (store, tmp) = make_test_store(8);
+        let domain = "admin/restart_branch";
+
+        // main: index + tag c0.
+        let r0 = one_row(8, 1.0, "main doc");
+        let v0 = store
+            .io_upsert_chunks(domain, "main", "doc/1", std::slice::from_ref(&r0))
+            .await
+            .expect("upsert main");
+        store.io_tag_commit(domain, "main", "c0", v0).await.expect("tag c0");
+        store.update_last_indexed(domain, "main", "c0", v0).await;
+
+        // feature branch forked from c0, index + tag c1 on the feature lineage.
+        store.io_create_branch(domain, "feature", v0).await.expect("create branch");
+        let r1 = one_row(8, 2.0, "feature doc");
+        let v1 = store
+            .io_upsert_chunks(domain, "feature", "doc/2", std::slice::from_ref(&r1))
+            .await
+            .expect("upsert feature");
+        store.io_tag_commit(domain, "feature", "c1", v1).await.expect("tag c1");
+        store.update_last_indexed(domain, "feature", "c1", v1).await;
+
+        drop(store);
+        let restarted = reopen_store(&tmp, 8);
+
+        let d = dom(domain);
+        let main_li = restarted.last_indexed(&d, &br("main")).await.expect("li main");
+        let feat_li = restarted.last_indexed(&d, &br("feature")).await.expect("li feature");
+
+        assert_eq!(
+            main_li.commit.as_deref(),
+            Some("c0"),
+            "main's last-indexed must be c0 after restart (branch-precise, from disk)"
+        );
+        assert_eq!(
+            feat_li.commit.as_deref(),
+            Some("c1"),
+            "feature's last-indexed must be c1 after restart (its own lineage tag)"
+        );
+    }
+
+    // --- last_indexed picks the LATEST tag on the branch (forward progress) ---
+    #[tokio::test]
+    async fn last_indexed_picks_latest_commit_on_branch_after_restart() {
+        let (store, tmp) = make_test_store(8);
+        let domain = "admin/restart_latest";
+
+        let r0 = one_row(8, 1.0, "v0");
+        let v0 = store
+            .io_upsert_chunks(domain, "main", "doc/1", std::slice::from_ref(&r0))
+            .await
+            .expect("upsert v0");
+        store.io_tag_commit(domain, "main", "c0", v0).await.expect("tag c0");
+
+        let r1 = one_row(8, 2.0, "v1");
+        let v1 = store
+            .io_upsert_chunks(domain, "main", "doc/2", std::slice::from_ref(&r1))
+            .await
+            .expect("upsert v1");
+        store.io_tag_commit(domain, "main", "c1", v1).await.expect("tag c1");
+
+        drop(store);
+        let restarted = reopen_store(&tmp, 8);
+
+        let li = restarted
+            .last_indexed(&dom(domain), &br("main"))
+            .await
+            .expect("last_indexed read");
+        assert_eq!(
+            li.commit.as_deref(),
+            Some("c1"),
+            "after restart, last-indexed must be the LATEST tagged commit (c1), not c0"
+        );
+        assert_eq!(li.version, v1);
+    }
+
+    // --- an un-indexed branch (no tags) reports None after restart (not a panic) ---
+    #[tokio::test]
+    async fn last_indexed_none_for_unindexed_domain_after_restart() {
+        let (store, tmp) = make_test_store(8);
+        let domain = "admin/restart_empty";
+        // Index main so the dataset exists, but query a DIFFERENT branch with no tags.
+        let r = one_row(8, 1.0, "doc");
+        let v = store
+            .io_upsert_chunks(domain, "main", "doc/1", std::slice::from_ref(&r))
+            .await
+            .expect("upsert");
+        store.io_tag_commit(domain, "main", "c0", v).await.expect("tag");
+
+        drop(store);
+        let restarted = reopen_store(&tmp, 8);
+
+        // A branch that was never tagged → None (derived from disk: no matching tag).
+        let li = restarted
+            .last_indexed(&dom(domain), &br("never_indexed"))
+            .await
+            .expect("li read");
+        assert_eq!(li.commit, None, "a branch with no tag must report None, not a spurious commit");
+
+        // A domain with no dataset at all → None.
+        let li_absent = restarted
+            .last_indexed(&dom("admin/never"), &br("main"))
+            .await
+            .expect("li read");
+        assert_eq!(li_absent.commit, None);
+    }
+
+    // --- RESUME FORWARD after restart: index c0,c1 → restart → index c2 ─ c2
+    //     must ADD to the existing on-disk index (c0,c1 still there), NOT rebuild
+    //     from scratch, and last-indexed must walk forward to c2. (Requirement #2:
+    //     re-index after a mid-way reset resumes forward from the last durable.) ---
+    #[tokio::test]
+    async fn reindex_after_restart_resumes_forward_not_from_scratch() {
+        let (store, tmp) = make_test_store(8);
+        let domain = "admin/resume";
+
+        // c0: one doc.
+        let r0 = ChunkRow {
+            doc_id: "doc/0".to_owned(),
+            doc_type: "Doc".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: fake_embedding(8, 1.0),
+            content: "zero".to_owned(),
+        };
+        let v0 = store
+            .io_upsert_chunks(domain, "main", "doc/0", std::slice::from_ref(&r0))
+            .await
+            .expect("upsert c0");
+        store.io_tag_commit(domain, "main", "c0", v0).await.expect("tag c0");
+
+        // c1: a SECOND doc (append).
+        let r1 = ChunkRow {
+            doc_id: "doc/1".to_owned(),
+            doc_type: "Doc".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: fake_embedding(8, 2.0),
+            content: "one".to_owned(),
+        };
+        let v1 = store
+            .io_upsert_chunks(domain, "main", "doc/1", std::slice::from_ref(&r1))
+            .await
+            .expect("upsert c1");
+        store.io_tag_commit(domain, "main", "c1", v1).await.expect("tag c1");
+
+        let chunks_before = store.statistics().await.chunks;
+        assert_eq!(chunks_before, 2, "two docs indexed before restart");
+
+        // RESTART: cold in-memory state, warm disk.
+        drop(store);
+        let restarted = reopen_store(&tmp, 8);
+
+        // The durable resume point: last-indexed is c1 (NOT lost, NOT reset to c0).
+        let resume = restarted
+            .last_indexed(&dom(domain), &br("main"))
+            .await
+            .expect("li after restart");
+        assert_eq!(
+            resume.commit.as_deref(),
+            Some("c1"),
+            "resume must start FORWARD from the last durably-indexed commit c1"
+        );
+
+        // c2: a THIRD doc indexed AFTER restart — appended to the existing index.
+        let r2 = ChunkRow {
+            doc_id: "doc/2".to_owned(),
+            doc_type: "Doc".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: fake_embedding(8, 3.0),
+            content: "two".to_owned(),
+        };
+        let v2 = restarted
+            .io_upsert_chunks(domain, "main", "doc/2", std::slice::from_ref(&r2))
+            .await
+            .expect("upsert c2 after restart");
+        restarted.io_tag_commit(domain, "main", "c2", v2).await.expect("tag c2");
+
+        // NOT from scratch: all three docs present (c0+c1 survived the restart,
+        // c2 was ADDED). A from-scratch rebuild would have dropped doc/0, doc/1.
+        let chunks_after = restarted.statistics().await.chunks;
+        assert_eq!(
+            chunks_after, 3,
+            "c2 must ADD to the existing on-disk index (3 docs), not rebuild from scratch (would be 1)"
+        );
+
+        // All three commits resolvable; c2 is the new forward tip.
+        assert_eq!(restarted.io_resolve_commit(domain, "main", "c0").await.unwrap(), Some(v0));
+        assert_eq!(restarted.io_resolve_commit(domain, "main", "c1").await.unwrap(), Some(v1));
+        assert_eq!(restarted.io_resolve_commit(domain, "main", "c2").await.unwrap(), Some(v2));
+        assert!(v2 > v1 && v1 > v0, "versions advance forward, never reset");
+
+        let final_li = restarted
+            .last_indexed(&dom(domain), &br("main"))
+            .await
+            .expect("final li");
+        assert_eq!(final_li.commit.as_deref(), Some("c2"), "last-indexed walked forward to c2");
+    }
+
+    // --- A commit killed MID-INDEX (data appended but NEVER tagged) is NOT
+    //     treated as indexed after restart — no half-tagged state is "complete".
+    //     The resume re-does it from the prior tag. (Requirement #2 partial-work) ---
+    #[tokio::test]
+    async fn untagged_midindex_commit_is_not_complete_after_restart() {
+        let (store, tmp) = make_test_store(8);
+        let domain = "admin/midkill";
+
+        // c0 fully indexed + tagged.
+        let r0 = ChunkRow {
+            doc_id: "doc/0".to_owned(),
+            doc_type: "Doc".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: fake_embedding(8, 1.0),
+            content: "zero".to_owned(),
+        };
+        let v0 = store
+            .io_upsert_chunks(domain, "main", "doc/0", std::slice::from_ref(&r0))
+            .await
+            .expect("upsert c0");
+        store.io_tag_commit(domain, "main", "c0", v0).await.expect("tag c0");
+
+        // c1: data WRITTEN (version advances) but the process is "killed" before
+        // io_tag_commit runs — simulate by upserting WITHOUT tagging.
+        let r1 = ChunkRow {
+            doc_id: "doc/1".to_owned(),
+            doc_type: "Doc".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: fake_embedding(8, 2.0),
+            content: "one".to_owned(),
+        };
+        let _v1 = store
+            .io_upsert_chunks(domain, "main", "doc/1", std::slice::from_ref(&r1))
+            .await
+            .expect("upsert c1 (never tagged — killed mid-index)");
+
+        drop(store);
+        let restarted = reopen_store(&tmp, 8);
+
+        // The untagged commit c1 is NOT indexed (no tag) — half-written, partial
+        // work is never treated as complete.
+        assert_eq!(
+            restarted.io_resolve_commit(domain, "main", "c1").await.unwrap(),
+            None,
+            "an untagged (killed mid-index) commit must NOT resolve as indexed"
+        );
+        // last-indexed remains the last DURABLY-tagged commit, c0 — the resume base.
+        let li = restarted
+            .last_indexed(&dom(domain), &br("main"))
+            .await
+            .expect("li");
+        assert_eq!(
+            li.commit.as_deref(),
+            Some("c0"),
+            "resume base is the last durably-tagged commit, not the half-written c1"
+        );
     }
 
     // --- snapshot isolation: search at C0 does not see C1 data ---

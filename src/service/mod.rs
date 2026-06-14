@@ -35,9 +35,6 @@ pub struct SearchService {
     /// readiness (search additionally requires a warm embedding backend).
     ready_index: Arc<std::sync::atomic::AtomicBool>,
     ready_search: Arc<std::sync::atomic::AtomicBool>,
-    /// Process-local per-branch state: indexing-enablement + 404 negative cache
-    /// for catch-up resolution (truth is always the layer index / Lance tags).
-    branch_state: Arc<crate::layeridx::BranchState>,
 }
 
 /// Outcome of a search that resolves through the catch-up layer (RISK-15).
@@ -97,7 +94,6 @@ impl SearchService {
             http_client: reqwest::Client::new(),
             ready_index,
             ready_search,
-            branch_state: Arc::new(crate::layeridx::BranchState::default()),
         }
     }
 
@@ -133,7 +129,10 @@ impl SearchService {
             parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
         let domain = Domain::from_resource_path(&rp);
         let branch = BranchName::new(branch_raw.to_owned());
-        Ok(self.store.last_indexed(&domain, &branch).await)
+        self.store
+            .last_indexed(&domain, &branch)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))
     }
 
     /// Start an async push/index task.
@@ -205,12 +204,10 @@ impl SearchService {
             }
         }
 
-        // An indexing request for this branch directly busts its 404 negative
-        // cache and enrolls it (Spec 10 §5: invalidate immediately on a direct
-        // index request) — so a search that 404'd before this push will resolve
-        // on its next attempt.
-        self.branch_state.invalidate_negative(&domain_str, &branch);
-        self.branch_state.enable(&domain_str, &branch);
+        // No process-local enablement/negative-cache to manage here: a search
+        // that 404'd before this push resolves on its next attempt purely from
+        // the durable tag this push will write (task-durable-index-state — the
+        // negative cache that previously needed busting here is gone).
 
         // Generate a task ID immediately.
         let task_id = format!("task-{}", uuid::Uuid::new_v4().as_simple());
@@ -486,9 +483,19 @@ impl SearchService {
     /// is the latest indexed commit — that could be a DESCENDANT of an older
     /// requested commit, leaking newer data the requested snapshot never had.
     ///
-    /// Enablement gate (#5, Spec 10 §5 / RISK-22): a branch with NO indexed
-    /// lineage is 404'd and negatively cached BEFORE any ancestor walk. A branch
-    /// that resolves is marked enabled (auto-enroll propagation).
+    /// Lineage gate (#5, Spec 10 §5): a branch with NO indexed lineage on disk
+    /// is 404'd before any ancestor walk.
+    ///
+    /// DURABLE STATE (task-durable-index-state): every signal here — "is this
+    /// commit indexed", "does this branch have any indexed lineage" — is read
+    /// from the on-disk Lance tags, NOT a process-local map. There is NO negative
+    /// cache: the previous 404 negative cache was the source of the
+    /// restart-loses-state bug (it cached "no lineage" for a branch whose index
+    /// was on disk) and, now that the lineage check is a cheap durable tag lookup
+    /// and the ancestor walk is a pure in-memory pass over a single tag-list
+    /// read, it guarded nothing worth keeping. Its removal makes the restart
+    /// invariant trivially true: a branch with an on-disk index can NEVER be
+    /// blocked, because nothing process-local outlives the truth on disk.
     async fn resolve_searchable_commit(
         &self,
         domain: &Domain,
@@ -498,48 +505,32 @@ impl SearchService {
     ) -> Result<String, ServiceError> {
         let domain_str = domain.as_str();
 
-        // 1. Negative cache FIRST — short-circuit without any I/O. Correct
-        //    because the ONLY way a commit becomes indexed is via a push, and
-        //    the push path busts this branch's negative cache (direct
-        //    invalidation), so a freshly-indexed exact commit is never masked by
-        //    a stale negative entry. This preserves the cache's purpose: a 404'd
-        //    branch does not re-walk history (and does not re-list tags).
-        if self.branch_state.is_negative_cached(domain_str, branch) {
-            return Err(ServiceError::NotFound(format!(
-                "no indexed ancestor for commit {} on branch {} (negatively cached)",
-                requested_commit, branch
-            )));
-        }
-
-        // 2. Load the dataset-global commit→version map ONCE (fail-loud on a
-        //    real tag-list error; absent dataset → empty map). The
-        //    nearest-ancestor walk is then a pure, in-memory resolution.
+        // 1. Load the dataset-global commit→version map ONCE (fail-loud on a
+        //    real tag-list error; absent dataset → empty map). This single
+        //    durable read backs both the exact match and the pure in-memory
+        //    nearest-ancestor walk below — no per-candidate I/O.
         let commit_versions = self
             .store
             .io_list_commit_versions(domain_str)
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
-        // 3. EXACT match: a directly-indexed commit is always serveable.
-        //    Busts any (now-stale) negative entry + enrolls.
+        // 2. EXACT match: a directly-indexed commit is always serveable.
         if commit_versions.contains_key(requested_commit) {
-            self.branch_state.enable(domain_str, branch);
-            self.branch_state.invalidate_negative(domain_str, branch);
             return Ok(requested_commit.to_owned());
         }
 
-        // 4. Enablement gate (#5): a branch with NO indexed lineage at all →
-        //    404 + negative cache, before any ancestor walk. The durable
-        //    last-indexed commit (or the enabled set) is the lineage signal.
+        // 3. Lineage gate (#5): a branch with NO indexed lineage at all → 404,
+        //    before any ancestor walk. The signal is the durable on-disk
+        //    last-indexed tag for the branch (survives a restart).
         if !self.branch_has_indexed_lineage(domain, branch).await? {
-            self.branch_state.record_negative(domain_str, branch);
             return Err(ServiceError::NotFound(format!(
                 "no indexed lineage for branch {} (commit {})",
                 branch, requested_commit
             )));
         }
 
-        // 5. Pure nearest-ancestor resolution over the SUPPLIED window only.
+        // 4. Pure nearest-ancestor resolution over the SUPPLIED window only.
         //    The resolver re-checks exact (already handled above; harmless),
         //    then walks ancestors nearest-first, resolving each via the
         //    in-memory map — no per-candidate I/O. We never consult the tip.
@@ -555,22 +546,18 @@ impl SearchService {
         .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         match resolved {
-            crate::layeridx::ResolvedLayer::Exact { commit, .. } => {
-                self.branch_state.enable(domain_str, branch);
-                self.branch_state.invalidate_negative(domain_str, branch);
-                Ok(commit)
-            }
+            crate::layeridx::ResolvedLayer::Exact { commit, .. } => Ok(commit),
             crate::layeridx::ResolvedLayer::Ancestor { served_commit, .. } => {
-                // A PROVEN ancestor (member of the supplied window). Stale, but
-                // never newer than requested. Auto-enroll the branch.
-                self.branch_state.enable(domain_str, branch);
+                // A PROVEN ancestor (member of the supplied window). Stale (the
+                // caller reports it via TerminusDB-Data-Version), but never newer
+                // than requested. The lag between requested and served is the
+                // catch-up nudge signal — TerminusDB's push driver converges it.
                 Ok(served_commit)
             }
             crate::layeridx::ResolvedLayer::None => {
                 // Requested not indexed and no SUPPLIED ancestor is indexed. We
                 // will NOT serve the tip (could be a descendant of the requested
-                // commit) — 404 + negative cache. TerminusDB nudges a push.
-                self.branch_state.record_negative(domain_str, branch);
+                // commit) — 404. TerminusDB nudges a push to catch up.
                 Err(ServiceError::NotFound(format!(
                     "no indexed ancestor for commit {} on branch {} within the supplied window",
                     requested_commit, branch
@@ -579,25 +566,24 @@ impl SearchService {
         }
     }
 
-    /// Whether `branch` has any indexed lineage — the enablement signal for the
-    /// resolution gate (#5, Spec 10 §5). The in-memory `enabled` set is the fast
-    /// path (a branch is enabled on its first push / first resolved search); the
-    /// durable `last_indexed.commit` is the authoritative backstop that survives
-    /// a process restart (the `enabled` set is process-local). Reading
-    /// `is_enabled` here is what makes the enablement set load-bearing rather
-    /// than write-only.
+    /// Whether `branch` has any indexed lineage — the gate for resolution (#5,
+    /// Spec 10 §5).
+    ///
+    /// DURABLE (task-durable-index-state): the signal is the on-disk
+    /// last-indexed tag for the branch (`store.last_indexed` derives it from
+    /// the Lance tags on a cache miss), so it is correct immediately after a
+    /// restart with no process-local enablement state. FAIL-LOUD: a real
+    /// tag-read error propagates rather than being misread as "no lineage".
     async fn branch_has_indexed_lineage(
         &self,
         domain: &Domain,
         branch: &str,
     ) -> Result<bool, ServiceError> {
-        if self.branch_state.is_enabled(domain.as_str(), branch) {
-            return Ok(true);
-        }
         let last = self
             .store
             .last_indexed(domain, &BranchName::new(branch.to_owned()))
-            .await;
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
         Ok(last.commit.is_some())
     }
 
@@ -832,14 +818,15 @@ impl SearchService {
     }
 
     /// Delete a domain's ENTIRE footprint: the `{domain}.lance` dataset (all
-    /// branches/versions/tags) plus every in-memory trace (store caches +
-    /// per-branch enablement/negative-cache). IDEMPOTENT — an unknown/already-
-    /// gone domain succeeds (TerminusDB may retry). Fail-loud on a real I/O error.
+    /// branches/versions/tags) plus the store's in-memory caches. IDEMPOTENT —
+    /// an unknown/already-gone domain succeeds (TerminusDB may retry). Fail-loud
+    /// on a real I/O error.
     ///
-    /// Order: the store removes the on-disk dataset FIRST, then purges its own
-    /// in-memory maps (fail-loud partial guard inside the store). Only after the
-    /// store succeeds do we purge the service-owned per-branch state — so we
-    /// never leave searchable per-branch state pointing at a deleted dataset.
+    /// The store removes the on-disk dataset FIRST, then purges its own in-memory
+    /// maps (fail-loud partial guard inside the store). There is no separate
+    /// service-owned per-branch enablement/negative-cache to purge any more —
+    /// index state is derived from the (now-deleted) on-disk tags
+    /// (task-durable-index-state).
     pub async fn delete_domain(&self, domain_raw: &str) -> Result<(), ServiceError> {
         let rp =
             parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
@@ -850,8 +837,6 @@ impl SearchService {
             .io_delete_domain(&domain_str)
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
-
-        self.branch_state.purge_domain(&domain_str);
 
         Ok(())
     }
