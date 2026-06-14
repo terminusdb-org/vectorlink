@@ -212,6 +212,16 @@ pub struct LanceStore {
     /// Serialises the atomic check-and-reserve in `io_try_reserve_commit` so two
     /// concurrent pushes of the SAME (domain, branch, commit) cannot both pass.
     reservation_lock: tokio::sync::Mutex<()>,
+    /// Count of `Dataset::open` (fresh from disk) calls. Each fresh open spins up
+    /// a NEW Lance object-store + session holding its own file readers; under
+    /// concurrent load these transient opens are the FD-pressure source that
+    /// exhausted descriptors (BUG-FD24). Read paths must reuse the cached domain
+    /// handle and `checkout_version`/`checkout_branch` off it (which SHARE the
+    /// handle's object_store + session — see `Dataset::checkout_by_ref`), so the
+    /// fresh-open count does NOT grow with the number of searches. Instrumented so
+    /// the regression test can assert reads reuse the cache rather than opening
+    /// fresh per query.
+    fresh_open_count: std::sync::atomic::AtomicU64,
 }
 
 impl LanceStore {
@@ -229,7 +239,29 @@ impl LanceStore {
             domain_guards: RwLock::new(HashMap::new()),
             inflight_commits: RwLock::new(std::collections::HashSet::new()),
             reservation_lock: tokio::sync::Mutex::new(()),
+            fresh_open_count: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Open the domain dataset FRESH from disk, tracking the open for FD/perf
+    /// instrumentation. Every `Dataset::open` allocates a fresh object_store +
+    /// session (with their own file readers), so this is the FD-pressure entry
+    /// point we minimise (BUG-FD24). Callers that can reuse a cached handle MUST
+    /// do so via `io_open_dataset_readonly` instead.
+    async fn io_open_fresh(&self, uri: &str) -> Result<Dataset, StoreError> {
+        self.fresh_open_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Dataset::open(uri)
+            .await
+            .map_err(|e| StoreError::Internal(format!("dataset open failed: {}", e)))
+    }
+
+    /// Number of fresh `Dataset::open` calls performed so far (test
+    /// instrumentation for the FD-exhaustion regression guard).
+    #[cfg(test)]
+    pub fn fresh_open_count(&self) -> u64 {
+        self.fresh_open_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Atomically check-and-reserve a commit for indexing (the 409 state machine).
@@ -481,35 +513,6 @@ impl LanceStore {
         }
         datasets.insert(domain.to_owned(), Arc::clone(&arc_ds));
         Ok(Some(arc_ds))
-    }
-
-    /// Open a FRESH (uncached) read-only handle to the domain dataset's default
-    /// (main) branch, opened directly from disk every call. Returns `None` if the
-    /// dataset does not exist (resurrection guard — never auto-creates).
-    ///
-    /// WHY FRESH (not the cached handle): Lance `Tags::list()`/`get()` read the
-    /// on-disk `_refs/tags/` directory through the dataset's object-store metadata
-    /// cache, which is populated when the handle is opened. A handle cached in
-    /// `self.datasets` BEFORE a tag was written serves a STALE directory listing
-    /// and so MISSES tags created afterwards on a different handle. That stale read
-    /// is the root cause of the 409-guard letting an already-indexed commit
-    /// through (and the same latent hazard for search resolution). Tag resolution
-    /// must therefore always read a freshly-opened handle so the listing reflects
-    /// the current on-disk refs. This handle is deliberately NOT inserted into the
-    /// shared cache (which tracks the default-branch data head for reads/writes).
-    async fn io_open_dataset_fresh_for_tags(
-        &self,
-        domain: &str,
-    ) -> Result<Option<Dataset>, StoreError> {
-        let path = self.dataset_path(domain);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let uri = path.to_string_lossy().to_string();
-        let ds = Dataset::open(&uri)
-            .await
-            .map_err(|e| StoreError::Internal(format!("fresh open for tags failed: {}", e)))?;
-        Ok(Some(ds))
     }
 
     /// Open a FRESH, branch-bound dataset handle for WRITING to `branch`
@@ -871,12 +874,19 @@ impl LanceStore {
 
         if branch == MAIN_BRANCH {
             // Default branch — the cached handle is on main; tag there.
-            let ds_arc = self.io_open_dataset(domain, branch).await?;
-            let ds = ds_arc.read().await;
-            ds.tags()
-                .create(&tag, version)
-                .await
-                .map_err(|e| StoreError::Internal(format!("tag creation failed: {}", e)))?;
+            {
+                let ds_arc = self.io_open_dataset(domain, branch).await?;
+                let ds = ds_arc.read().await;
+                ds.tags()
+                    .create(&tag, version)
+                    .await
+                    .map_err(|e| StoreError::Internal(format!("tag creation failed: {}", e)))?;
+            }
+            // Invalidate-on-write (BUG-FD24): refresh the cached handle so a
+            // subsequent cached-handle read (resolve/list/search) is guaranteed to
+            // see this tag. Tag listing reads disk live, but refreshing makes the
+            // contract explicit and robust against any future handle-level caching.
+            self.io_refresh_cached_dataset(domain, branch).await?;
             return Ok(());
         }
 
@@ -884,9 +894,7 @@ impl LanceStore {
         // on the branch's own lineage.
         let path = self.dataset_path(domain);
         let uri = path.to_string_lossy().to_string();
-        let base = Dataset::open(&uri)
-            .await
-            .map_err(|e| StoreError::Internal(format!("open for tag failed: {}", e)))?;
+        let base = self.io_open_fresh(&uri).await?;
         let branch_ds = base.checkout_branch(branch).await.map_err(|e| {
             StoreError::Internal(format!("checkout '{}' for tag failed: {}", branch, e))
         })?;
@@ -895,6 +903,10 @@ impl LanceStore {
             .create(&tag, version)
             .await
             .map_err(|e| StoreError::Internal(format!("tag creation failed: {}", e)))?;
+        // Invalidate-on-write (BUG-FD24): tag resolution is dataset-global, so the
+        // cached (default-branch) handle must be refreshed to guarantee this
+        // branch-scoped tag is visible to subsequent cached-handle reads.
+        self.io_refresh_cached_dataset(domain, branch).await?;
         Ok(())
     }
 
@@ -1033,20 +1045,26 @@ impl LanceStore {
     /// READ-ONLY: never auto-creates the dataset (BLOCKER-2 resurrection guard).
     /// A domain with no dataset on disk resolves to `Ok(None)`.
     ///
-    /// Reads a FRESHLY-opened handle (`io_open_dataset_fresh_for_tags`) rather
-    /// than the shared cached handle: a cached handle's object-store listing cache
-    /// can be stale and MISS a tag written after the handle was opened, which is
-    /// the root cause of the 409-guard admitting an already-indexed commit.
+    /// Reads the CACHED domain handle (BUG-FD24): a fresh `Dataset::open` per
+    /// resolve spins up a new object_store + session and leaks file descriptors
+    /// under load. TAG VISIBILITY is preserved because every mutation that writes
+    /// a tag/version (`io_tag_commit`, `io_upsert_chunks`, `io_delete_doc`,
+    /// optimize, assign) refreshes the cached handle via `io_refresh_cached_dataset`
+    /// — so a commit tagged by the worker is visible to a subsequent resolve. This
+    /// is the invalidate-on-write contract that lets reads reuse the cache without
+    /// regressing the 409 guard (which previously required fresh-open to avoid a
+    /// stale listing).
     pub async fn io_resolve_commit(
         &self,
         domain: &str,
         _branch: &str,
         commit: &str,
     ) -> Result<Option<u64>, StoreError> {
-        let ds = match self.io_open_dataset_fresh_for_tags(domain).await? {
+        let cached = match self.io_open_dataset_readonly(domain).await? {
             Some(ds) => ds,
             None => return Ok(None), // No dataset on disk → genuinely not indexed.
         };
+        let ds = cached.read().await;
 
         let tag = layeridx::encode_commit_tag(commit);
         // `list()` reads the refs directory; a failure here is a REAL error
@@ -1070,19 +1088,20 @@ impl LanceStore {
     ///
     /// READ-ONLY: never auto-creates. Absent dataset → empty map.
     ///
-    /// Reads a FRESHLY-opened handle (`io_open_dataset_fresh_for_tags`) for the
-    /// same reason as `io_resolve_commit`: a cached handle's listing cache can be
-    /// stale and MISS recently-written tags, which would silently degrade search
-    /// catch-up resolution (serve a 404/stale ancestor for a commit that IS
-    /// indexed).
+    /// Reads the CACHED domain handle (BUG-FD24), not a fresh `Dataset::open`
+    /// per call. `tags().list()` reads the on-disk refs directory live each call
+    /// (`ObjectStore::read_dir` → `list_with_delimiter`, no listing cache), and the
+    /// cache is refreshed by every tag/version mutation, so a recently-tagged
+    /// commit is visible to catch-up resolution without opening fresh per query.
     pub async fn io_list_commit_versions(
         &self,
         domain: &str,
     ) -> Result<HashMap<String, u64>, StoreError> {
-        let ds = match self.io_open_dataset_fresh_for_tags(domain).await? {
+        let cached = match self.io_open_dataset_readonly(domain).await? {
             Some(ds) => ds,
             None => return Ok(HashMap::new()),
         };
+        let ds = cached.read().await;
         let tags = ds
             .tags()
             .list()
@@ -1290,51 +1309,13 @@ impl LanceStore {
         commit: &str,
         query: &SearchQuery,
     ) -> Result<Vec<ChunkHit>, StoreError> {
-        // Layout A: Lance versions are branch-scoped, so we must resolve the tag
-        // and check out the version on a handle bound to `branch`.
-        //
-        // FRESH HANDLE FOR BOTH BRANCHES: we open the dataset directly from disk
-        // every search rather than reusing the shared cached handle. A cached
-        // handle's object-store listing cache can be stale and MISS the tag of a
-        // just-indexed commit (the same staleness class that broke the 409 guard
-        // — see `io_open_dataset_fresh_for_tags`). Opening fresh guarantees the
-        // tag `get_version` and the versioned data snapshot both reflect current
-        // on-disk state. READ-ONLY: an absent dataset is "not indexed", never a
-        // resurrection (BLOCKER-2).
-        let path = self.dataset_path(domain);
-        if !path.exists() {
-            return Err(StoreError::Internal(format!(
-                "commit not indexed: domain '{}' has no dataset",
-                domain
-            )));
-        }
-        let uri = path.to_string_lossy().to_string();
-        let opened = Dataset::open(&uri)
-            .await
-            .map_err(|e| StoreError::Internal(format!("open for search failed: {}", e)))?;
-        let owned_branch_ds;
-        let base: &Dataset = if branch == MAIN_BRANCH {
-            &opened
-        } else {
-            owned_branch_ds = opened.checkout_branch(branch).await.map_err(|e| {
-                StoreError::Internal(format!("checkout '{}' for search failed: {}", branch, e))
-            })?;
-            &owned_branch_ds
-        };
-
-        // Resolve commit to version via tag (global resolution).
-        let tag = layeridx::encode_commit_tag(commit);
-        let version = base
-            .tags()
-            .get_version(&tag)
-            .await
-            .map_err(|e| StoreError::Internal(format!("commit not indexed: {}", e)))?;
-
-        // Snapshot isolation: checkout the version on the branch-bound handle.
-        let snapshot = base
-            .checkout_version(version)
-            .await
-            .map_err(|e| StoreError::Internal(format!("checkout version {} failed: {}", version, e)))?;
+        // Resolve `commit` to its versioned read-only snapshot off the CACHED
+        // domain handle (shared object_store + session — see
+        // `io_snapshot_from_cache`). Reusing the cache instead of `Dataset::open`
+        // per search bounds the open file-descriptor count under load (BUG-FD24);
+        // writers refresh the cache on mutation so freshly-tagged commits are still
+        // visible (the 409 / search-at-just-indexed-commit invariant).
+        let snapshot = self.io_snapshot_from_cache(domain, branch, commit).await?;
 
         // Build the search based on mode — always against the versioned snapshot.
         let hits = match query.mode {
@@ -1538,6 +1519,86 @@ impl LanceStore {
         // caller (/similar) re-embeds and ranks separately.
         batches_to_vector_hits(&batches, false)
     }
+
+    /// Resolve `commit` on `branch` to its versioned, read-only snapshot off the
+    /// CACHED domain handle — the single shared resolution path for `/search`,
+    /// `/similar` and `/duplicates` (so commit→snapshot resolution and the
+    /// not-indexed behaviour are CONSISTENT across all three).
+    ///
+    /// CACHED, NOT FRESH-PER-CALL (BUG-FD24): we clone the cached domain `Dataset`
+    /// (cheap — `Dataset::clone` shares the object_store + session via `Arc`) and
+    /// `checkout_branch`/`checkout_version` off that clone. `checkout_by_ref`
+    /// REUSES the handle's object_store and session (it does not allocate a new
+    /// one), so resolving a snapshot from the cache opens NO new file descriptors —
+    /// unlike `Dataset::open`, which spins up a fresh object_store + session
+    /// holding its own file readers per call (the FD-exhaustion source under load).
+    ///
+    /// TAG VISIBILITY (the reason fresh-open previously existed): the cached handle
+    /// is refreshed by every mutation that changes tags/versions (`io_tag_commit`,
+    /// `io_upsert_chunks`, `io_delete_doc`, optimize, assign) via
+    /// `io_refresh_cached_dataset`, so a commit tagged by the worker is visible to
+    /// a subsequent search/resolve. This preserves the 409 / search-at-just-
+    /// indexed-commit invariant WITHOUT opening fresh every query.
+    ///
+    /// READ-ONLY (BLOCKER-2): an absent dataset is "not indexed", never resurrected
+    /// (`io_open_dataset_readonly` does not auto-create).
+    async fn io_snapshot_from_cache(
+        &self,
+        domain: &str,
+        branch: &str,
+        commit: &str,
+    ) -> Result<Dataset, StoreError> {
+        let cached = match self.io_open_dataset_readonly(domain).await? {
+            Some(ds) => ds,
+            None => {
+                return Err(StoreError::Internal(format!(
+                    "commit not indexed: domain '{}' has no dataset",
+                    domain
+                )));
+            }
+        };
+
+        // Clone the cached Dataset (shares object_store + session via Arc) so the
+        // checkouts below run without holding the cache lock for the whole search.
+        let base = {
+            let guard = cached.read().await;
+            guard.clone()
+        };
+
+        let owned_branch_ds;
+        let base: &Dataset = if branch == MAIN_BRANCH {
+            &base
+        } else {
+            owned_branch_ds = base.checkout_branch(branch).await.map_err(|e| {
+                StoreError::Internal(format!("checkout '{}' for snapshot failed: {}", branch, e))
+            })?;
+            &owned_branch_ds
+        };
+
+        let tag = layeridx::encode_commit_tag(commit);
+        let version = base
+            .tags()
+            .get_version(&tag)
+            .await
+            .map_err(|e| StoreError::Internal(format!("commit not indexed: {}", e)))?;
+
+        base.checkout_version(version).await.map_err(|e| {
+            StoreError::Internal(format!("checkout version {} failed: {}", version, e))
+        })
+    }
+
+    /// Resolve `commit` on `branch` to its versioned, read-only snapshot.
+    /// Thin alias over `io_snapshot_from_cache` retained for `/duplicates` and
+    /// `/similar` call sites.
+    async fn io_open_snapshot(
+        &self,
+        domain: &str,
+        branch: &str,
+        commit: &str,
+    ) -> Result<Dataset, StoreError> {
+        self.io_snapshot_from_cache(domain, branch, commit).await
+    }
+
 }
 
 /// Ensure the FTS inverted index is up-to-date on an already-open Dataset handle.
@@ -3183,5 +3244,170 @@ mod tests {
         let ok = batches_to_vector_hits(&batches, false);
         assert!(ok.is_ok(), "a plain scan tolerates absent _distance");
         assert_eq!(ok.unwrap().len(), 1);
+    }
+
+    /// Count this process's currently-open file descriptors (Linux: /proc/self/fd).
+    /// Used by the FD-exhaustion regression test to prove search no longer leaks
+    /// descriptors under sustained load.
+    #[cfg(target_os = "linux")]
+    fn open_fd_count() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("read /proc/self/fd")
+            .count()
+    }
+
+    // --- BUG-FD24: under sustained search load the engine exhausted file
+    //     descriptors ("Too many open files (os error 24)"). The bench pinpointed
+    //     the mechanism: ~2 FDs leaked PER /search — the Lance VECTOR-INDEX reader
+    //     files (`_indices/<uuid>/index.idx` + `auxiliary.idx`), opened when the
+    //     ANN `nearest()` runs through a FRESHLY-`Dataset::open`ed handle (a new
+    //     object_store + session) and NOT released before the call returns. The
+    //     count climbed monotonically (past 2100) and exhausted the default soft
+    //     limit (~1024) after ~140 searches.
+    //
+    //     This test builds a domain WITH a real vector (ANN) index — the leak is
+    //     index-reader-bound, so the index MUST exist — then issues many vector
+    //     searches and asserts BOTH (a) the process open-FD count stays FLAT and
+    //     (b) reads perform no fresh `Dataset::open` per query. RED against
+    //     fresh-open-per-search (FDs climb + opens == searches); GREEN once reads
+    //     reuse the cached handle (one shared object_store + session → index
+    //     readers bounded to one set, FDs flat).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn search_does_not_leak_file_descriptors_under_load() {
+        let dim = 16;
+        // IVF_PQ needs >= 256 training vectors; a few partitions for a small corpus.
+        let config = VectorIndexConfig {
+            num_partitions: 4,
+            num_sub_vectors: 8,
+            nprobes: 4,
+            refine_factor: Some(10),
+        };
+        let (mut store, _tmp) = make_test_store(dim);
+        store.set_vector_index_config(config.clone());
+        let domain = "admin/fdload";
+
+        // One doc with 300 chunks → 300 rows, above the 256 index-training floor,
+        // built in a single fast upsert (avoids hundreds of sequential writes).
+        let corpus = 300usize;
+        let rows: Vec<ChunkRow> = (0..corpus)
+            .map(|i| ChunkRow {
+                doc_id: "doc/corpus".to_owned(),
+                doc_type: "Doc".to_owned(),
+                chunk_index: i as i32,
+                chunk_count: corpus as i32,
+                chunk_token_start: i as i32,
+                doc_token_len: corpus as i32,
+                embedding: fake_embedding(dim, 1.0 + i as f32),
+                content: format!("chunk content number {} lorem ipsum dolor", i),
+            })
+            .collect();
+        store
+            .io_upsert_chunks(domain, "main", "doc/corpus", &rows)
+            .await
+            .expect("upsert corpus");
+
+        // Build the vector (ANN) index — the leaked FDs are its reader files.
+        {
+            let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+            let mut ds = ds_arc.write().await;
+            crate::store::vector_index::io_ensure_vector_index(&mut ds, &config)
+                .await
+                .expect("ensure vector index");
+        }
+        // Refresh the cached handle so it reflects the new index version, then tag.
+        store
+            .io_refresh_cached_dataset(domain, "main")
+            .await
+            .expect("refresh after index build");
+        let indexed_version = {
+            let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+            let guard = ds_arc.read().await;
+            guard.version().version
+        };
+        store
+            .io_tag_commit(domain, "main", "c_load", indexed_version)
+            .await
+            .expect("tag c_load");
+
+        let query = SearchQuery {
+            query_embedding: fake_embedding(dim, 9999.0),
+            query_text: String::new(),
+            mode: SearchMode::Vector,
+            start: 0,
+            count: 5,
+            doc_type_filter: Vec::new(),
+            doc_id_filter: Vec::new(),
+            snippet: false,
+        };
+
+        // Warm up: the first search opens/populates the cached handle and loads
+        // the index reader once. Measure baselines AFTER warm-up so we compare
+        // steady-state to steady-state.
+        store
+            .io_search(domain, "main", "c_load", &query)
+            .await
+            .expect("warmup search");
+        let baseline_fds = open_fd_count();
+        let baseline_opens = store.fresh_open_count();
+
+        // Sustained CONCURRENT load (matches the live server). With fresh-open per
+        // search, the ANN index reader FDs leak ~2/search and the count climbs;
+        // with the cached handle reused, the count stays flat.
+        let load_iterations = 400usize;
+        let concurrency = 8usize;
+        let store = std::sync::Arc::new(store);
+        for _ in 0..(load_iterations / concurrency) {
+            let mut handles = Vec::with_capacity(concurrency);
+            for _ in 0..concurrency {
+                let s = std::sync::Arc::clone(&store);
+                let q = query.clone();
+                handles.push(tokio::spawn(async move {
+                    s.io_search(domain, "main", "c_load", &q).await
+                }));
+            }
+            for h in handles {
+                h.await
+                    .expect("search task join")
+                    .expect("load search must succeed (no FD exhaustion)");
+            }
+        }
+        let after_fds = open_fd_count();
+        let opens_added = store.fresh_open_count() - baseline_opens;
+        eprintln!(
+            "[fd-load] searches={} fresh_opens_added={} fds(baseline={}, after={}, delta={})",
+            load_iterations,
+            opens_added,
+            baseline_fds,
+            after_fds,
+            after_fds as i64 - baseline_fds as i64
+        );
+
+        // PRIMARY: searches must NOT open a fresh dataset per call (each fresh
+        // open is the new object_store/session that leaks the index reader FDs).
+        assert!(
+            opens_added < (load_iterations as u64) / 4,
+            "search opened a fresh dataset per call ({} fresh opens across {} searches). \
+             Reads must reuse the cached domain handle and checkout_version off it \
+             (sharing one object_store + session), not Dataset::open fresh every query \
+             — the fresh open leaks the ANN index reader FDs (BUG-FD24).",
+            opens_added,
+            load_iterations
+        );
+
+        // SECONDARY: open FD count must stay FLAT under load (the bench saw it
+        // climb past 2100 unbounded). Slack covers runtime/allocator churn only —
+        // it must NOT scale with the number of searches.
+        let slack = 64;
+        assert!(
+            after_fds <= baseline_fds + slack,
+            "open FD count grew under search load (baseline={}, after {} searches={}, slack={}). \
+             The ANN index reader FDs are leaking per search — reads must reuse the \
+             cached handle so the index readers are bounded to one set (BUG-FD24).",
+            baseline_fds,
+            load_iterations,
+            after_fds,
+            slack
+        );
     }
 }
