@@ -195,6 +195,23 @@ pub struct LanceStore {
     /// respect to a concurrent first-write — the delete never races a half-created
     /// dataset, and a create never silently revives a domain mid-delete.
     domain_guards: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// In-flight commit reservations keyed by (domain, branch, commit).
+    ///
+    /// A commit is "committed" the moment its push is ACCEPTED — not only once
+    /// indexing finishes and tags it. This set holds the ACCEPTED→INDEXING window:
+    /// a commit is inserted when its push passes the guard (reserved), and removed
+    /// when indexing reaches a terminal state. On SUCCESS the durable Lance tag
+    /// becomes the permanent "Indexed" marker (and the reservation is dropped); on
+    /// FAILURE the reservation is dropped so a legitimate retry is allowed.
+    ///
+    /// The 409 guard rejects a re-push whose commit is EITHER reserved (in this
+    /// set) OR already Indexed (tagged). Mutations are serialised by
+    /// `reservation_lock` so the check-and-reserve is atomic (no TOCTOU race
+    /// between two concurrent pushes of the same commit).
+    inflight_commits: RwLock<std::collections::HashSet<(String, String, String)>>,
+    /// Serialises the atomic check-and-reserve in `io_try_reserve_commit` so two
+    /// concurrent pushes of the SAME (domain, branch, commit) cannot both pass.
+    reservation_lock: tokio::sync::Mutex<()>,
 }
 
 impl LanceStore {
@@ -210,7 +227,72 @@ impl LanceStore {
             tasks: RwLock::new(HashMap::new()),
             pipeline_locks: RwLock::new(HashMap::new()),
             domain_guards: RwLock::new(HashMap::new()),
+            inflight_commits: RwLock::new(std::collections::HashSet::new()),
+            reservation_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Atomically check-and-reserve a commit for indexing (the 409 state machine).
+    ///
+    /// A commit is rejected (returns `Ok(false)` — caller must respond 409) if it
+    /// is in ANY non-absent state:
+    ///   - Reserved/Indexing: present in `inflight_commits` (a push is in flight).
+    ///   - Indexed: a durable Lance tag exists for it (`io_resolve_commit`).
+    ///
+    /// Otherwise the commit is absent: we INSERT the reservation and return
+    /// `Ok(true)` (caller proceeds to spawn the index pipeline).
+    ///
+    /// ATOMICITY: the whole check-and-insert runs under `reservation_lock`, so two
+    /// concurrent pushes of the same (domain, branch, commit) cannot both observe
+    /// "absent" — exactly one wins the reservation, the other gets `Ok(false)`.
+    ///
+    /// FAIL-LOUD: a real tag-resolution error (I/O / corruption) propagates as
+    /// `Err` — it is NOT collapsed into "absent" (which would let a re-push of a
+    /// possibly-indexed commit through). The reservation is only taken on a proven
+    /// absence.
+    pub async fn io_try_reserve_commit(
+        &self,
+        domain: &str,
+        branch: &str,
+        commit: &str,
+    ) -> Result<bool, StoreError> {
+        let _atomic = self.reservation_lock.lock().await;
+
+        // In-flight (Reserved/Indexing) → reject.
+        let key = (domain.to_owned(), branch.to_owned(), commit.to_owned());
+        {
+            let inflight = self.inflight_commits.read().await;
+            if inflight.contains(&key) {
+                return Ok(false);
+            }
+        }
+
+        // Durably Indexed (tagged) → reject. Fail-loud on a real resolution error.
+        if self.io_resolve_commit(domain, branch, commit).await?.is_some() {
+            return Ok(false);
+        }
+
+        // Absent → reserve and proceed.
+        let mut inflight = self.inflight_commits.write().await;
+        inflight.insert(key);
+        Ok(true)
+    }
+
+    /// Release a commit reservation (terminal state of its push).
+    ///
+    /// Called on BOTH success and failure of the index pipeline:
+    ///   - SUCCESS: the durable Lance tag now marks the commit Indexed, so the
+    ///     in-flight reservation is no longer needed (the tag keeps the 409 guard
+    ///     correct). Dropping it keeps the set bounded.
+    ///   - FAILURE (task → Error): no tag was written, so dropping the reservation
+    ///     returns the commit to the absent state — a legitimate retry of the same
+    ///     commit is then allowed (NOT blocked forever).
+    ///
+    /// Idempotent: releasing an absent reservation is a no-op.
+    pub async fn io_release_commit_reservation(&self, domain: &str, branch: &str, commit: &str) {
+        let key = (domain.to_owned(), branch.to_owned(), commit.to_owned());
+        let mut inflight = self.inflight_commits.write().await;
+        inflight.remove(&key);
     }
 
     /// Acquire the per-domain create/delete guard (BLOCKER-2 / #6). Held by a
@@ -399,6 +481,35 @@ impl LanceStore {
         }
         datasets.insert(domain.to_owned(), Arc::clone(&arc_ds));
         Ok(Some(arc_ds))
+    }
+
+    /// Open a FRESH (uncached) read-only handle to the domain dataset's default
+    /// (main) branch, opened directly from disk every call. Returns `None` if the
+    /// dataset does not exist (resurrection guard — never auto-creates).
+    ///
+    /// WHY FRESH (not the cached handle): Lance `Tags::list()`/`get()` read the
+    /// on-disk `_refs/tags/` directory through the dataset's object-store metadata
+    /// cache, which is populated when the handle is opened. A handle cached in
+    /// `self.datasets` BEFORE a tag was written serves a STALE directory listing
+    /// and so MISSES tags created afterwards on a different handle. That stale read
+    /// is the root cause of the 409-guard letting an already-indexed commit
+    /// through (and the same latent hazard for search resolution). Tag resolution
+    /// must therefore always read a freshly-opened handle so the listing reflects
+    /// the current on-disk refs. This handle is deliberately NOT inserted into the
+    /// shared cache (which tracks the default-branch data head for reads/writes).
+    async fn io_open_dataset_fresh_for_tags(
+        &self,
+        domain: &str,
+    ) -> Result<Option<Dataset>, StoreError> {
+        let path = self.dataset_path(domain);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let uri = path.to_string_lossy().to_string();
+        let ds = Dataset::open(&uri)
+            .await
+            .map_err(|e| StoreError::Internal(format!("fresh open for tags failed: {}", e)))?;
+        Ok(Some(ds))
     }
 
     /// Open a FRESH, branch-bound dataset handle for WRITING to `branch`
@@ -921,17 +1032,21 @@ impl LanceStore {
     ///
     /// READ-ONLY: never auto-creates the dataset (BLOCKER-2 resurrection guard).
     /// A domain with no dataset on disk resolves to `Ok(None)`.
+    ///
+    /// Reads a FRESHLY-opened handle (`io_open_dataset_fresh_for_tags`) rather
+    /// than the shared cached handle: a cached handle's object-store listing cache
+    /// can be stale and MISS a tag written after the handle was opened, which is
+    /// the root cause of the 409-guard admitting an already-indexed commit.
     pub async fn io_resolve_commit(
         &self,
         domain: &str,
         _branch: &str,
         commit: &str,
     ) -> Result<Option<u64>, StoreError> {
-        let ds_arc = match self.io_open_dataset_readonly(domain).await? {
+        let ds = match self.io_open_dataset_fresh_for_tags(domain).await? {
             Some(ds) => ds,
             None => return Ok(None), // No dataset on disk → genuinely not indexed.
         };
-        let ds = ds_arc.read().await;
 
         let tag = layeridx::encode_commit_tag(commit);
         // `list()` reads the refs directory; a failure here is a REAL error
@@ -954,15 +1069,20 @@ impl LanceStore {
     /// e.g. a Lance-internal ref), never treated as an error.
     ///
     /// READ-ONLY: never auto-creates. Absent dataset → empty map.
+    ///
+    /// Reads a FRESHLY-opened handle (`io_open_dataset_fresh_for_tags`) for the
+    /// same reason as `io_resolve_commit`: a cached handle's listing cache can be
+    /// stale and MISS recently-written tags, which would silently degrade search
+    /// catch-up resolution (serve a 404/stale ancestor for a commit that IS
+    /// indexed).
     pub async fn io_list_commit_versions(
         &self,
         domain: &str,
     ) -> Result<HashMap<String, u64>, StoreError> {
-        let ds_arc = match self.io_open_dataset_readonly(domain).await? {
+        let ds = match self.io_open_dataset_fresh_for_tags(domain).await? {
             Some(ds) => ds,
             None => return Ok(HashMap::new()),
         };
-        let ds = ds_arc.read().await;
         let tags = ds
             .tags()
             .list()
@@ -1027,6 +1147,13 @@ impl LanceStore {
         {
             let mut locks = self.pipeline_locks.write().await;
             locks.retain(|(d, _b), _| d != domain);
+        }
+        {
+            // Purge any in-flight reservations for this domain so a delete +
+            // re-push of the same commit is not wrongly 409'd by a stale
+            // reservation left over from a push that the delete superseded.
+            let mut inflight = self.inflight_commits.write().await;
+            inflight.retain(|(d, _b, _c)| d != domain);
         }
 
         Ok(())
@@ -1164,41 +1291,36 @@ impl LanceStore {
         query: &SearchQuery,
     ) -> Result<Vec<ChunkHit>, StoreError> {
         // Layout A: Lance versions are branch-scoped, so we must resolve the tag
-        // and check out the version on a handle bound to `branch`. For main, the
-        // cached handle is the default branch; for a feature branch we open a
-        // fresh branch-bound handle. (Tag *resolution* is global, but
-        // `checkout_version(v)` interprets `v` on the handle's branch lineage.)
+        // and check out the version on a handle bound to `branch`.
+        //
+        // FRESH HANDLE FOR BOTH BRANCHES: we open the dataset directly from disk
+        // every search rather than reusing the shared cached handle. A cached
+        // handle's object-store listing cache can be stale and MISS the tag of a
+        // just-indexed commit (the same staleness class that broke the 409 guard
+        // — see `io_open_dataset_fresh_for_tags`). Opening fresh guarantees the
+        // tag `get_version` and the versioned data snapshot both reflect current
+        // on-disk state. READ-ONLY: an absent dataset is "not indexed", never a
+        // resurrection (BLOCKER-2).
+        let path = self.dataset_path(domain);
+        if !path.exists() {
+            return Err(StoreError::Internal(format!(
+                "commit not indexed: domain '{}' has no dataset",
+                domain
+            )));
+        }
+        let uri = path.to_string_lossy().to_string();
+        let opened = Dataset::open(&uri)
+            .await
+            .map_err(|e| StoreError::Internal(format!("open for search failed: {}", e)))?;
         let owned_branch_ds;
-        let base: &Dataset;
-        let _guard;
-        if branch == MAIN_BRANCH {
-            // READ-ONLY: a search must never resurrect a deleted/never-indexed
-            // domain (BLOCKER-2). An absent dataset means the commit is not
-            // indexed — surfaced as a fail-loud "not indexed" error here, which
-            // the service's catch-up resolution has already guarded against by
-            // resolving the served commit before calling search.
-            let ds_arc = self
-                .io_open_dataset_readonly(domain)
-                .await?
-                .ok_or_else(|| {
-                    StoreError::Internal(format!(
-                        "commit not indexed: domain '{}' has no dataset",
-                        domain
-                    ))
-                })?;
-            _guard = ds_arc.read_owned().await;
-            base = &_guard;
+        let base: &Dataset = if branch == MAIN_BRANCH {
+            &opened
         } else {
-            let path = self.dataset_path(domain);
-            let uri = path.to_string_lossy().to_string();
-            let opened = Dataset::open(&uri)
-                .await
-                .map_err(|e| StoreError::Internal(format!("open for search failed: {}", e)))?;
             owned_branch_ds = opened.checkout_branch(branch).await.map_err(|e| {
                 StoreError::Internal(format!("checkout '{}' for search failed: {}", branch, e))
             })?;
-            base = &owned_branch_ds;
-        }
+            &owned_branch_ds
+        };
 
         // Resolve commit to version via tag (global resolution).
         let tag = layeridx::encode_commit_tag(commit);
@@ -2883,6 +3005,166 @@ mod tests {
             ],
         )
         .expect("batch")
+    }
+
+    // --- BUG-409: io_resolve_commit must see a tag created AFTER the cached
+    //     handle was last refreshed. This replicates the LIVE pipeline ordering
+    //     that the simple round-trip test misses:
+    //       1. upsert chunks            (refreshes cached handle → H_data)
+    //       2. optimize indices         (refreshes cached handle → H_index)
+    //       3. tag commit               (io_tag_commit on the cached handle)
+    //       4. resolve commit (the GUARD)
+    //     If io_resolve_commit reads a STALE cached handle that predates the tag
+    //     write, it returns None for an indexed commit — the 409 guard then lets
+    //     a re-push of an already-indexed commit through (returns 200, BUG).
+    //
+    //     We drive the refresh between upsert and tag explicitly to mirror the
+    //     optimize step's `io_refresh_cached_dataset`, then assert resolve sees
+    //     the tag. This is the store-level pinpoint of the live 409 bug.
+    #[tokio::test]
+    async fn resolve_commit_sees_tag_created_after_cache_refresh() {
+        let (store, _tmp) = make_test_store(8);
+        let domain = "admin/bug409";
+
+        // 1. Upsert (this refreshes the cached handle to the data version).
+        let r = one_row(8, 1.0, "indexed content for bug 409");
+        let version = store
+            .io_upsert_chunks(domain, "main", "doc/x", std::slice::from_ref(&r))
+            .await
+            .expect("upsert");
+        assert!(version > 0);
+
+        // 2. Mirror the optimize step: refresh the cached handle AGAIN, so the
+        //    cached Dataset is a handle opened BEFORE the tag is written.
+        store
+            .io_refresh_cached_dataset(domain, "main")
+            .await
+            .expect("refresh (mirrors optimize)");
+
+        // 3. Tag the commit (the worker step). After this the commit is indexed.
+        store
+            .io_tag_commit(domain, "main", "rc0", version)
+            .await
+            .expect("tag commit");
+
+        // 4. The GUARD: io_resolve_commit must now report rc0 as indexed.
+        let resolved = store
+            .io_resolve_commit(domain, "main", "rc0")
+            .await
+            .expect("resolve");
+        assert_eq!(
+            resolved,
+            Some(version),
+            "io_resolve_commit must see a commit tagged after the cached handle was \
+             refreshed — a stale cached handle that returns None here is the root \
+             cause of the 409 guard letting a re-push of an indexed commit through"
+        );
+
+        // The dataset-global list view must agree (search resolution path).
+        let versions = store
+            .io_list_commit_versions(domain)
+            .await
+            .expect("list commit versions");
+        assert_eq!(
+            versions.get("rc0").copied(),
+            Some(version),
+            "io_list_commit_versions (search resolution) must also see the tag"
+        );
+    }
+
+    // --- 409 state machine: reserve once, reject the second reservation of the
+    //     same in-flight commit, release allows a retry ---
+    #[tokio::test]
+    async fn reserve_commit_rejects_inflight_then_release_allows_retry() {
+        let (store, _tmp) = make_test_store(8);
+        let domain = "admin/reserve";
+
+        // First reservation of an absent commit succeeds.
+        let first = store
+            .io_try_reserve_commit(domain, "main", "c1")
+            .await
+            .expect("reserve c1");
+        assert!(first, "first reservation of an absent commit must succeed");
+
+        // A second reservation of the SAME in-flight commit is rejected (Reserved
+        // state → 409), even though it is not yet tagged/Indexed.
+        let second = store
+            .io_try_reserve_commit(domain, "main", "c1")
+            .await
+            .expect("re-reserve c1");
+        assert!(
+            !second,
+            "re-reserving an in-flight (Reserved) commit must be rejected"
+        );
+
+        // Releasing the reservation (terminal: e.g. index failed) returns the
+        // commit to absent — a retry is then allowed (not blocked forever).
+        store
+            .io_release_commit_reservation(domain, "main", "c1")
+            .await;
+        let retry = store
+            .io_try_reserve_commit(domain, "main", "c1")
+            .await
+            .expect("retry reserve c1");
+        assert!(
+            retry,
+            "after release (failed index), a retry of the same commit must be allowed"
+        );
+    }
+
+    // --- 409 state machine: an INDEXED (tagged) commit is rejected even with no
+    //     active reservation (the durable tag is the Indexed marker) ---
+    #[tokio::test]
+    async fn reserve_commit_rejects_already_indexed() {
+        let (store, _tmp) = make_test_store(8);
+        let domain = "admin/reserve_indexed";
+
+        // Index + tag c0 (Indexed state), then drop the reservation as the worker
+        // does on success.
+        let r = one_row(8, 1.0, "indexed doc");
+        let v = store
+            .io_upsert_chunks(domain, "main", "doc/x", std::slice::from_ref(&r))
+            .await
+            .expect("upsert");
+        store
+            .io_tag_commit(domain, "main", "c0", v)
+            .await
+            .expect("tag c0");
+
+        // A push of an already-Indexed commit must be rejected (no reservation
+        // exists, but the tag does).
+        let reserved = store
+            .io_try_reserve_commit(domain, "main", "c0")
+            .await
+            .expect("reserve c0");
+        assert!(
+            !reserved,
+            "re-pushing an already-indexed (tagged) commit must be rejected"
+        );
+    }
+
+    // --- 409 state machine: two CONCURRENT reservations of the same new commit —
+    //     exactly one wins (atomic check-and-reserve, no TOCTOU) ---
+    #[tokio::test]
+    async fn concurrent_reserve_same_commit_exactly_one_wins() {
+        use std::sync::Arc;
+        let (store, _tmp) = make_test_store(8);
+        let store = Arc::new(store);
+        let domain = "admin/reserve_race";
+
+        let s1 = Arc::clone(&store);
+        let s2 = Arc::clone(&store);
+        let h1 = tokio::spawn(async move { s1.io_try_reserve_commit(domain, "main", "c9").await });
+        let h2 = tokio::spawn(async move { s2.io_try_reserve_commit(domain, "main", "c9").await });
+        let r1 = h1.await.unwrap().expect("reserve 1");
+        let r2 = h2.await.unwrap().expect("reserve 2");
+
+        assert_ne!(
+            r1, r2,
+            "exactly one concurrent reservation of the same commit must win (got r1={}, r2={})",
+            r1, r2
+        );
+        assert!(r1 || r2, "at least one reservation must have succeeded");
     }
 
     // --- #E: a ranked vector search with a MISSING `_distance` column fails

@@ -151,18 +151,23 @@ impl SearchService {
         let branch = branch_raw.to_owned();
         let commit = target_commit.to_owned();
 
-        // GUARD: reject an already-indexed commit immediately (409 Conflict).
-        // A commit is immutable; re-indexing would be redundant at best and risks
-        // re-tagging an immutable snapshot to a different version (correctness hazard).
-        // On a brand-new domain/branch, io_resolve_commit returns Ok(None) → proceed.
-        let already_indexed = self
+        // GUARD (409 state machine): a commit is "committed" the moment its push
+        // is ACCEPTED, not only once indexing tags it. Atomically check-and-reserve:
+        // reject (409) if the commit is in ANY non-absent state — Reserved/Indexing
+        // (a push already in flight) OR Indexed (already tagged). The check and the
+        // reservation happen under one lock so two concurrent pushes of the same
+        // commit cannot both pass (exactly one wins). On a proven-absent commit we
+        // take the reservation here and MUST release it on every terminal path
+        // below (success, failure, or panic) — otherwise a failed index would block
+        // a legitimate retry forever.
+        let reserved = self
             .store
-            .io_resolve_commit(&domain_str, &branch, &commit)
+            .io_try_reserve_commit(&domain_str, &branch, &commit)
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
-        if already_indexed.is_some() {
+        if !reserved {
             return Err(ServiceError::Conflict(format!(
-                "commit {} already indexed",
+                "commit {} already pushed (in-flight or indexed)",
                 commit
             )));
         }
@@ -171,23 +176,30 @@ impl SearchService {
         // not yet exist, fork it from the parent's indexed version (block reuse).
         // A push to "main" or to an existing branch skips this (no-op). Fail loud
         // if the parent isn't indexed (cannot fork from nothing).
+        //
+        // RELEASE-ON-FAILURE: this runs AFTER the reservation is taken. If the
+        // fork fails we must release the reservation before returning, otherwise
+        // the commit stays permanently reserved and a legitimate retry is blocked.
         if branch != crate::store::lance::MAIN_BRANCH {
             if let Some(parent) = parent_commit {
-                crate::store::branch::io_ensure_branch_forked(
+                if let Err(e) = crate::store::branch::io_ensure_branch_forked(
                     &self.store,
                     &domain_str,
                     &branch,
                     parent,
                 )
                 .await
-                .map_err(|e| {
+                {
+                    self.store
+                        .io_release_commit_reservation(&domain_str, &branch, &commit)
+                        .await;
                     let msg = e.to_string();
-                    if msg.contains("not indexed") || msg.contains("does not exist") {
+                    return Err(if msg.contains("not indexed") || msg.contains("does not exist") {
                         ServiceError::NotFound(msg)
                     } else {
                         ServiceError::Internal(msg)
-                    }
-                })?;
+                    });
+                }
             }
         }
 
@@ -221,6 +233,9 @@ impl SearchService {
         // Monitor the JoinHandle so panics are captured → Error, never Pending forever.
         let store_for_panic = Arc::clone(&store);
         let task_id_for_panic = task_id.clone();
+        // Coordinates for releasing the reservation on the panic/cancel path
+        // (the in-task path releases via its own owned `domain_str`/`branch`/`commit`).
+        let reservation_coords = (domain_str.clone(), branch.clone(), commit.clone());
         let handle = tokio::spawn(async move {
             let ctx = PipelineCtx {
                 store: &store,
@@ -233,6 +248,9 @@ impl SearchService {
             };
             let result = io_run_index_pipeline(&ctx, &commit, operations).await;
 
+            // Release the reservation on EVERY terminal state. On success the
+            // durable Lance tag now keeps the 409 guard correct; on failure
+            // releasing returns the commit to absent so a retry is allowed.
             match result {
                 Ok((indexed, skipped)) => {
                     store
@@ -254,9 +272,14 @@ impl SearchService {
                         .await;
                 }
             }
+            store
+                .io_release_commit_reservation(&domain_str, &branch, &commit)
+                .await;
         });
 
-        // Monitor: if the spawned task panics, record Error (never leave Pending).
+        // Monitor: if the spawned task panics, record Error (never leave Pending)
+        // AND release the reservation so the panicked commit can be retried (the
+        // in-task release never runs on a panic).
         tokio::spawn(async move {
             if let Err(join_err) = handle.await {
                 let msg = if join_err.is_panic() {
@@ -266,6 +289,10 @@ impl SearchService {
                 };
                 store_for_panic
                     .record_task(&task_id_for_panic, TaskStatus::Error { error: msg })
+                    .await;
+                let (d, b, c) = &reservation_coords;
+                store_for_panic
+                    .io_release_commit_reservation(d, b, c)
                     .await;
             }
         });
