@@ -188,35 +188,3 @@ To detect cross-catalogue (Abt↔Buy) duplicates this way, both sides must be in
 the SAME indexed snapshot, then filter the returned pairs to those that straddle
 the two id namespaces (`…/Abt/…` paired with `…/Buy/…`).
 
----
-
-## Operational note — file-descriptor pressure under a long search loop (FIXED)
-
-**Resolved (BUG-FD24).** Previously each `/search` opened a fresh `Dataset`
-handle (`Dataset::open`) per query, which spins up a NEW Lance object-store +
-session whose file readers — including the vector-index files
-`_indices/<uuid>/index.idx` + `auxiliary.idx` — held ~2 FDs per search. The
-default container soft limit is `nofile=1024`, so a tight sweep hit
-`LanceError(IO): Too many open files (os error 24)` after ~140 searches.
-
-The read paths (`io_search`, `io_open_snapshot`, `io_resolve_commit`,
-`io_list_commit_versions`) now reuse the CACHED domain handle and
-`checkout_version`/`checkout_branch` off it — those SHARE the handle's
-object-store + session (`Dataset::checkout_by_ref`), so the index readers are
-bounded to one set per cached handle instead of one per query. Writers refresh
-the cached handle on every tag/version mutation (`io_tag_commit`,
-`io_upsert_chunks`, `io_delete_doc`, optimize, assign), so a freshly-indexed
-commit is still resolvable by a subsequent search (the 409 / just-indexed-commit
-invariant is preserved). Verified live at the DEFAULT `nofile=1024`: 300+
-searches with the open-FD count FLAT (no growth) and zero failures.
-
-Confirm the open-FD count is now stable under load:
-
-```bash
-CID=$(docker ps -q -f name=tdb-search-tdb-search-1)
-docker exec "$CID" sh -c 'cat /proc/1/limits | grep "open files"'   # default 1024 is fine
-docker exec "$CID" sh -c 'ls /proc/1/fd | wc -l'                    # stays flat across a search sweep
-```
-
-The raised-ulimit compose override that the bench used as a stopgap is NO LONGER
-needed and must not be committed — the fix is in the Rust search path.
