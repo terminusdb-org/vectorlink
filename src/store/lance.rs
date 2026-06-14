@@ -188,6 +188,13 @@ pub struct LanceStore {
     /// Ensures concurrent pushes to the same branch are serialised so that
     /// commit→version tags are correctly isolated.
     pipeline_locks: RwLock<HashMap<BranchKey, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-DOMAIN guard serialising dataset CREATE (write path) against
+    /// `DELETE /domain` (BLOCKER-2 / #6). A delete holds this for the whole
+    /// remove-then-purge sequence; a write that must create the domain dataset
+    /// holds it across the create. This makes "remove the footprint" atomic with
+    /// respect to a concurrent first-write — the delete never races a half-created
+    /// dataset, and a create never silently revives a domain mid-delete.
+    domain_guards: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl LanceStore {
@@ -202,7 +209,28 @@ impl LanceStore {
             branch_indexes: RwLock::new(HashMap::new()),
             tasks: RwLock::new(HashMap::new()),
             pipeline_locks: RwLock::new(HashMap::new()),
+            domain_guards: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Acquire the per-domain create/delete guard (BLOCKER-2 / #6). Held by a
+    /// dataset-creating write across the create, and by `DELETE /domain` across
+    /// the whole remove-then-purge — so the two never interleave.
+    async fn acquire_domain_guard(&self, domain: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let guards = self.domain_guards.read().await;
+            if let Some(l) = guards.get(domain) {
+                Arc::clone(l)
+            } else {
+                drop(guards);
+                let mut guards = self.domain_guards.write().await;
+                guards
+                    .entry(domain.to_owned())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                    .clone()
+            }
+        };
+        lock.lock_owned().await
     }
 
     /// Get the vector index configuration (used by the ingest pipeline).
@@ -327,6 +355,50 @@ impl LanceStore {
         }
         datasets.insert(domain.to_owned(), Arc::clone(&arc_ds));
         Ok(arc_ds)
+    }
+
+    /// READ-ONLY domain dataset open (layout A) — NEVER auto-creates.
+    ///
+    /// Returns `Some(handle)` if the dataset exists on disk (or is already
+    /// cached), `None` if it does not exist. Unlike `io_open_dataset`, this is
+    /// the path used by resolve/search/lookup: a read against a domain that was
+    /// never indexed — or was deleted via `DELETE /domain` — must NOT bring an
+    /// empty dataset back into existence (BLOCKER-2 resurrection class). Only a
+    /// genuine write/index (`io_upsert_chunks` / `io_delete_doc`) may create.
+    ///
+    /// FAIL-LOUD: a real open error (corrupt manifest / I/O) propagates as
+    /// `StoreError`; only a genuinely-absent directory yields `Ok(None)`.
+    pub async fn io_open_dataset_readonly(
+        &self,
+        domain: &str,
+    ) -> Result<Option<Arc<RwLock<Dataset>>>, StoreError> {
+        // Check cache first (keyed by domain — layout A).
+        {
+            let datasets = self.datasets.read().await;
+            if let Some(ds) = datasets.get(domain) {
+                return Ok(Some(Arc::clone(ds)));
+            }
+        }
+
+        let path = self.dataset_path(domain);
+        if !path.exists() {
+            // Genuinely absent — do NOT create. (Resurrection guard.)
+            return Ok(None);
+        }
+
+        let uri = path.to_string_lossy().to_string();
+        let ds = Dataset::open(&uri)
+            .await
+            .map_err(|e| StoreError::Internal(format!("failed to open dataset: {}", e)))?;
+
+        let arc_ds = Arc::new(RwLock::new(ds));
+        let mut datasets = self.datasets.write().await;
+        // Re-check: a concurrent opener may have inserted while we were opening.
+        if let Some(existing) = datasets.get(domain) {
+            return Ok(Some(Arc::clone(existing)));
+        }
+        datasets.insert(domain.to_owned(), Arc::clone(&arc_ds));
+        Ok(Some(arc_ds))
     }
 
     /// Open a FRESH, branch-bound dataset handle for WRITING to `branch`
@@ -609,6 +681,11 @@ impl LanceStore {
             return Ok(0);
         }
 
+        // Serialise dataset creation against DELETE /domain (BLOCKER-2 / #6):
+        // hold the per-domain guard across the ensure-exists so a concurrent
+        // delete can't observe a half-created dataset.
+        let _domain_guard = self.acquire_domain_guard(domain).await;
+
         // Ensure the domain dataset exists (creates the main branch on first use).
         self.io_open_dataset(domain, branch).await?;
 
@@ -645,8 +722,12 @@ impl LanceStore {
         branch: &str,
         doc_id: &str,
     ) -> Result<u64, StoreError> {
-        // Ensure the domain dataset exists.
-        self.io_open_dataset(domain, branch).await?;
+        // A delete against a domain that does not exist is a no-op — it must NOT
+        // create the dataset (BLOCKER-2 resurrection guard). Only a genuine
+        // insert/change creates a domain.
+        if self.io_open_dataset_readonly(domain).await?.is_none() {
+            return Ok(0);
+        }
 
         let mut ds = self.io_open_branch_for_write(domain, branch).await?;
 
@@ -826,20 +907,77 @@ impl LanceStore {
     }
 
     /// Resolve a commit to a Lance version via tag lookup.
+    ///
+    /// Returns `Ok(Some(version))` if the commit is indexed (its tag exists),
+    /// `Ok(None)` if the commit is genuinely NOT indexed (no such tag), and
+    /// `Err(..)` for any REAL failure (corrupt manifest, I/O, lock poison).
+    ///
+    /// FAIL-LOUD (BLOCKER-3): we resolve via the full tag list rather than a
+    /// per-tag `get_version` whose `Err` cannot be distinguished from genuine
+    /// absence. A `tags().list()` error is a real error and propagates; a tag
+    /// missing from a successfully-listed map is genuine "not indexed". This
+    /// closes the class where a transient error silently downgraded a search to
+    /// "not indexed" (and, combined with catch-up, silently served stale data).
+    ///
+    /// READ-ONLY: never auto-creates the dataset (BLOCKER-2 resurrection guard).
+    /// A domain with no dataset on disk resolves to `Ok(None)`.
     pub async fn io_resolve_commit(
         &self,
         domain: &str,
-        branch: &str,
+        _branch: &str,
         commit: &str,
     ) -> Result<Option<u64>, StoreError> {
-        let ds_arc = self.io_open_dataset(domain, branch).await?;
+        let ds_arc = match self.io_open_dataset_readonly(domain).await? {
+            Some(ds) => ds,
+            None => return Ok(None), // No dataset on disk → genuinely not indexed.
+        };
         let ds = ds_arc.read().await;
 
         let tag = layeridx::encode_commit_tag(commit);
-        match ds.tags().get_version(&tag).await {
-            Ok(v) => Ok(Some(v)),
-            Err(_) => Ok(None),
+        // `list()` reads the refs directory; a failure here is a REAL error
+        // (I/O / corruption), surfaced loudly — NOT collapsed into "not indexed".
+        let tags = ds
+            .tags()
+            .list()
+            .await
+            .map_err(|e| StoreError::Internal(format!("tag list failed: {}", e)))?;
+        Ok(tags.get(&tag).map(|contents| contents.version))
+    }
+
+    /// List ALL indexed commit→version mappings for a domain (decoded commit
+    /// ids → Lance version). One I/O read of the dataset-global tag set, used by
+    /// the catch-up resolver to walk an ancestor window purely in memory rather
+    /// than issuing one tag lookup per candidate.
+    ///
+    /// FAIL-LOUD: a `list()` error propagates; a tag whose name does not decode
+    /// to a commit id is skipped (it was not written by `encode_commit_tag` —
+    /// e.g. a Lance-internal ref), never treated as an error.
+    ///
+    /// READ-ONLY: never auto-creates. Absent dataset → empty map.
+    pub async fn io_list_commit_versions(
+        &self,
+        domain: &str,
+    ) -> Result<HashMap<String, u64>, StoreError> {
+        let ds_arc = match self.io_open_dataset_readonly(domain).await? {
+            Some(ds) => ds,
+            None => return Ok(HashMap::new()),
+        };
+        let ds = ds_arc.read().await;
+        let tags = ds
+            .tags()
+            .list()
+            .await
+            .map_err(|e| StoreError::Internal(format!("tag list failed: {}", e)))?;
+
+        let mut out = HashMap::with_capacity(tags.len());
+        for (tag_name, contents) in tags {
+            // Only our commit tags decode; skip anything else (fail-soft on
+            // decode is correct here — a non-commit ref is simply not a commit).
+            if let Ok(commit) = layeridx::decode_commit_tag(&tag_name) {
+                out.insert(commit, contents.version);
+            }
         }
+        Ok(out)
     }
 
     /// Delete a domain's ENTIRE store footprint (layout A): drop the single
@@ -857,6 +995,13 @@ impl LanceStore {
     /// intact — never a half-deleted footprint (searchable map entry with no
     /// dataset, or a dataset with no map entry).
     pub async fn io_delete_domain(&self, domain: &str) -> Result<(), StoreError> {
+        // Hold the per-domain guard across the WHOLE remove-then-purge so a
+        // concurrent first-write that creates the dataset cannot interleave
+        // (BLOCKER-2 / #6): either the create completes before we remove (and we
+        // remove it), or it waits until after we have removed+purged (and then
+        // legitimately re-creates as a fresh index). Never a half-deleted state.
+        let _guard = self.acquire_domain_guard(domain).await;
+
         // 1. Drop the on-disk dataset directory first.
         let path = self.dataset_path(domain);
         if path.exists() {
@@ -1027,7 +1172,20 @@ impl LanceStore {
         let base: &Dataset;
         let _guard;
         if branch == MAIN_BRANCH {
-            let ds_arc = self.io_open_dataset(domain, branch).await?;
+            // READ-ONLY: a search must never resurrect a deleted/never-indexed
+            // domain (BLOCKER-2). An absent dataset means the commit is not
+            // indexed — surfaced as a fail-loud "not indexed" error here, which
+            // the service's catch-up resolution has already guarded against by
+            // resolving the served commit before calling search.
+            let ds_arc = self
+                .io_open_dataset_readonly(domain)
+                .await?
+                .ok_or_else(|| {
+                    StoreError::Internal(format!(
+                        "commit not indexed: domain '{}' has no dataset",
+                        domain
+                    ))
+                })?;
             _guard = ds_arc.read_owned().await;
             base = &_guard;
         } else {
@@ -1116,7 +1274,9 @@ impl LanceStore {
             .await
             .map_err(|e| StoreError::Internal(format!("batch collect failed: {}", e)))?;
 
-        Ok(batches_to_vector_hits(&batches))
+        // KNN search via nearest() — a `_distance` column is REQUIRED; fail loud
+        // if absent rather than corrupt ranking with 0.0 (#E).
+        batches_to_vector_hits(&batches, true)
     }
 
     /// Full-text search.
@@ -1212,7 +1372,13 @@ impl LanceStore {
         }
         let owned_ds;
         let ds: &Dataset = if branch == MAIN_BRANCH {
-            let ds_arc = self.io_open_dataset(domain, branch).await?;
+            // READ-ONLY (BLOCKER-2): never resurrect a deleted domain on lookup.
+            // The `path.exists()` guard above means we only reach here when the
+            // dataset exists, but use the non-creating open for defence in depth.
+            let ds_arc = match self.io_open_dataset_readonly(domain).await? {
+                Some(ds) => ds,
+                None => return Ok(Vec::new()),
+            };
             let guard = ds_arc.read().await;
             // Read+collect under the guard, then return early — simplest correct path.
             return Self::scan_doc_chunks(&guard, doc_id).await;
@@ -1246,7 +1412,9 @@ impl LanceStore {
             .await
             .map_err(|e| StoreError::Internal(format!("lookup collect failed: {}", e)))?;
 
-        Ok(batches_to_vector_hits(&batches))
+        // Plain filter scan (no KNN) — no `_distance` column by design; the
+        // caller (/similar) re-embeds and ranks separately.
+        batches_to_vector_hits(&batches, false)
     }
 }
 
@@ -1307,8 +1475,21 @@ fn build_filter_expression(doc_types: &[String], doc_ids: &[String]) -> String {
     parts.join(" AND ")
 }
 
-/// Extract ChunkHit records from RecordBatches (vector search — reads `_distance`).
-fn batches_to_vector_hits(batches: &[RecordBatch]) -> Vec<ChunkHit> {
+/// Extract ChunkHit records from RecordBatches.
+///
+/// `require_distance` distinguishes the two read shapes:
+///  - A vector `nearest()` search MUST carry a `_distance` column; a missing one
+///    means the scanner did not run as a KNN query — defaulting every hit to 0.0
+///    would silently corrupt ranking (all-equal distances → arbitrary order),
+///    so we FAIL LOUD with `StoreError::Internal` (#E).
+///  - A plain filter scan (e.g. doc-chunk lookup for `/similar`) has NO
+///    `_distance` column by design and does NOT rank — `require_distance=false`
+///    yields a neutral 0.0 there, which is correct (the caller re-embeds and
+///    ranks separately).
+fn batches_to_vector_hits(
+    batches: &[RecordBatch],
+    require_distance: bool,
+) -> Result<Vec<ChunkHit>, StoreError> {
     let mut hits = Vec::new();
 
     for batch in batches {
@@ -1335,10 +1516,22 @@ fn batches_to_vector_hits(batches: &[RecordBatch]) -> Vec<ChunkHit> {
             .column_by_name("_distance")
             .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
 
+        // FAIL LOUD (#E): a ranked vector search with no usable `_distance`
+        // column is a real error — never default to 0.0 and corrupt ranking.
+        if require_distance && distances.is_none() && n > 0 {
+            return Err(StoreError::Internal(
+                "vector search result is missing the `_distance` column — \
+                 refusing to default distances to 0.0 (would corrupt ranking)"
+                    .to_owned(),
+            ));
+        }
+
         if let (Some(ids), Some(ci), Some(cc), Some(cts), Some(dtl), Some(cnt)) =
             (doc_ids, chunk_indexes, chunk_counts, chunk_token_starts, doc_token_lens, contents)
         {
             for i in 0..n {
+                // For a ranked search `distances` is guaranteed Some by the guard
+                // above; for a plain scan a neutral 0.0 is correct (no ranking).
                 let distance = distances.map(|d| d.value(i)).unwrap_or(0.0);
                 hits.push(ChunkHit {
                     doc_id: ids.value(i).to_owned(),
@@ -1354,7 +1547,7 @@ fn batches_to_vector_hits(batches: &[RecordBatch]) -> Vec<ChunkHit> {
         }
     }
 
-    hits
+    Ok(hits)
 }
 
 /// Extract ChunkHit records from RecordBatches (FTS search — reads `_score`).
@@ -2523,5 +2716,190 @@ mod tests {
     #[should_panic(expected = "embedding dimension must be > 0")]
     fn vector_index_config_zero_dim_panics() {
         VectorIndexConfig::default_for_dim(0);
+    }
+
+    fn one_row(dim: usize, seed: f32, content: &str) -> ChunkRow {
+        ChunkRow {
+            doc_id: "doc/x".to_owned(),
+            doc_type: "Doc".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: fake_embedding(dim, seed),
+            content: content.to_owned(),
+        }
+    }
+
+    // --- #3: io_resolve_commit returns Ok(None) for a genuinely-absent domain,
+    //     and NEVER auto-creates the dataset (BLOCKER-2 read-path guard) ---
+    #[tokio::test]
+    async fn resolve_commit_absent_domain_is_none_and_does_not_create() {
+        let (store, tmp) = make_test_store(8);
+        let resolved = store
+            .io_resolve_commit("admin/never", "main", "c0")
+            .await
+            .expect("resolve must not error on an absent domain");
+        assert_eq!(resolved, None, "absent domain → not indexed");
+        // The read must NOT have created a dataset directory on disk.
+        let path = tmp.path().join("admin__never.lance");
+        assert!(
+            !path.exists(),
+            "io_resolve_commit must not auto-create the dataset (resurrection guard)"
+        );
+    }
+
+    // --- #3: a tag that exists resolves; a tag that is absent (but domain
+    //     exists) is Ok(None), distinct from an error ---
+    #[tokio::test]
+    async fn resolve_commit_distinguishes_absent_tag_from_error() {
+        let (store, _tmp) = make_test_store(8);
+        let domain = "admin/resolve3";
+        let r = one_row(8, 1.0, "hello world");
+        let v = store
+            .io_upsert_chunks(domain, "main", "doc/x", std::slice::from_ref(&r))
+            .await
+            .unwrap();
+        store.io_tag_commit(domain, "main", "c0", v).await.unwrap();
+
+        // Indexed commit → Some.
+        assert_eq!(
+            store.io_resolve_commit(domain, "main", "c0").await.unwrap(),
+            Some(v)
+        );
+        // A different, never-tagged commit on an existing domain → Ok(None),
+        // NOT an error.
+        assert_eq!(
+            store.io_resolve_commit(domain, "main", "c_absent").await.unwrap(),
+            None
+        );
+    }
+
+    // --- #2: a read (io_search) against a never-indexed domain does NOT create
+    //     the dataset and surfaces "not indexed" rather than empty success ---
+    #[tokio::test]
+    async fn search_absent_domain_does_not_create_dataset() {
+        let (store, tmp) = make_test_store(8);
+        let query = SearchQuery {
+            query_embedding: fake_embedding(8, 1.0),
+            query_text: "anything".to_owned(),
+            mode: SearchMode::Vector,
+            start: 0,
+            count: 5,
+            doc_type_filter: vec![],
+            doc_id_filter: vec![],
+            snippet: false,
+        };
+        let res = store.io_search("admin/ghost", "main", "c0", &query).await;
+        assert!(res.is_err(), "search on an absent domain must fail (not indexed), not succeed empty");
+        let path = tmp.path().join("admin__ghost.lance");
+        assert!(!path.exists(), "search must not auto-create the dataset");
+    }
+
+    // --- #2: after io_delete_domain, a resolve does NOT resurrect the dataset ---
+    #[tokio::test]
+    async fn delete_domain_then_resolve_does_not_resurrect() {
+        let (store, tmp) = make_test_store(8);
+        let domain = "admin/del_resurrect";
+        let r = one_row(8, 1.0, "doc to delete");
+        let v = store
+            .io_upsert_chunks(domain, "main", "doc/x", std::slice::from_ref(&r))
+            .await
+            .unwrap();
+        store.io_tag_commit(domain, "main", "c0", v).await.unwrap();
+        let path = tmp.path().join("admin__del_resurrect.lance");
+        assert!(path.exists(), "dataset exists after indexing");
+
+        store.io_delete_domain(domain).await.unwrap();
+        assert!(!path.exists(), "dataset removed by delete");
+
+        // Resolve after delete must be None AND must not recreate the dir.
+        let resolved = store.io_resolve_commit(domain, "main", "c0").await.unwrap();
+        assert_eq!(resolved, None);
+        assert!(!path.exists(), "resolve must not resurrect the deleted dataset");
+    }
+
+    // --- #4: two concurrent first-pushes to the SAME new branch both succeed
+    //     (idempotent branch-out, no "already exists" 500 for the loser) ---
+    #[tokio::test]
+    async fn concurrent_branch_out_both_succeed() {
+        use std::sync::Arc;
+        let (store, _tmp) = make_test_store(8);
+        let store = Arc::new(store);
+        let domain = "admin/race";
+        // Seed main @ c0 so the parent is indexed.
+        let r = one_row(8, 1.0, "parent doc");
+        let v = store
+            .io_upsert_chunks(domain, "main", "doc/x", std::slice::from_ref(&r))
+            .await
+            .unwrap();
+        store.io_tag_commit(domain, "main", "c0", v).await.unwrap();
+
+        // Fire two concurrent branch-outs of the same new branch from c0.
+        let s1 = Arc::clone(&store);
+        let s2 = Arc::clone(&store);
+        let h1 = tokio::spawn(async move {
+            crate::store::branch::io_ensure_branch_forked(&s1, domain, "feature", "c0").await
+        });
+        let h2 = tokio::spawn(async move {
+            crate::store::branch::io_ensure_branch_forked(&s2, domain, "feature", "c0").await
+        });
+        let r1 = h1.await.unwrap();
+        let r2 = h2.await.unwrap();
+        assert!(r1.is_ok(), "first branch-out must succeed: {:?}", r1);
+        assert!(
+            r2.is_ok(),
+            "concurrent branch-out must be idempotent, not 500: {:?}",
+            r2
+        );
+        // Exactly one feature branch exists.
+        let branches = store.io_list_branches(domain).await.unwrap();
+        assert!(branches.iter().any(|b| b == "feature"));
+    }
+
+    /// Build a RecordBatch with the base chunk columns but NO `_distance` column
+    /// (the shape a vector search would have if the scanner failed to attach
+    /// distances).
+    fn batch_without_distance() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Utf8, false),
+            Field::new("doc_type", DataType::Utf8, false),
+            Field::new("chunk_index", DataType::Int32, false),
+            Field::new("chunk_count", DataType::Int32, false),
+            Field::new("chunk_token_start", DataType::Int32, false),
+            Field::new("doc_token_len", DataType::Int32, false),
+            Field::new("content", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["doc/1"])),
+                Arc::new(StringArray::from(vec!["Doc"])),
+                Arc::new(Int32Array::from(vec![0])),
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![0])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(StringArray::from(vec!["content"])),
+            ],
+        )
+        .expect("batch")
+    }
+
+    // --- #E: a ranked vector search with a MISSING `_distance` column fails
+    //     loud rather than defaulting distances to 0.0 (which would corrupt
+    //     ranking). A plain scan (require_distance=false) tolerates absence. ---
+    #[test]
+    fn vector_hits_missing_distance_fails_loud_when_required() {
+        let batches = vec![batch_without_distance()];
+        let err = batches_to_vector_hits(&batches, true);
+        assert!(
+            err.is_err(),
+            "missing _distance on a ranked search must error, not default to 0.0"
+        );
+
+        // The same batch is fine for a plain scan (no ranking expected).
+        let ok = batches_to_vector_hits(&batches, false);
+        assert!(ok.is_ok(), "a plain scan tolerates absent _distance");
+        assert_eq!(ok.unwrap().len(), 1);
     }
 }

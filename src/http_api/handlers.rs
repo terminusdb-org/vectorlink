@@ -63,6 +63,10 @@ pub struct SearchGetParams {
     pub doc_type: Option<Vec<String>>,
     pub doc_id: Option<Vec<String>>,
     pub snippet: Option<bool>,
+    // NOTE: the repeated `ancestor` query param is NOT declared here. axum's
+    // `Query` (serde_urlencoded) cannot deserialize repeated keys into a `Vec`
+    // and would 400 the whole request. It is read from the raw query string via
+    // `extract_repeated_param(.., "ancestor")` instead (same as doc_type/doc_id).
 }
 
 #[allow(dead_code)]
@@ -75,6 +79,7 @@ pub struct SimilarParams {
     pub count: Option<i64>,
     pub doc_type: Option<Vec<String>>,
     pub snippet: Option<bool>,
+    // Repeated `ancestor` param read from the raw query (see SearchGetParams).
 }
 
 #[allow(dead_code)]
@@ -100,6 +105,9 @@ pub struct SearchRequestBody {
     pub doc_type: Option<Vec<String>>,
     pub doc_id: Option<Vec<String>>,
     pub snippet: Option<bool>,
+    /// Nearest-first ancestor window supplied by TerminusDB (Spec 10 §5) — drives
+    /// catch-up resolution. Body value wins over the query param, like other fields.
+    pub ancestors: Option<Vec<String>>,
 }
 
 // ─────────────────────────── Response helpers ─────────────────────────────
@@ -417,6 +425,7 @@ async fn handle_search_get(
     let count = params.count.unwrap_or(10).max(1) as usize;
     let doc_type_filter = extract_repeated_param(raw_query.as_deref(), "doc_type");
     let doc_id_filter = extract_repeated_param(raw_query.as_deref(), "doc_id");
+    let ancestors = extract_repeated_param(raw_query.as_deref(), "ancestor");
     let snippet = params.snippet.unwrap_or(false);
 
     match state
@@ -431,6 +440,7 @@ async fn handle_search_get(
             &doc_type_filter,
             &doc_id_filter,
             snippet,
+            &ancestors,
         )
         .await
     {
@@ -492,6 +502,10 @@ async fn handle_search_post(
     let doc_type_filter = body.doc_type.unwrap_or_default();
     let doc_id_filter = body.doc_id.unwrap_or_default();
     let snippet = body.snippet.unwrap_or(false);
+    // The ancestor window is taken from the JSON body (`ancestors` array) on
+    // POST. (The repeated `ancestor` query param is a GET convenience; on POST
+    // the structured body is the canonical source — see the contract.)
+    let ancestors = body.ancestors.unwrap_or_default();
 
     match state
         .service
@@ -505,6 +519,7 @@ async fn handle_search_post(
             &doc_type_filter,
             &doc_id_filter,
             snippet,
+            &ancestors,
         )
         .await
     {
@@ -513,16 +528,18 @@ async fn handle_search_post(
     }
 }
 
-/// Build a search response: the bare `[{id,distance}]` array body plus the
-/// `TerminusDB-Data-Version` header reporting the commit ACTUALLY served. Under
-/// lag this is the nearest indexed ancestor (≠ requested ⇒ the caller detects
-/// staleness) — staleness is never hidden (RISK-15, P3-LAG-1).
-fn search_response(outcome: crate::service::SearchOutcome) -> Response {
-    let mut response = Json(outcome.hits).into_response();
-    // The served commit is an opaque id; sanitise to a valid header value. If it
-    // somehow cannot form a header (non-ASCII control chars), that is an internal
-    // invariant violation — fail loud rather than drop the staleness signal.
-    match format!("commit:{}", outcome.served_commit).parse() {
+/// Attach the `TerminusDB-Data-Version` header (value `commit:<served>`) to a
+/// JSON body, reporting the commit ACTUALLY served. Under lag this is the
+/// nearest PROVEN ancestor (≠ requested ⇒ caller detects staleness) — never
+/// hidden (RISK-15, P3-LAG-1).
+///
+/// GRACEFUL (#F): a served commit that cannot form a valid header value (e.g.
+/// a malformed/control-char commit id) yields a clean 500 — NEVER a panic. This
+/// shared helper is the single sanctioned place the data-version header is set,
+/// so neither `/search` nor `/similar` can panic the handler on bad input.
+fn response_with_served_commit<T: Serialize>(body: T, served_commit: &str) -> Response {
+    let mut response = Json(body).into_response();
+    match format!("commit:{}", served_commit).parse() {
         Ok(value) => {
             response
                 .headers_mut()
@@ -533,15 +550,22 @@ fn search_response(outcome: crate::service::SearchOutcome) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
                 "served commit '{}' cannot be encoded as a data-version header",
-                outcome.served_commit
+                served_commit
             ),
         ),
     }
 }
 
+/// Build a search response: the bare `[{id,distance}]` array body plus the
+/// served-commit staleness header.
+fn search_response(outcome: crate::service::SearchOutcome) -> Response {
+    response_with_served_commit(outcome.hits, &outcome.served_commit)
+}
+
 async fn handle_similar(
     State(state): State<AppState>,
     headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
     Query(params): Query<SimilarParams>,
 ) -> Response {
     if let Err(r) = validate_data_version_header(&headers) {
@@ -580,15 +604,30 @@ async fn handle_similar(
         return r;
     }
 
-    match state.service.similar(&domain, &commit, &id).await {
-        Ok(results) => {
-            let mut response = Json(results).into_response();
-            response.headers_mut().insert(
-                "terminusdb-data-version",
-                format!("commit:{}", commit).parse().expect("valid header"),
-            );
-            response
-        }
+    let start = params.start.unwrap_or(0).max(0) as usize;
+    let count = params.count.unwrap_or(10).max(1) as usize;
+    let doc_type_filter = extract_repeated_param(raw_query.as_deref(), "doc_type");
+    let ancestors = extract_repeated_param(raw_query.as_deref(), "ancestor");
+    let snippet = params.snippet.unwrap_or(false);
+
+    // Route through the SAME catch-up resolution as /search (#A): the served
+    // commit (exact or proven ancestor) is reported via the data-version header
+    // using the shared GRACEFUL helper (#F — never panics on a bad commit id).
+    match state
+        .service
+        .similar_with_options(
+            &domain,
+            &commit,
+            &id,
+            start,
+            count,
+            &doc_type_filter,
+            snippet,
+            &ancestors,
+        )
+        .await
+    {
+        Ok(outcome) => response_with_served_commit(outcome.hits, &outcome.served_commit),
         Err(e) => service_error_to_response(e),
     }
 }

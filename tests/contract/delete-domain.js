@@ -77,6 +77,92 @@ describe("DELETE /domain", function () {
     expect(after.status).to.equal(404)
   })
 
+  it("BLOCKER-2: DELETE then immediate search does NOT resurrect the domain", async function () {
+    const D = "admin/resurrect_search"
+    await pushAndWait(D, "main", "rs_c0", [
+      { op: "Inserted", id: "terminusdb:///rs/People/leia", string: "Princess Leia leads the Rebel Alliance against the Empire." },
+    ])
+
+    // Count domains before delete.
+    const statsBefore = await agent()
+      .get("/statistics")
+      .set("Authorization", authHeader())
+      .expect(200)
+
+    await agent()
+      .delete("/domain")
+      .query({ domain: D })
+      .set("Authorization", authHeader())
+      .expect(204)
+
+    // Immediately search the deleted domain (the read path must NOT auto-create
+    // an empty dataset). A no-lineage search → 404.
+    const search1 = await agent()
+      .get("/search")
+      .query({ domain: D, commit: "rs_c0", q: "Rebel Alliance", mode: "vector" })
+      .set("Authorization", authHeader())
+    expect(search1.status, "search must not resurrect the deleted domain").to.equal(404)
+
+    // A /similar against the deleted domain likewise must not resurrect it.
+    const similar1 = await agent()
+      .get("/similar")
+      .query({ domain: D, commit: "rs_c0", id: "terminusdb:///rs/People/leia" })
+      .set("Authorization", authHeader())
+    expect([404]).to.include(similar1.status)
+
+    // /statistics must not count the resurrected domain (the empty dataset must
+    // never have been recreated by the read path).
+    const statsAfter = await agent()
+      .get("/statistics")
+      .set("Authorization", authHeader())
+      .expect(200)
+    expect(statsAfter.body.domains, "deleted domain must not be counted after read-path access")
+      .to.be.at.most(statsBefore.body.domains)
+
+    // A genuine re-push (a NEW index, not a resurrection) is allowed and works.
+    await pushAndWait(D, "main", "rs_c1", [
+      { op: "Inserted", id: "terminusdb:///rs/People/leia", string: "Leia Organa, a leader of the Rebellion." },
+    ])
+    const reSearch = await agent()
+      .get("/search")
+      .query({ domain: D, commit: "rs_c1", q: "Rebellion", mode: "vector" })
+      .set("Authorization", authHeader())
+      .expect(200)
+    expect(reSearch.body).to.be.an("array")
+
+    // Clean up.
+    await agent().delete("/domain").query({ domain: D }).set("Authorization", authHeader()).expect(204)
+  })
+
+  it("BLOCKER-2: DELETE of a domain with a queued index drain leaves it gone", async function () {
+    // Push (which kicks off background indexing), then delete immediately — the
+    // delete must win: no resurrected, searchable empty dataset afterwards.
+    const D = "admin/resurrect_index"
+    const body = JSON.stringify({ op: "Inserted", id: "terminusdb:///ri/People/obiwan", string: "Obi-Wan Kenobi mentors Luke in the ways of the Force." })
+    const pushRes = await agent()
+      .post("/push")
+      .query({ domain: D, branch: "main", target_commit: "ri_c0" })
+      .set("Authorization", authHeader())
+      .set("Content-Type", "application/x-ndjson")
+      .send(body)
+      .expect(200)
+    // Wait for the index to settle so the dataset exists, then delete.
+    await waitForTask(pushRes.text)
+
+    await agent()
+      .delete("/domain")
+      .query({ domain: D })
+      .set("Authorization", authHeader())
+      .expect(204)
+
+    // After delete, a search must 404 — the domain stays gone.
+    const after = await agent()
+      .get("/search")
+      .query({ domain: D, commit: "ri_c0", q: "the Force", mode: "vector" })
+      .set("Authorization", authHeader())
+    expect(after.status).to.equal(404)
+  })
+
   it("is idempotent: deleting an already-removed domain returns 204 (not 404)", async function () {
     // DOMAIN was deleted by the previous test.
     await agent()

@@ -50,6 +50,16 @@ pub struct SearchOutcome {
     pub served_commit: String,
 }
 
+/// Outcome of a `/similar` request — same staleness contract as `SearchOutcome`
+/// (#A): carries the commit actually served so the transport reports it via
+/// `TerminusDB-Data-Version` and never dresses a stale ancestor up as fresh.
+#[derive(Debug, Clone)]
+pub struct SimilarOutcome {
+    pub hits: Vec<SearchHit>,
+    /// The commit whose snapshot was actually searched (exact or proven ancestor).
+    pub served_commit: String,
+}
+
 impl std::fmt::Debug for SearchService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SearchService")
@@ -267,15 +277,19 @@ impl SearchService {
         let domain = Domain::from_resource_path(&rp);
         let domain_str = domain.as_str();
 
-        // Resolve the branch (default to "main").
-        let branch = "main";
+        // Use the branch carried by the domain graphspec, NOT a hardcoded "main"
+        // (#B): `/assign` on `org/db/local/branch/feature` must resolve the
+        // source tag on `feature`. Tag resolution is dataset-global, but the
+        // create side of `io_assign_commit` needs the owning branch for a
+        // non-main lineage.
+        let branch = extract_branch(&rp);
 
         // Pure tag-pointer assign: resolve source → tag target to the same
         // version. NO embedding, NO recompute (P3-ASSIGN-1). Fail loud if the
         // source commit is not indexed.
         match self
             .store
-            .io_assign_commit(domain_str, branch, source_commit, target_commit)
+            .io_assign_commit(domain_str, &branch, source_commit, target_commit)
             .await
         {
             Ok(_version) => Ok(()),
@@ -311,6 +325,7 @@ impl SearchService {
             &[],
             &[],
             false,
+            &[],
         )
         .await
     }
@@ -319,13 +334,19 @@ impl SearchService {
     /// commit actually SERVED (exact, or the nearest indexed ancestor under lag)
     /// so the transport reports staleness truthfully (RISK-15, P3-LAG-1).
     ///
-    /// Catch-up resolution (never blocks, never silently stale):
+    /// Catch-up resolution (never blocks, never silently stale, never leaks
+    /// newer-than-requested data):
     ///  1. Exact: requested commit is indexed → serve it.
-    ///  2. Lag: not indexed → serve the branch's durable last-indexed commit (the
-    ///     nearest indexed ancestor on a linear-per-branch history) and report it
-    ///     as the served commit (⇒ caller sees served ≠ requested = stale).
-    ///  3. None: branch has no indexed ancestor → `NotFound` (404), negatively
+    ///  2. Lag: not indexed → walk the TerminusDB-supplied `ancestors` window
+    ///     nearest-first; serve the FIRST indexed one (a PROVEN ancestor of the
+    ///     requested commit). Report it as served (served ≠ requested ⇒ stale).
+    ///     We NEVER serve the branch tip merely because it exists — only a
+    ///     commit proven to be an ancestor (BLOCKER-1 snapshot isolation).
+    ///  3. None: no indexed ancestor in the window → `NotFound` (404), negatively
     ///     cached per branch (TTL) so a repeat search doesn't re-walk history.
+    ///
+    /// `ancestors` is the nearest-first ancestor window (Spec 10 §5; last 10,
+    /// then up to 1000). Empty window + not-exact ⇒ no provable ancestor ⇒ 404.
     #[allow(clippy::too_many_arguments)]
     pub async fn search_with_options(
         &self,
@@ -338,6 +359,7 @@ impl SearchService {
         doc_type_filter: &[String],
         doc_id_filter: &[String],
         snippet: bool,
+        ancestors: &[String],
     ) -> Result<SearchOutcome, ServiceError> {
         let rp =
             parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
@@ -352,9 +374,12 @@ impl SearchService {
         let domain_str = domain.as_str().to_owned();
         let branch = extract_branch(&rp);
 
-        // Resolve the searchable commit via catch-up (exact → nearest ancestor → 404).
+        // Resolve the searchable commit via catch-up (exact → proven nearest
+        // ancestor in the supplied window → 404). Never serves newer data.
+        // Pass the already-parsed Domain through (#7 — no re-parse of the
+        // normalized string, no spurious 500 path).
         let served_commit = self
-            .resolve_searchable_commit(&domain_str, &branch, commit)
+            .resolve_searchable_commit(&domain, &branch, commit, ancestors)
             .await?;
 
         // Embed the query text.
@@ -407,67 +432,128 @@ impl SearchService {
     }
 
     /// Resolve the requested commit to the commit whose snapshot will actually
-    /// be searched (catch-up, RISK-15). Exact if indexed; else the branch's
-    /// durable last-indexed commit (nearest ancestor on linear-per-branch); else
-    /// `NotFound`, negatively cached per branch.
+    /// be searched (catch-up, RISK-15, BLOCKER-1). Exact if indexed; else the
+    /// nearest PROVEN ancestor in the supplied window; else `NotFound`.
     ///
-    /// Auto-enroll: any successful resolution marks the branch indexing-enabled,
-    /// so a descendant branch that resolves through an ancestor is enrolled on
-    /// first search (propagation; one explicit bootstrap per lineage).
+    /// SNAPSHOT ISOLATION (BLOCKER-1): we only ever serve a commit that is the
+    /// requested commit itself OR a member of the nearest-first `ancestors`
+    /// window TerminusDB supplied. We NEVER serve the branch tip just because it
+    /// is the latest indexed commit — that could be a DESCENDANT of an older
+    /// requested commit, leaking newer data the requested snapshot never had.
+    ///
+    /// Enablement gate (#5, Spec 10 §5 / RISK-22): a branch with NO indexed
+    /// lineage is 404'd and negatively cached BEFORE any ancestor walk. A branch
+    /// that resolves is marked enabled (auto-enroll propagation).
     async fn resolve_searchable_commit(
         &self,
-        domain: &str,
+        domain: &Domain,
         branch: &str,
         requested_commit: &str,
+        ancestors: &[String],
     ) -> Result<String, ServiceError> {
-        // 1. Exact match: the requested commit is itself indexed.
-        let exact = self
-            .store
-            .io_resolve_commit(domain, branch, requested_commit)
-            .await
-            .map_err(|e| ServiceError::Internal(e.to_string()))?;
-        if exact.is_some() {
-            self.branch_state.enable(domain, branch);
-            self.branch_state.invalidate_negative(domain, branch);
-            return Ok(requested_commit.to_owned());
-        }
+        let domain_str = domain.as_str();
 
-        // 2. Negative cache: a recent search already found no indexed ancestor.
-        if self.branch_state.is_negative_cached(domain, branch) {
+        // 1. Negative cache FIRST — short-circuit without any I/O. Correct
+        //    because the ONLY way a commit becomes indexed is via a push, and
+        //    the push path busts this branch's negative cache (direct
+        //    invalidation), so a freshly-indexed exact commit is never masked by
+        //    a stale negative entry. This preserves the cache's purpose: a 404'd
+        //    branch does not re-walk history (and does not re-list tags).
+        if self.branch_state.is_negative_cached(domain_str, branch) {
             return Err(ServiceError::NotFound(format!(
                 "no indexed ancestor for commit {} on branch {} (negatively cached)",
                 requested_commit, branch
             )));
         }
 
-        // 3. Lag: serve the branch's durable last-indexed commit (the nearest
-        //    indexed ancestor on a linear-per-branch history). TerminusDB owns
-        //    the DAG and pushes the missing delta on seeing served ≠ requested.
-        let last = self
+        // 2. Load the dataset-global commit→version map ONCE (fail-loud on a
+        //    real tag-list error; absent dataset → empty map). The
+        //    nearest-ancestor walk is then a pure, in-memory resolution.
+        let commit_versions = self
             .store
-            .last_indexed(
-                &Domain::from_resource_path(
-                    &parse_domain(domain).map_err(|e| ServiceError::Internal(e.to_string()))?,
-                ),
-                &BranchName::new(branch.to_owned()),
-            )
-            .await;
+            .io_list_commit_versions(domain_str)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
-        match last.commit {
-            Some(ancestor) => {
-                // Enroll the branch (auto-enroll on first resolved search).
-                self.branch_state.enable(domain, branch);
-                Ok(ancestor)
+        // 3. EXACT match: a directly-indexed commit is always serveable.
+        //    Busts any (now-stale) negative entry + enrolls.
+        if commit_versions.contains_key(requested_commit) {
+            self.branch_state.enable(domain_str, branch);
+            self.branch_state.invalidate_negative(domain_str, branch);
+            return Ok(requested_commit.to_owned());
+        }
+
+        // 4. Enablement gate (#5): a branch with NO indexed lineage at all →
+        //    404 + negative cache, before any ancestor walk. The durable
+        //    last-indexed commit (or the enabled set) is the lineage signal.
+        if !self.branch_has_indexed_lineage(domain, branch).await? {
+            self.branch_state.record_negative(domain_str, branch);
+            return Err(ServiceError::NotFound(format!(
+                "no indexed lineage for branch {} (commit {})",
+                branch, requested_commit
+            )));
+        }
+
+        // 5. Pure nearest-ancestor resolution over the SUPPLIED window only.
+        //    The resolver re-checks exact (already handled above; harmless),
+        //    then walks ancestors nearest-first, resolving each via the
+        //    in-memory map — no per-candidate I/O. We never consult the tip.
+        let resolved = crate::layeridx::resolve_nearest_layer(
+            requested_commit,
+            ancestors,
+            |c: String| {
+                let v = commit_versions.get(&c).copied();
+                std::future::ready(Ok(v))
+            },
+        )
+        .await
+        .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        match resolved {
+            crate::layeridx::ResolvedLayer::Exact { commit, .. } => {
+                self.branch_state.enable(domain_str, branch);
+                self.branch_state.invalidate_negative(domain_str, branch);
+                Ok(commit)
             }
-            None => {
-                // 4. No indexed ancestor at all → 404, negatively cached.
-                self.branch_state.record_negative(domain, branch);
+            crate::layeridx::ResolvedLayer::Ancestor { served_commit, .. } => {
+                // A PROVEN ancestor (member of the supplied window). Stale, but
+                // never newer than requested. Auto-enroll the branch.
+                self.branch_state.enable(domain_str, branch);
+                Ok(served_commit)
+            }
+            crate::layeridx::ResolvedLayer::None => {
+                // Requested not indexed and no SUPPLIED ancestor is indexed. We
+                // will NOT serve the tip (could be a descendant of the requested
+                // commit) — 404 + negative cache. TerminusDB nudges a push.
+                self.branch_state.record_negative(domain_str, branch);
                 Err(ServiceError::NotFound(format!(
-                    "no indexed ancestor for commit {} on branch {}",
+                    "no indexed ancestor for commit {} on branch {} within the supplied window",
                     requested_commit, branch
                 )))
             }
         }
+    }
+
+    /// Whether `branch` has any indexed lineage — the enablement signal for the
+    /// resolution gate (#5, Spec 10 §5). The in-memory `enabled` set is the fast
+    /// path (a branch is enabled on its first push / first resolved search); the
+    /// durable `last_indexed.commit` is the authoritative backstop that survives
+    /// a process restart (the `enabled` set is process-local). Reading
+    /// `is_enabled` here is what makes the enablement set load-bearing rather
+    /// than write-only.
+    async fn branch_has_indexed_lineage(
+        &self,
+        domain: &Domain,
+        branch: &str,
+    ) -> Result<bool, ServiceError> {
+        if self.branch_state.is_enabled(domain.as_str(), branch) {
+            return Ok(true);
+        }
+        let last = self
+            .store
+            .last_indexed(domain, &BranchName::new(branch.to_owned()))
+            .await;
+        Ok(last.commit.is_some())
     }
 
     /// Similar: look up doc by id → use its best embedding → vector search.
@@ -476,12 +562,16 @@ impl SearchService {
         domain_raw: &str,
         commit: &str,
         id: &str,
-    ) -> Result<Vec<SearchHit>, ServiceError> {
-        self.similar_with_options(domain_raw, commit, id, 0, 10, &[], false)
+    ) -> Result<SimilarOutcome, ServiceError> {
+        self.similar_with_options(domain_raw, commit, id, 0, 10, &[], false, &[])
             .await
     }
 
-    /// Similar with full options.
+    /// Similar with full options. Routes through the SAME catch-up resolution as
+    /// `/search` (#A): an un-indexed/lagging commit resolves to the nearest
+    /// PROVEN ancestor (never a descendant) and the served commit is returned so
+    /// the transport reports staleness via `TerminusDB-Data-Version`. A branch
+    /// with no indexed lineage → 404 (not a raw "commit not indexed" 500).
     #[allow(clippy::too_many_arguments)]
     pub async fn similar_with_options(
         &self,
@@ -492,7 +582,8 @@ impl SearchService {
         count: usize,
         doc_type_filter: &[String],
         snippet: bool,
-    ) -> Result<Vec<SearchHit>, ServiceError> {
+        ancestors: &[String],
+    ) -> Result<SimilarOutcome, ServiceError> {
         let rp =
             parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
 
@@ -505,6 +596,13 @@ impl SearchService {
         let domain = Domain::from_resource_path(&rp);
         let domain_str = domain.as_str().to_owned();
         let branch = extract_branch(&rp);
+
+        // Resolve the searchable commit via the SHARED catch-up path (#A) BEFORE
+        // any store read — exact, nearest proven ancestor, or 404. Never serves
+        // newer-than-requested data.
+        let served_commit = self
+            .resolve_searchable_commit(&domain, &branch, commit, ancestors)
+            .await?;
 
         // Look up the document's chunks (indexed lookup, not a scan).
         let doc_chunks = self
@@ -553,7 +651,7 @@ impl SearchService {
 
         let chunk_hits = self
             .store
-            .io_search(&domain_str, &branch, commit, &search_query)
+            .io_search(&domain_str, &branch, &served_commit, &search_query)
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
@@ -567,7 +665,10 @@ impl SearchService {
             .take(count)
             .collect();
 
-        Ok(paginated)
+        Ok(SimilarOutcome {
+            hits: paginated,
+            served_commit,
+        })
     }
 
     /// Duplicates: bounded near-duplicate detection.

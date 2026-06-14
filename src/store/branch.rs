@@ -38,6 +38,14 @@ pub async fn io_ensure_branch_forked(
         return Ok(BranchOutcome::AlreadyExists);
     }
 
+    // Hold the per-(domain, branch) pipeline lock across the whole
+    // check-existence → resolve-parent → create sequence (#4). Without it, two
+    // concurrent first-pushes to the same NEW branch can both observe "absent"
+    // and both call create — the loser would 500 on "already exists". Under the
+    // lock the sequence is atomic: the first creates, the second observes the
+    // branch and returns `AlreadyExists`.
+    let _lock = store.acquire_pipeline_lock(domain, branch).await;
+
     let existing = store.io_list_branches(domain).await?;
     if existing.iter().any(|b| b == branch) {
         return Ok(BranchOutcome::AlreadyExists);
@@ -55,11 +63,21 @@ pub async fn io_ensure_branch_forked(
             ))
         })?;
 
-    store
-        .io_create_branch(domain, branch, parent_version)
-        .await?;
+    // Create under the lock. Treat an "already exists" race as success
+    // (idempotent #4): even though we are lock-holder, a branch could have been
+    // created out-of-band; concurrent safety must not depend solely on our lock.
+    match store.io_create_branch(domain, branch, parent_version).await {
+        Ok(()) => Ok(BranchOutcome::Created { parent_version }),
+        Err(e) if is_already_exists(&e) => Ok(BranchOutcome::AlreadyExists),
+        Err(e) => Err(e),
+    }
+}
 
-    Ok(BranchOutcome::Created { parent_version })
+/// Whether a store error reports that the branch already exists — an idempotent
+/// success for branch-out (#4), never a hard failure.
+fn is_already_exists(e: &StoreError) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("already exists")
 }
 
 /// Result of a branch-out attempt.

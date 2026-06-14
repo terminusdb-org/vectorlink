@@ -412,6 +412,40 @@ mod tests {
         assert_eq!(resolved, ResolvedLayer::None);
     }
 
+    // --- BLOCKER-1: requesting an OLDER un-indexed commit must NOT resolve to a
+    //     NEWER indexed commit that is NOT in the ancestor window. The newer tip
+    //     `cNew` is indexed, but it is a DESCENDANT of the requested `cOld`, so
+    //     it is absent from cOld's ancestor window — resolution must be None,
+    //     never `cNew` (no snapshot-isolation leak). ---
+    #[tokio::test]
+    async fn nearest_layer_never_serves_newer_non_ancestor() {
+        // Only the NEWER commit is indexed. The requested OLDER commit's honest
+        // ancestor window contains only older roots (none indexed here).
+        let map = HashMap::from([("cNew".to_owned(), 42u64)]);
+        let ancestors = vec!["cOlderRoot".to_owned()];
+        let resolved = resolve_nearest_layer("cOld", &ancestors, map_resolver(map))
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved,
+            ResolvedLayer::None,
+            "must NOT serve the newer indexed tip for an older request — it is a descendant, not an ancestor"
+        );
+    }
+
+    // --- BLOCKER-1: with NO ancestor window, a non-exact commit cannot be
+    //     proven to descend from any indexed commit → None (the engine 404s
+    //     rather than serving the tip). ---
+    #[tokio::test]
+    async fn nearest_layer_empty_window_non_exact_is_none() {
+        let map = HashMap::from([("cIndexed".to_owned(), 7u64)]);
+        let ancestors: Vec<String> = vec![];
+        let resolved = resolve_nearest_layer("cUnknown", &ancestors, map_resolver(map))
+            .await
+            .unwrap();
+        assert_eq!(resolved, ResolvedLayer::None);
+    }
+
     // ───────────────────── per-branch state (P3-LIX-2) ─────────────────────
 
     // --- enabling one branch does NOT enable a sibling ---

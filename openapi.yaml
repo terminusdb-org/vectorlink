@@ -223,6 +223,7 @@ paths:
         - $ref: '#/components/parameters/Mode'
         - $ref: '#/components/parameters/DocType'
         - $ref: '#/components/parameters/DocId'
+        - $ref: '#/components/parameters/Ancestor'
         - $ref: '#/components/parameters/Snippet'
         - $ref: '#/components/parameters/ExpectedDataVersion'
       responses:
@@ -323,6 +324,7 @@ paths:
         - $ref: '#/components/parameters/Start'
         - $ref: '#/components/parameters/Count'
         - $ref: '#/components/parameters/DocType'
+        - $ref: '#/components/parameters/Ancestor'
         - $ref: '#/components/parameters/Snippet'
         - $ref: '#/components/parameters/ExpectedDataVersion'
       responses:
@@ -591,6 +593,27 @@ components:
         Restrict to these full document IRIs (doc_id IN (...)). Stated by repeating
         the parameter — `?doc_id=...&doc_id=...` — not comma-joined. (On POST,
         prefer the JSON `doc_id` array.)
+      schema:
+        type: array
+        items: { type: string }
+      style: form
+      explode: true
+    Ancestor:
+      name: ancestor
+      in: query
+      required: false
+      description: >
+        The nearest-first ancestor commit window for catch-up resolution. When the
+        requested `commit` is not yet indexed, the engine serves the FIRST commit
+        in this window that IS indexed — the nearest indexed ancestor — and reports
+        it via the `TerminusDB-Data-Version` response header (so the caller detects
+        staleness). The engine NEVER serves a commit that is not the requested one
+        or a member of this window, so it can never return a snapshot newer than
+        the one requested. Supplied by the caller (TerminusDB owns the DAG): the
+        last 10 ancestors first, then progressively up to 1000. Stated by repeating
+        the parameter — `?ancestor=c1&ancestor=c0` — nearest first. Absent + the
+        requested commit not indexed ⇒ no provable ancestor ⇒ 404. (On POST, prefer
+        the JSON `ancestors` array.)
       schema:
         type: array
         items: { type: string }
@@ -877,6 +900,16 @@ components:
           type: array
           items: { type: string }
           description: Restrict to these full document IRIs (IN).
+        ancestors:
+          type: array
+          items: { type: string }
+          description: >
+            Nearest-first ancestor commit window for catch-up resolution (see the
+            `ancestor` query parameter). When the requested `commit` is not yet
+            indexed, the engine serves the nearest indexed ancestor in THIS window
+            (reported via `TerminusDB-Data-Version`) and never a commit outside it
+            — so it cannot serve a snapshot newer than requested. Absent + the
+            requested commit not indexed ⇒ 404.
         snippet:
           type: boolean
           default: false

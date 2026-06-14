@@ -117,4 +117,31 @@ describe("P3 branching + assign (HTTP pipeline)", function () {
       .expect(200)
     expect(ids(tgt.body).sort()).to.deep.equal(ids(src.body).sort(), "assigned commit must search identically to source")
   })
+
+  it("#B: /assign on a branch-qualified domain resolves the source on THAT branch (not hardcoded main)", async function () {
+    // fc0 is indexed on the `feature` branch (from the branch-out test above),
+    // NOT on main. Assigning fc0 → fc_assigned with a branch-qualified domain
+    // must succeed — the prior bug hardcoded branch="main" and 404'd here even
+    // though fc0 IS indexed on feature.
+    const branchDomain = `${DOMAIN}/local/branch/feature`
+    await agent()
+      .post("/assign")
+      .query({ domain: branchDomain, source_commit: "fc0", target_commit: "fc_assigned" })
+      .set("Authorization", authHeader())
+      .expect(204)
+
+    // The assigned commit searches identically to fc0 on the feature branch.
+    const q = { q: "scavenger Jakku Force", mode: "vector", count: 10 }
+    const src = await agent()
+      .get("/search")
+      .query({ domain: branchDomain, commit: "fc0", ...q })
+      .set("Authorization", authHeader())
+      .expect(200)
+    const tgt = await agent()
+      .get("/search")
+      .query({ domain: branchDomain, commit: "fc_assigned", ...q })
+      .set("Authorization", authHeader())
+      .expect(200)
+    expect(ids(tgt.body).sort()).to.deep.equal(ids(src.body).sort(), "branch assign must search identically to source")
+  })
 })

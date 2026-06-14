@@ -197,6 +197,12 @@ async fn main() -> ExitCode {
     };
     let http_client = reqwest::Client::new();
 
+    // Acquire the per-(domain, branch) pipeline lock for the WHOLE
+    // load→tag→last-indexed sequence (#D). The push pipeline takes the same
+    // lock, so a concurrent `load` + `/push` on the same branch cannot
+    // interleave versions/tags and break snapshot isolation.
+    let _pipeline_lock = store.acquire_pipeline_lock(&args.domain, &args.branch).await;
+
     // Run the indexing pipeline.
     let mut indexed_count: u64 = 0;
     let mut skipped_count: u64 = 0;
@@ -281,9 +287,16 @@ async fn main() -> ExitCode {
         indexed_count, skipped_count, last_version
     );
 
+    // Non-zero exit on partial failure (#C) — CI/automation relies on this
+    // signal. (Previously returned 0, masking partial failures.)
+    exit_code_for(skipped_count)
+}
+
+/// Map a skipped-document count to a process exit code: any skip is a partial
+/// failure (non-zero), zero skips is success. Pure — unit-tested (#C).
+fn exit_code_for(skipped_count: u64) -> ExitCode {
     if skipped_count > 0 {
-        // Non-zero exit to signal partial failure (same as /push task with skipped).
-        ExitCode::from(0)
+        ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     }
@@ -348,4 +361,31 @@ async fn io_index_one(
         .io_upsert_chunks(domain, branch, doc_id, &rows)
         .await
         .map_err(|e| format!("upsert failed: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- #C: partial failure (skips > 0) must NOT signal success ---
+    #[test]
+    fn exit_code_nonzero_on_partial_failure() {
+        // ExitCode has no Eq; compare the documented mapping via Debug. SUCCESS
+        // for zero skips, FAILURE for any skip.
+        assert_eq!(
+            format!("{:?}", exit_code_for(0)),
+            format!("{:?}", ExitCode::SUCCESS),
+            "zero skips -> success"
+        );
+        assert_eq!(
+            format!("{:?}", exit_code_for(1)),
+            format!("{:?}", ExitCode::FAILURE),
+            "one skip -> failure (must not be SUCCESS)"
+        );
+        assert_eq!(
+            format!("{:?}", exit_code_for(99)),
+            format!("{:?}", ExitCode::FAILURE),
+            "many skips -> failure"
+        );
+    }
 }
