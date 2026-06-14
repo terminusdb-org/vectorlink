@@ -15,7 +15,7 @@
 # The image is then used by DOCKER_RUN in the Makefile for all cargo
 # operations (clippy, build, test).
 
-FROM rust:1-bookworm
+FROM rust:1-trixie
 
 # Install build-time system dependencies once, at image build time.
 # protoc + libprotobuf-dev: lance-encoding needs protoc + well-known .proto includes.

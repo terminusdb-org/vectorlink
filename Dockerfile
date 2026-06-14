@@ -1,14 +1,15 @@
+# syntax=docker/dockerfile:1
 # Multi-stage Dockerfile for tdb-search.
 #
-# Build stage: rust:1-bookworm with protobuf + future deps pre-installed.
-# Runtime stage: debian:bookworm-slim for minimal image size.
+# Build stage: rust:1-trixie with protobuf + future deps pre-installed.
+# Runtime stage: debian:trixie-slim for minimal image size.
 #
 # Build-time system deps (per BUILD-LEARNINGS.md):
 # - protobuf-compiler + libprotobuf-dev: required by lance-encoding (Phase 2+)
 # - g++ libssl-dev pkg-config: required by fastembed/ort (Phase 7)
 
 # ──────────────────────────── Build stage ──────────────────────────────────
-FROM rust:1-bookworm AS builder
+FROM rust:1-trixie AS builder
 
 # Install build-time system dependencies for Phase 2+ forward compatibility.
 # protoc + libprotobuf-dev: lance-encoding needs protoc + well-known .proto includes.
@@ -23,36 +24,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Cache dependency compilation by copying manifests first.
+# Copy manifests and full source.
 COPY Cargo.toml Cargo.lock* ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs \
-  && cargo build --release 2>/dev/null || true \
-  && rm -rf src
-
-# Copy full source and build for real.
 COPY src/ src/
-COPY spikes/tokenizer/tokenizer.json /build/tokenizer.json
-RUN cargo build --release
+COPY benches/ benches/
+COPY assets/tokenizer.json.bz2 /build/tokenizer.json.bz2
+
+# Build with BuildKit cache mounts for persistent cargo registry + target dir.
+# The cache survives across builds so incremental recompilation is fast (~seconds
+# for a source-only change vs ~10 min cold). The binary is copied OUT of the
+# cache mount in the same RUN (cache mounts are not part of the image layer).
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release && \
+    cp /build/target/release/tdb-search /build/tdb-search
 
 # ──────────────────────────── Runtime stage ────────────────────────────────
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
   && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/tdb-search /usr/local/bin/tdb-search
-COPY --from=builder /build/tokenizer.json /opt/tdb-search/tokenizer.json
-
-# Data directory for LanceDB datasets.
-RUN mkdir -p /data && chown 65534:65534 /data
+COPY --from=builder /build/tdb-search /usr/local/bin/tdb-search
+COPY --from=builder /build/tokenizer.json.bz2 /opt/tdb-search/tokenizer.json.bz2
 
 # Non-root user for security.
 RUN useradd -r -s /bin/false tdb-search
+
+# Data directory for LanceDB datasets (owned by tdb-search user).
+RUN mkdir -p /data && chown tdb-search:tdb-search /data
+
 USER tdb-search
 
-ENV TDB_SEARCH_TOKENIZER_PATH=/opt/tdb-search/tokenizer.json
+ENV TDB_SEARCH_TOKENIZER_PATH=/opt/tdb-search/tokenizer.json.bz2
 ENV TDB_SEARCH_DATA_DIR=/data
 
 EXPOSE 8080

@@ -3,12 +3,29 @@
 # Canonical deployment: terminusdb + tdb-search + embeddings (Ollama).
 # No external network dependency after the one-time model pull.
 # The embedding sidecar is Ollama serving nomic-embed-text-v2-moe (Q8_0 GGUF).
+#
+# TerminusDB build-from-source notes:
+#   The canonical path builds TerminusDB from the sibling submodule (../terminusdb/).
+#   This is a HEAVY build (SWI-Prolog + Rust/Cargo): ~15-30 min first time, ~5 min
+#   incremental. Requires >= 12 GB free Docker filesystem space. If the build OOMs
+#   or disk-fills: `docker builder prune` and ensure /mnt/lima-colima has >= 12 GB.
+#
+#   FALLBACK (pre-built image, for quick iteration when NOT modifying TerminusDB):
+#   Replace the `build:` block on the terminusdb service with:
+#     image: terminusdb/terminusdb-server:latest
+#     pull_policy: missing
 
 services:
   # TerminusDB — renders embedding text, pushes deltas to the indexer, fronts search.
+  # Built from source (../terminusdb submodule) so Phase 6 can modify internals.
   terminusdb:
-    image: terminusdb/terminusdb-server:latest
-    pull_policy: missing
+    build:
+      context: ../terminusdb
+      dockerfile: Dockerfile
+      args:
+        SKIP_TESTS: "true"
+        SWIPL_VERSION: "10.0.1"
+    image: terminusdb/terminusdb-server:local
     environment:
       - TERMINUSDB_SERVER_PORT=6363
       - "TERMINUSDB_ADMIN_PASS=${TERMINUSDB_ADMIN_PASS:-root}"
@@ -18,11 +35,11 @@ services:
     volumes:
       - terminusdb-storage:/app/terminusdb/storage
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:6363/api/info || exit 1"]
-      interval: 15s
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/6363 && echo -e \"GET /api/info HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3 && timeout 2 grep -q api:success <&3'"]
+      interval: 60s
       timeout: 5s
-      retries: 20
-      start_period: 60s
+      retries: 10
+      start_period: 10s
     restart: unless-stopped
 
   # Ollama embedding sidecar — serves nomic-embed-text-v2-moe via /v1/embeddings.
@@ -35,7 +52,7 @@ services:
     volumes:
       - ollama-models:/root/.ollama
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:11434/api/tags || exit 1"]
+      test: ["CMD", "ollama", "list"]
       interval: 10s
       timeout: 5s
       retries: 30
@@ -72,7 +89,7 @@ services:
       - TDB_SEARCH_MODEL=nomic-embed-v2
       - TDB_SEARCH_DIM=768
       - TDB_SEARCH_DATA_DIR=/data
-      - TDB_SEARCH_TOKENIZER_PATH=/opt/tdb-search/tokenizer.json
+      - TDB_SEARCH_TOKENIZER_PATH=/opt/tdb-search/tokenizer.json.bz2
     ports:
       - "127.0.0.1:8081:8080"
     volumes:
@@ -83,7 +100,7 @@ services:
       embeddings:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health/live || exit 1"]
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8080 && echo -e \"GET /health/live HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3 && timeout 2 grep -q 200 <&3'"]
       interval: 10s
       timeout: 5s
       retries: 10
