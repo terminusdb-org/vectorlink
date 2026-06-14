@@ -12,6 +12,7 @@ How to run tdb-search and use it as a standalone semantic search engine, driven 
 4. [Searching](./04-searching.md) — GET vs POST, the three modes, filters, pagination, distances.
 5. [History & branching](./05-history-and-branching.md) — per-commit snapshots, branch-out with block reuse, `/assign`, staleness.
 6. [Operations](./06-operations.md) — auth, health/readiness, statistics, configuration.
+7. [Complete example](./07-complete-example.md) — the full Star Wars lifecycle in `curl`: readiness → index → vector/FTS/hybrid/filter/similar searches → a second commit (Changed/Deleted) → statistics/assign/delete.
 
 ## The one-paragraph mental model
 

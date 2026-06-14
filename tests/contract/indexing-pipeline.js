@@ -189,44 +189,69 @@ describe("Indexing pipeline (real embeddings)", function () {
   })
 
   describe("GET /search — doc_type filter", function () {
-    it("filters results to only Species", async function () {
+    it("single doc_type filters results (contract form, no brackets)", async function () {
       const res = await agent()
         .get("/search")
-        .query({
-          domain: DOMAIN,
-          commit: "c0",
-          q: "strong beings",
-          mode: "vector",
-          "doc_type[]": "Species",
-        })
+        .query(`domain=${DOMAIN}&commit=c0&q=strong beings&mode=vector&doc_type=Species`)
         .set("Authorization", authHeader())
         .expect(200)
 
       expect(res.body).to.be.an("array")
+      expect(res.body.length).to.be.at.least(1, "expected at least one Species result")
       // All results should be Species type (Wookiee).
       for (const hit of res.body) {
-        expect(hit.id).to.include("Species")
+        expect(hit.id).to.include("Species", `expected Species doc, got ${hit.id}`)
+      }
+    })
+
+    it("repeated doc_type filters to multiple types (contract form)", async function () {
+      const res = await agent()
+        .get("/search")
+        .query(`domain=${DOMAIN}&commit=c0&q=galaxy&mode=vector&doc_type=Species&doc_type=Vehicles`)
+        .set("Authorization", authHeader())
+        .expect(200)
+
+      expect(res.body).to.be.an("array")
+      // All results must be either Species or Vehicles.
+      for (const hit of res.body) {
+        const isSpeciesOrVehicle = hit.id.includes("Species") || hit.id.includes("Vehicles")
+        expect(isSpeciesOrVehicle).to.equal(true,
+          `expected Species or Vehicles doc, got ${hit.id}`)
       }
     })
   })
 
   describe("GET /search — doc_id filter", function () {
-    it("filters results to specific document IDs", async function () {
+    it("single doc_id filters to that document (contract form, no brackets)", async function () {
       const res = await agent()
         .get("/search")
-        .query({
-          domain: DOMAIN,
-          commit: "c0",
-          q: "Jedi",
-          mode: "vector",
-          "doc_id[]": "terminusdb:///itest/People/yoda",
-        })
+        .query(`domain=${DOMAIN}&commit=c0&q=Jedi&mode=vector&doc_id=terminusdb:///itest/People/yoda`)
         .set("Authorization", authHeader())
         .expect(200)
 
       expect(res.body).to.be.an("array")
+      expect(res.body.length).to.be.at.least(1, "expected at least one result for yoda")
       for (const hit of res.body) {
         expect(hit.id).to.equal("terminusdb:///itest/People/yoda")
+      }
+    })
+
+    it("repeated doc_id filters to multiple documents (contract form)", async function () {
+      const res = await agent()
+        .get("/search")
+        .query(`domain=${DOMAIN}&commit=c0&q=Jedi&mode=vector&doc_id=terminusdb:///itest/People/yoda&doc_id=terminusdb:///itest/People/luke`)
+        .set("Authorization", authHeader())
+        .expect(200)
+
+      expect(res.body).to.be.an("array")
+      expect(res.body.length).to.be.at.least(1, "expected at least one result")
+      const allowedIds = [
+        "terminusdb:///itest/People/yoda",
+        "terminusdb:///itest/People/luke",
+      ]
+      for (const hit of res.body) {
+        expect(allowedIds).to.include(hit.id,
+          `expected yoda or luke, got ${hit.id}`)
       }
     })
   })
@@ -479,6 +504,32 @@ describe("Indexing pipeline (real embeddings)", function () {
 
       expect(res.body.commit).to.not.equal(null)
       expect(res.body.version).to.be.at.least(1)
+    })
+  })
+
+  describe("POST /push — duplicate commit rejection", function () {
+    it("re-pushing an already-indexed commit returns 409 immediately (no task spawned)", async function () {
+      // c0 was indexed in the before() hook. Re-pushing it must be rejected.
+      const body = JSON.stringify({ op: "Inserted", id: "terminusdb:///itest/People/test", string: "duplicate push test" })
+      const res = await agent()
+        .post("/push")
+        .query({ domain: DOMAIN, branch: BRANCH, target_commit: "c0" })
+        .set("Authorization", authHeader())
+        .set("Content-Type", "application/x-ndjson")
+        .send(body)
+      expect(res.status).to.equal(409, `expected 409 for duplicate commit, got ${res.status}: ${res.text}`)
+      // No task ID should be returned (it's a direct rejection, not a spawned task).
+      expect(res.text).to.not.match(/^task-/)
+    })
+
+    it("search at the original commit still works after rejected re-push", async function () {
+      const res = await agent()
+        .get("/search")
+        .query({ domain: DOMAIN, commit: "c0", q: "Jedi", mode: "vector" })
+        .set("Authorization", authHeader())
+        .expect(200)
+      expect(res.body).to.be.an("array")
+      expect(res.body.length).to.be.at.least(1, "original c0 snapshot must still be searchable")
     })
   })
 })

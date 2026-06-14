@@ -125,7 +125,10 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '409':
-          description: A push for this (domain, branch) is already in progress (concurrency guard).
+          description: >
+            Conflict. Either (a) a push for this (domain, branch) is already in
+            progress (concurrency guard), or (b) the target_commit is already
+            indexed — re-indexing an immutable commit is always an error.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -312,7 +315,8 @@ paths:
       description: >
         Looks up the document's vector(s) by id, then runs a vector search. Same
         response shape and staleness header as `/search`; paginates with `start`
-        and `count`.
+        and `count`. Supports `doc_type` and `doc_id` filters to scope the
+        candidate pool (e.g. "similar within these specific documents").
       parameters:
         - $ref: '#/components/parameters/Domain'
         - $ref: '#/components/parameters/Commit'
@@ -324,12 +328,64 @@ paths:
         - $ref: '#/components/parameters/Start'
         - $ref: '#/components/parameters/Count'
         - $ref: '#/components/parameters/DocType'
+        - $ref: '#/components/parameters/DocId'
         - $ref: '#/components/parameters/Ancestor'
         - $ref: '#/components/parameters/Snippet'
         - $ref: '#/components/parameters/ExpectedDataVersion'
       responses:
         '200':
           description: Ranked neighbours (same shape/header as /search).
+          headers:
+            TerminusDB-Data-Version: { $ref: '#/components/headers/DataVersion' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResults' }
+        '400':
+          description: The id is not present in the index, or a param is invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NoIndexedLineage' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
+    post:
+      tags: [search]
+      operationId: similarPost
+      summary: POST variant of /similar for large candidate pools.
+      description: >
+        Same semantics as GET /similar but accepts parameters in the JSON body.
+        Preferred when `doc_id` candidate pools are large (dozens+) and would
+        overflow a GET URL. Body values override same-named query parameters
+        (same precedence as POST /search).
+      parameters:
+        - $ref: '#/components/parameters/Domain'
+        - $ref: '#/components/parameters/Commit'
+        - name: id
+          in: query
+          required: false
+          description: Full document IRI (body.id takes precedence).
+          schema: { type: string }
+        - $ref: '#/components/parameters/Start'
+        - $ref: '#/components/parameters/Count'
+        - $ref: '#/components/parameters/Snippet'
+        - $ref: '#/components/parameters/ExpectedDataVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SimilarRequest' }
+            examples:
+              candidatePool:
+                summary: Similarity scoped to a candidate pool
+                value:
+                  domain: admin/star_wars
+                  commit: c1
+                  id: "terminusdb:///star-wars/People/1"
+                  doc_id: ["terminusdb:///star-wars/People/20", "terminusdb:///star-wars/People/30"]
+                  doc_type: ["People"]
+      responses:
+        '200':
+          description: Ranked neighbours within the candidate pool.
           headers:
             TerminusDB-Data-Version: { $ref: '#/components/headers/DataVersion' }
           content:
@@ -910,6 +966,56 @@ components:
             (reported via `TerminusDB-Data-Version`) and never a commit outside it
             — so it cannot serve a snapshot newer than requested. Absent + the
             requested commit not indexed ⇒ 404.
+        snippet:
+          type: boolean
+          default: false
+          description: Include the matched chunk's text as `chunk.snippet` in each hit.
+
+    SimilarRequest:
+      type: object
+      description: >
+        POST /similar body. Every field may also be supplied as a query parameter;
+        when a field is present here it wins and the same-named query parameter is
+        discarded (not merged). `domain`, `commit` and `id` must be present here
+        or in the query. Use this when the candidate pool (`doc_id`) is large.
+      properties:
+        domain:
+          type: string
+          description: >
+            The database to address as a graphspec; repo defaults to `local`
+            (e.g. `org/db` → `org/db/local/branch/main`). See the Domain parameter.
+          example: admin/star_wars
+        commit:
+          type: string
+          description: Opaque commit hash — the searched snapshot.
+        id:
+          type: string
+          description: Full document IRI to find neighbours of.
+          example: "terminusdb:///star-wars/People/1"
+        start:
+          type: integer
+          minimum: 0
+          default: 0
+          description: Zero-based offset of the first result to return (pagination).
+        count:
+          type: integer
+          minimum: 1
+          default: 10
+          description: Max results to return (pagination page size).
+        doc_type:
+          type: array
+          items: { type: string }
+          description: Restrict to these document types (IN).
+        doc_id:
+          type: array
+          items: { type: string }
+          description: Restrict to these full document IRIs — the candidate pool (IN).
+        ancestors:
+          type: array
+          items: { type: string }
+          description: >
+            Nearest-first ancestor commit window for catch-up resolution (same as
+            /search POST).
         snippet:
           type: boolean
           default: false

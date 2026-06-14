@@ -151,6 +151,22 @@ impl SearchService {
         let branch = branch_raw.to_owned();
         let commit = target_commit.to_owned();
 
+        // GUARD: reject an already-indexed commit immediately (409 Conflict).
+        // A commit is immutable; re-indexing would be redundant at best and risks
+        // re-tagging an immutable snapshot to a different version (correctness hazard).
+        // On a brand-new domain/branch, io_resolve_commit returns Ok(None) → proceed.
+        let already_indexed = self
+            .store
+            .io_resolve_commit(&domain_str, &branch, &commit)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+        if already_indexed.is_some() {
+            return Err(ServiceError::Conflict(format!(
+                "commit {} already indexed",
+                commit
+            )));
+        }
+
         // Branch-out: if a parent commit is supplied and the target branch does
         // not yet exist, fork it from the parent's indexed version (block reuse).
         // A push to "main" or to an existing branch skips this (no-op). Fail loud
@@ -563,7 +579,7 @@ impl SearchService {
         commit: &str,
         id: &str,
     ) -> Result<SimilarOutcome, ServiceError> {
-        self.similar_with_options(domain_raw, commit, id, 0, 10, &[], false, &[])
+        self.similar_with_options(domain_raw, commit, id, 0, 10, &[], &[], false, &[])
             .await
     }
 
@@ -581,6 +597,7 @@ impl SearchService {
         start: usize,
         count: usize,
         doc_type_filter: &[String],
+        doc_id_filter: &[String],
         snippet: bool,
         ancestors: &[String],
     ) -> Result<SimilarOutcome, ServiceError> {
@@ -645,7 +662,7 @@ impl SearchService {
             start,
             count: count + 1, // Over-fetch to exclude self.
             doc_type_filter: doc_type_filter.to_vec(),
-            doc_id_filter: Vec::new(),
+            doc_id_filter: doc_id_filter.to_vec(),
             snippet,
         };
 

@@ -12,6 +12,7 @@ describe("P1-AUTH: Admin secret gate", function () {
     { method: "get", path: "/search", query: { domain: "admin/db", commit: "c1", q: "test" } },
     { method: "post", path: "/search", query: {}, body: { domain: "admin/db", commit: "c1", q: "test" } },
     { method: "get", path: "/similar", query: { domain: "admin/db", commit: "c1", id: "x" } },
+    { method: "post", path: "/similar", query: {}, body: { domain: "admin/db", commit: "c1", id: "x" } },
     { method: "get", path: "/duplicates", query: { domain: "admin/db", commit: "c1" } },
     { method: "get", path: "/statistics", query: {} },
     { method: "get", path: "/check", query: { task_id: "fake" } },

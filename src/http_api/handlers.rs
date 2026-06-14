@@ -60,13 +60,11 @@ pub struct SearchGetParams {
     pub start: Option<i64>,
     pub count: Option<i64>,
     pub mode: Option<String>,
-    pub doc_type: Option<Vec<String>>,
-    pub doc_id: Option<Vec<String>>,
     pub snippet: Option<bool>,
-    // NOTE: the repeated `ancestor` query param is NOT declared here. axum's
-    // `Query` (serde_urlencoded) cannot deserialize repeated keys into a `Vec`
-    // and would 400 the whole request. It is read from the raw query string via
-    // `extract_repeated_param(.., "ancestor")` instead (same as doc_type/doc_id).
+    // NOTE: repeated/multi-value query params (ancestor, doc_type, doc_id) are
+    // NOT declared here. axum's `Query` (serde_urlencoded) cannot deserialize
+    // repeated keys into a `Vec` and would 400 the whole request. They are read
+    // from the raw query string via `extract_repeated_param` instead.
 }
 
 #[allow(dead_code)]
@@ -77,9 +75,9 @@ pub struct SimilarParams {
     pub id: Option<String>,
     pub start: Option<i64>,
     pub count: Option<i64>,
-    pub doc_type: Option<Vec<String>>,
     pub snippet: Option<bool>,
-    // Repeated `ancestor` param read from the raw query (see SearchGetParams).
+    // Repeated params (ancestor, doc_type) read from raw query via
+    // `extract_repeated_param` (see SearchGetParams note).
 }
 
 #[allow(dead_code)]
@@ -107,6 +105,20 @@ pub struct SearchRequestBody {
     pub snippet: Option<bool>,
     /// Nearest-first ancestor window supplied by TerminusDB (Spec 10 §5) — drives
     /// catch-up resolution. Body value wins over the query param, like other fields.
+    pub ancestors: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SimilarRequestBody {
+    pub domain: Option<String>,
+    pub commit: Option<String>,
+    pub id: Option<String>,
+    pub start: Option<i64>,
+    pub count: Option<i64>,
+    pub doc_type: Option<Vec<String>>,
+    pub doc_id: Option<Vec<String>>,
+    pub snippet: Option<bool>,
+    /// Nearest-first ancestor window (same as /search POST).
     pub ancestors: Option<Vec<String>>,
 }
 
@@ -607,6 +619,7 @@ async fn handle_similar(
     let start = params.start.unwrap_or(0).max(0) as usize;
     let count = params.count.unwrap_or(10).max(1) as usize;
     let doc_type_filter = extract_repeated_param(raw_query.as_deref(), "doc_type");
+    let doc_id_filter = extract_repeated_param(raw_query.as_deref(), "doc_id");
     let ancestors = extract_repeated_param(raw_query.as_deref(), "ancestor");
     let snippet = params.snippet.unwrap_or(false);
 
@@ -622,6 +635,74 @@ async fn handle_similar(
             start,
             count,
             &doc_type_filter,
+            &doc_id_filter,
+            snippet,
+            &ancestors,
+        )
+        .await
+    {
+        Ok(outcome) => response_with_served_commit(outcome.hits, &outcome.served_commit),
+        Err(e) => service_error_to_response(e),
+    }
+}
+
+async fn handle_similar_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<SimilarParams>,
+    Json(body): Json<SimilarRequestBody>,
+) -> Response {
+    if let Err(r) = validate_data_version_header(&headers) {
+        return r;
+    }
+
+    // Body takes precedence over query params (same contract as POST /search).
+    let domain = body.domain.or(params.domain).unwrap_or_default();
+    let commit = body.commit.or(params.commit).unwrap_or_default();
+    let id = body.id.or(params.id).unwrap_or_default();
+    let start = body.start.or(params.start);
+    let count = body.count.or(params.count);
+
+    if domain.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "missing required parameter: domain".to_owned(),
+        );
+    }
+    if commit.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "missing required parameter: commit".to_owned(),
+        );
+    }
+    if id.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "missing required parameter: id".to_owned(),
+        );
+    }
+
+    if let Err(r) = validate_pagination(start, count) {
+        return r;
+    }
+
+    let start_val = start.unwrap_or(0).max(0) as usize;
+    let count_val = count.unwrap_or(10).max(1) as usize;
+    let doc_type_filter = body.doc_type.unwrap_or_default();
+    let doc_id_filter = body.doc_id.unwrap_or_default();
+    let snippet = body.snippet.unwrap_or(false);
+    let ancestors = body.ancestors.unwrap_or_default();
+
+    match state
+        .service
+        .similar_with_options(
+            &domain,
+            &commit,
+            &id,
+            start_val,
+            count_val,
+            &doc_type_filter,
+            &doc_id_filter,
             snippet,
             &ancestors,
         )
@@ -740,7 +821,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/check", get(handle_check))
         .route("/assign", post(handle_assign))
         .route("/search", get(handle_search_get).post(handle_search_post))
-        .route("/similar", get(handle_similar))
+        .route("/similar", get(handle_similar).post(handle_similar_post))
         .route("/duplicates", get(handle_duplicates))
         .route("/statistics", get(handle_statistics))
         .route("/domain", delete(handle_delete_domain))
