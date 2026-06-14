@@ -1,0 +1,16 @@
+{
+  "name": "tdb-search-bench-entity-resolution",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Entity-resolution accuracy benchmark for the tdb-search vector engine (Leipzig ER datasets, starting with Abt-Buy).",
+  "type": "commonjs",
+  "scripts": {
+    "fetch:abt-buy": "node src/fetch.js abt-buy",
+    "load:abt-buy": "node src/load.js abt-buy",
+    "verify:abt-buy": "node src/verify.js abt-buy",
+    "bench:abt-buy": "node src/bench.js abt-buy"
+  },
+  "dependencies": {
+    "handlebars": "^4.7.7"
+  }
+}

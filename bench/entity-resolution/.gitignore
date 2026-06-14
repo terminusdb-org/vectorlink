@@ -1,0 +1,8 @@
+# Raw benchmark datasets are NOT committed — fetched on demand from the
+# Leipzig ER benchmark page (see README "Fetch the data"). Re-fetchable, large,
+# and not ours to redistribute.
+data/
+
+# Local handlebars install (see README "Dependencies"). The dependency is
+# declared in package.json; node_modules is environment-local, not committed.
+node_modules/
