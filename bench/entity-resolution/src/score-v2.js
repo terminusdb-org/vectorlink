@@ -1,52 +1,53 @@
 "use strict";
 
 // Pure v2 scoring (spec §8) — PAIR-BASED entity-resolution evaluation against the
-// perfect mapping. This is the standard ER metric and the one the perfect-pairs
-// file defines: compare the SET of predicted (Abt, Buy) pairs to the SET of
-// ground-truth pairs.
+// perfect mapping. See docs/abt-buy-evaluation-methodology.md for the full
+// methodology.
+//
+// The standard ER metric: compare the SET of predicted (Abt, Buy) pairs to the
+// SET of ground-truth pairs.
 //
 //   truth     = abt_buy_perfectMapping.csv as Map<abtId, Set<buyId>>; the total
-//               number of TRUE PAIRS is Σ |truth(abt)| (the 1097 perfect pairs,
-//               many-to-one: most Abt map to one Buy, a few to several).
-//   predicted = the UNIQUE (abtId, buyId) pairs the algorithm output. A pair
-//               emitted twice (e.g. by both grounding and assignment, or as two
-//               mutual edges) is counted ONCE — no double-counting.
+//               number of TRUE PAIRS is Σ |truth(abt)| (the 1097 perfect pairs).
+//   predicted = the COMMITTED prediction set P — one pair per source Abt at most.
+//               The resolver guarantees this contract (see resolve.js invariant).
 //
-//   TP        = |predicted ∩ truth-pairs|
-//   precision = TP / |predicted|                 (of what we predicted, how much is right)
-//   recall    = TP / |truth-pairs|               (of the true pairs, how many we found)
+//   TP        = |P ∩ G|        (predicted pairs that are in the gold set)
+//   FP        = |P \ G|        (predicted pairs not in gold)
+//   FN        = |G \ P|        (gold pairs not predicted)
+//   precision = TP / (TP + FP) = TP / |P|
+//   recall    = TP / (TP + FN) = TP / |G|
 //   F1        = 2·P·R / (P + R)
 //
 // Every denominator is a PAIR count on the SAME pair universe — precision and
-// recall are consistent (no mixing pair-precision with id-recall), and a pair is
-// never counted more than once.
+// recall are consistent, and the F1 is meaningful and comparable across modes.
 //
 // False positives on UNMAPPED Abt: a predicted pair whose Abt has NO ground-truth
 // mapping is a genuine FALSE POSITIVE — the dataset asserts that Abt as a real
 // record, and the perfect mapping says it matches nothing, so predicting a pair
-// for it is wrong. The HEADLINE precision (`overall`) therefore counts EVERY
-// unique predicted pair in its denominator and such a pair as incorrect (it
-// lowers precision; it is not invisible). This is the sound pair-based metric.
+// for it is wrong. The HEADLINE precision counts EVERY predicted pair in its
+// denominator and such a pair as incorrect (it lowers precision; it is not
+// invisible). This is the sound pair-based metric.
 //
 // We ALSO expose a `mappedOnly` view that excludes unmapped-Abt predictions —
 // the v1-comparable universe (v1 scored only mapped queries) — for apples-to-
-// apples comparison with the 83% baseline. Use `overall` as the truth; use
-// `mappedOnly` only when comparing against v1.
+// apples comparison with the 83% baseline.
 
 function pairKey(abtId, buyId) {
   return `${abtId}::${buyId}`;
 }
 
-// Total ground-truth pairs (Σ set sizes) — the recall denominator.
+// Total ground-truth pairs (Σ set sizes) — the recall denominator |G|.
 function totalTruePairs(truth) {
   let total = 0;
   for (const set of truth.values()) total += set.size;
   return total;
 }
 
-// Unique predicted pairs (deduplicated). Each retains its nearest distance and a
-// stage; if the same pair came from two stages we keep "grounded" (the
-// higher-confidence origin) and the lower distance. Pure.
+// Deduplicate predicted pairs by (abtId, buyId) key. With the corrected resolver
+// (one-per-Abt), this is a safety net — it should produce the same array back.
+// Retained for defensive correctness: if the same pair were somehow emitted twice
+// (e.g. through a future code path), it must not be double-counted. Pure.
 function uniquePairs(groups) {
   const byKey = new Map();
   for (const g of groups) {
@@ -77,17 +78,17 @@ function precisionOf(pairs, truth) {
   return { correct, total, fraction: total === 0 ? 0 : correct / total };
 }
 
-// Headline precision (the sound pair-based metric): EVERY unique predicted pair
-// is in the denominator; a pair on an unmapped Abt is a false positive (wrong).
+// Headline precision: EVERY predicted pair is in the denominator; a pair on an
+// unmapped Abt is a false positive (wrong). This is P = TP / |P|.
 function precisionAll(pairs, truth) {
   const correct = pairs.reduce((acc, p) => acc + (isCorrect(p, truth) ? 1 : 0), 0);
   const total = pairs.length;
   return { correct, total, fraction: total === 0 ? 0 : correct / total };
 }
 
-// Collapse each Abt's predicted pairs to its SINGLE nearest Buy — the
-// one-Buy-per-Abt view directly comparable to v1's precision@1 (one pick per
-// Abt). Pure.
+// Collapse each Abt's predicted pairs to its SINGLE nearest Buy. With the
+// corrected resolver this is a no-op (resolver already guarantees one-per-Abt).
+// Retained as a safety net and for backward-compatible access to the view. Pure.
 function bestPerAbt(pairs) {
   const best = new Map();
   for (const p of pairs) {
@@ -103,24 +104,22 @@ function f1(precisionFraction, recallFraction) {
 }
 
 // results.groups: Array<{ abtId, buyId, distance, stage }>
+// The resolver guarantees at most one pair per Abt (the committed prediction set P).
 function scoreV2(groups, truth) {
-  // 1. Deduplicate the predicted pairs FIRST — this is the fix for the
-  //    double-counting: the totals below are over UNIQUE pairs.
+  // 1. Deduplicate (safety net — resolver already guarantees one-per-Abt).
   const predicted = uniquePairs(groups);
   const grounded = predicted.filter((p) => p.stage === "grounded");
   const assigned = predicted.filter((p) => p.stage === "assigned");
 
   const truePairCount = totalTruePairs(truth);
 
-  // 2. HEADLINE precision over ALL unique predicted pairs — an unmapped-Abt pair
-  //    is a false positive (counts against precision, not excluded).
+  // 2. HEADLINE precision over the committed prediction set P.
+  //    An unmapped-Abt pair is a false positive (counts against precision).
   const overall = precisionAll(predicted, truth);
   //    Mapped-only view (v1-comparable): excludes unmapped-Abt predictions.
   const mappedOnly = precisionOf(predicted, truth);
 
-  // 3. Recall against the PERFECT-PAIRS denominator: TP / total true pairs.
-  //    TP = unique predicted pairs that are in the truth set (a correct pair's
-  //    Abt is necessarily mapped, so overall.correct === mappedOnly.correct).
+  // 3. Recall: TP / |G| (gold pairs found / total gold pairs).
   const truePositives = overall.correct;
   const recall = {
     hits: truePositives,
@@ -128,22 +127,19 @@ function scoreV2(groups, truth) {
     fraction: truePairCount === 0 ? 0 : truePositives / truePairCount,
   };
 
+  // 4. Headline F1 — the single comparable metric across all modes.
+  //    Precision denominator = |P| (committed pairs, one-per-Abt).
+  //    Recall denominator = |G| (1097 gold pairs).
+  //    Both are pair-based with consistent universes.
   const headlineF1 = f1(overall.fraction, recall.fraction);
 
-  // 4. Per-stage precision (over unique pairs) — measures each refinement.
+  // 5. Per-stage precision — measures each refinement's contribution.
   const groundedScore = precisionOf(grounded, truth);
   const assignedScore = precisionOf(assigned, truth);
 
-  // 5. One-Buy-per-Abt view (comparable to v1 precision@1).
-  const best = bestPerAbt(predicted);
-  const bestScore = precisionOf(best, truth);
-  const mappedAbtIds = [...truth.keys()];
-  const bestRecall = {
-    // Of mapped Abt, how many had their single best pick land on a truth pair.
-    hits: bestScore.correct,
-    total: mappedAbtIds.length,
-    fraction: mappedAbtIds.length === 0 ? 0 : bestScore.correct / mappedAbtIds.length,
-  };
+  // 6. False-positive and false-negative counts for clarity.
+  const falsePositives = predicted.length - truePositives;
+  const falseNegatives = truePairCount - truePositives;
 
   const wrongExamples = predicted
     .filter((p) => truth.has(p.abtId) && !isCorrect(p, truth))
@@ -157,16 +153,19 @@ function scoreV2(groups, truth) {
     f1: headlineF1,
     grounded: groundedScore,
     assigned: assignedScore,
-    bestPerAbt: bestScore,
-    bestRecall,
+    // bestPerAbt retained for backward compat — now identical to overall since
+    // the resolver guarantees one-per-Abt.
+    bestPerAbt: precisionOf(bestPerAbt(predicted), truth),
     counts: {
       predictedPairsRaw: groups.length,
       predictedPairsUnique: predicted.length,
       groundedPairs: grounded.length,
       assignedPairs: assigned.length,
       truePairs: truePairCount,
-      mappedAbt: mappedAbtIds.length,
+      mappedAbt: [...truth.keys()].length,
       truePositives,
+      falsePositives,
+      falseNegatives,
     },
     wrongExamples,
   };

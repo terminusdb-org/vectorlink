@@ -261,26 +261,24 @@ function printScorecard(ds, config, result, score, timings) {
   lines.push(`k (fan-out)        : ${config.k}`);
   lines.push(`threshold τ        : ${config.threshold}`);
   lines.push(`max component size : ${config.maxComponentSize}`);
-  lines.push(`grounding strategy : mutual top-K membership (refinement C)`);
+  lines.push(`grounding strategy : mutual top-K nearest (one committed pair per Abt)`);
   lines.push(`assignment strategy: ${s.assignment}${s.assignment === "per-source" ? " (argmin Buy per Abt; Buy non-exclusive — many-to-one correct)" : " (per-component Hungarian 1:1; greedy fallback on runaway — for 1:1 truth)"}`);
   lines.push("--- candidate graph ---");
   lines.push(`edges (≤ τ)        : ${s.edgeCount}`);
-  lines.push("--- predicted pairs (deduplicated — no double-counting) ---");
-  lines.push(`predicted pairs    : ${score.counts.predictedPairsUnique} unique (${score.counts.predictedPairsRaw} raw, ${score.counts.predictedPairsRaw - score.counts.predictedPairsUnique} dupes collapsed)`);
-  lines.push(`true pairs (truth) : ${score.counts.truePairs} (perfectMapping)`);
-  lines.push(`true positives     : ${score.counts.truePositives}`);
-  lines.push("--- decisions (grounded Step 4 vs assigned Step 5; unique pairs) ---");
+  lines.push("--- committed prediction set P (one pair per Abt; §8.2 methodology) ---");
+  lines.push(`|P| predicted      : ${score.counts.predictedPairsUnique}`);
+  lines.push(`|G| gold pairs     : ${score.counts.truePairs} (perfectMapping)`);
+  lines.push("--- decisions (grounded Step 4 vs assigned Step 5) ---");
   lines.push(`grounded pairs     : ${score.counts.groundedPairs}   precision ${pct(score.grounded.fraction)} (${score.grounded.correct}/${score.grounded.total})`);
   lines.push(`assigned pairs     : ${score.counts.assignedPairs}   precision ${pct(score.assigned.fraction)} (${score.assigned.correct}/${score.assigned.total})`);
   lines.push(`unmatched Abt      : ${s.unmatchedCount}`);
-  lines.push("--- PAIR-BASED accuracy vs perfect pairs (consistent denominators) ---");
-  lines.push(`precision          : ${pct(score.overall.fraction)} (TP ${score.counts.truePositives} / ALL predicted ${score.overall.total}; unmapped-Abt pairs ARE false positives)`);
-  lines.push(`precision (mapped) : ${pct(score.mappedOnly.fraction)} (${score.mappedOnly.correct}/${score.mappedOnly.total}; v1-comparable, excludes unmapped-Abt)`);
-  lines.push(`recall             : ${pct(score.recall.fraction)} (TP ${score.counts.truePositives} / true pairs ${score.recall.total})`);
+  lines.push("--- HEADLINE: pair-based F1 (comparable across all modes) ---");
+  lines.push(`precision          : ${pct(score.overall.fraction)} (TP ${score.counts.truePositives} / |P| ${score.overall.total})`);
+  lines.push(`recall             : ${pct(score.recall.fraction)} (TP ${score.counts.truePositives} / |G| ${score.recall.total})`);
   lines.push(`F1                 : ${pct(score.f1)}`);
-  lines.push("--- one-Buy-per-Abt view (comparable to v1 precision@1) ---");
-  lines.push(`best-pick precision: ${pct(score.bestPerAbt.fraction)} (${score.bestPerAbt.correct}/${score.bestPerAbt.total} Abt with a pick)`);
-  lines.push(`best-pick coverage : ${pct(score.bestRecall.fraction)} (${score.bestRecall.hits}/${score.bestRecall.total} mapped Abt correct)`);
+  lines.push(`TP / FP / FN       : ${score.counts.truePositives} / ${score.counts.falsePositives} / ${score.counts.falseNegatives}`);
+  lines.push("--- detail ---");
+  lines.push(`precision (mapped) : ${pct(score.mappedOnly.fraction)} (${score.mappedOnly.correct}/${score.mappedOnly.total}; v1-comparable, excludes unmapped-Abt)`);
   lines.push("--- §6 performance contract ---");
   lines.push(`components         : ${s.componentCount}`);
   lines.push(`max component      : ${s.maxComponentObserved} (guard cap ${config.maxComponentSize})`);
@@ -290,7 +288,7 @@ function printScorecard(ds, config, result, score, timings) {
   lines.push("--- wall-clock ---");
   lines.push(`candidate gather   : ${timings.gatherMs.toFixed(0)} ms (mode=${config.mode})${timings.gatherFromCache ? " [REPLAYED from cache — NOT measured this run]" : ""}`);
   lines.push(`resolve total      : ${timings.resolveMs.toFixed(0)} ms`);
-  lines.push("--- example wrong pairs (predicted, scoreable, up to 8) ---");
+  lines.push("--- example wrong pairs (up to 8) ---");
   for (const w of score.wrongExamples) {
     lines.push(`  Abt ${w.abtId} -> Buy ${w.predictedBuy} [${w.stage}]  truth=[${w.truth.join(",")}]`);
   }

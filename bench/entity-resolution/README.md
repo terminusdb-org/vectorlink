@@ -193,12 +193,25 @@ Given each record's top-K cross-catalogue neighbours in **both** directions
 4. **Mutual top-K grounding** — accept directly every pair mutually within the
    other's top-K (`b ∈ topK(a)` **and** `a ∈ topK(b)`). Near-linear; resolves the
    confident majority and removes those nodes before the only expensive step.
-5. **Per-cluster optimal assignment** — the residual fragments into small
-   independent **connected components**; within **each component** run the
-   **minimum-cost bipartite (Hungarian)** assignment (`src/hungarian.js`), never a
-   global N×M matrix. A **runaway-component guard** caps component size and falls
-   back to greedy within an oversized component (logged), so a pathological knot
-   can never hang the run.
+5. **Assign the residual** (`--assignment`, default `per-source`):
+   - **`per-source` (DEFAULT — correct for this many-to-one truth).** The Abt-Buy
+     ground truth is **many-to-one**: an Abt maps to exactly **one** Buy, but a Buy
+     may match **several** Abt. The Buy side is therefore **non-exclusive** — there
+     is no contention for Buys, so each ungrounded Abt simply takes its **nearest
+     (argmin distance) ≤τ Buy**, and a Buy may be shared by several Abt. Ties break
+     to the lower Buy id (deterministic). This is both the optimal and the trivially
+     correct solution when targets are non-exclusive.
+   - **`optimal` (gated, for a 1:1 truth model).** Per-component **minimum-cost
+     bipartite (Hungarian)** assignment (`src/hungarian.js`), confined to small
+     **connected components** (never a global N×M matrix), with a **runaway-component
+     guard** that falls back to greedy on an oversized component (logged). This is
+     correct **only when both sides are exclusive** (1:1 truth) — spec §5's "an early
+     greedy pick steals the best target" argument assumes Buy exclusivity. Under the
+     Abt-Buy many-to-one truth it would **force one-Buy-per-Abt and drop legitimate
+     shared-Buy matches** (a recall loss), so it is NOT the default here. Kept
+     available for future 1:1 datasets (refinement D: "don't force 1:1 if the truth
+     isn't"; confirmed empirically — 3 Abt → 1 Buy yields 3 pairs under per-source, 1
+     under optimal).
 6. **Leave the rest unmatched** — abstain rather than force a least-bad pair.
 
 **Performance contract (§6):** the residual fragments into independent **connected

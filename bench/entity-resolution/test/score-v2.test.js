@@ -98,6 +98,9 @@ test("perfect prediction -> precision 1, recall 1, F1 1", () => {
 
 test("over-grounding many Buy per Abt: precision drops, bestPerAbt recovers the p@1 view", () => {
   // a1 grounded to its truth b1 AND two wrong Buy — the over-grounding case.
+  // NOTE: the corrected resolver no longer produces this output (it emits one per
+  // Abt). This test validates the scorer handles such input gracefully as a safety
+  // net — the bestPerAbt view still recovers the correct precision@1.
   const groups = [
     { abtId: "a1", buyId: "b1", distance: 0.10, stage: "grounded" }, // correct, nearest
     { abtId: "a1", buyId: "bX", distance: 0.30, stage: "grounded" }, // wrong
@@ -107,4 +110,25 @@ test("over-grounding many Buy per Abt: precision drops, bestPerAbt recovers the 
   assert.equal(s.overall.fraction, 1 / 3); // 1 correct of 3 predicted pairs
   // bestPerAbt collapses a1 to its nearest (b1, correct) -> 1/1.
   assert.equal(s.bestPerAbt.fraction, 1);
+});
+
+test("committed one-per-Abt output: TP/FP/FN counts are correct and F1 is meaningful", () => {
+  // Simulate the corrected resolver output: exactly one pair per Abt.
+  // a1->b1 (correct), a2->b9 (wrong — truth is a2->b2). a3 unmatched (FN).
+  const groups = [
+    { abtId: "a1", buyId: "b1", distance: 0.1, stage: "grounded" },
+    { abtId: "a2", buyId: "b9", distance: 0.3, stage: "assigned" },
+  ];
+  const s = scoreV2(groups, truth);
+  // |P|=2, |G|=3, TP=1, FP=1, FN=2
+  assert.equal(s.counts.predictedPairsUnique, 2);
+  assert.equal(s.counts.truePositives, 1);
+  assert.equal(s.counts.falsePositives, 1);
+  assert.equal(s.counts.falseNegatives, 2);
+  // precision = 1/2, recall = 1/3
+  assert.equal(s.overall.fraction, 0.5);
+  assert.equal(s.recall.fraction, 1 / 3);
+  // F1 = 2*(0.5*0.333)/(0.5+0.333) = 0.4
+  const expectedF1 = 2 * 0.5 * (1 / 3) / (0.5 + 1 / 3);
+  assert.ok(Math.abs(s.f1 - expectedF1) < 1e-10, "headline F1 is the standard harmonic mean");
 });

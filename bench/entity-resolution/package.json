@@ -14,6 +14,7 @@
     "bench:v2:search": "node src/bench-v2.js --mode search abt-buy-v2",
     "bench:v2:duplicates": "node src/bench-v2.js --mode duplicates abt-buy-v2",
     "bench:v2:similar": "node src/bench-v2.js --mode similar abt-buy-v2",
+    "bench:v2:similar:reload": "node src/bench-v2.js --mode similar --reload abt-buy-v2",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
