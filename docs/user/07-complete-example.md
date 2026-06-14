@@ -61,7 +61,7 @@ And capture the task id straight from the push as TASK. Use `@file.ndjson` to re
 ```bash
 TASK=$(curl -fsS -u "$CRED" -X POST \
   -H "Content-Type: application/x-ndjson" \
-  "$URL/push?domain=admin/star_wars&branch=main&target_commit=c2" \
+  "$URL/push?domain=admin/star_wars&branch=main&target_commit=c1" \
   --data-binary $'
 {"op":"Inserted","id":"terminusdb:///star-wars/People/luke","string":"The person\'s name is Luke Skywalker. A Jedi Knight from Tatooine, son of Anakin, trained by Yoda and Obi-Wan to use the light side of the Force."}
 {"op":"Inserted","id":"terminusdb:///star-wars/People/vader","string":"The person\'s name is Darth Vader. A Sith Lord consumed by the dark side of the Force, once the Jedi Anakin Skywalker, now enforcer of the Galactic Empire."}
