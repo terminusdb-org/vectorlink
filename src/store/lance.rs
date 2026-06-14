@@ -414,6 +414,18 @@ impl LanceStore {
     /// session (with their own file readers), so this is the FD-pressure entry
     /// point we minimise (BUG-FD24). Callers that can reuse a cached handle MUST
     /// do so via `io_open_dataset_readonly` instead.
+    ///
+    /// INVARIANT (poka-yoke): every `Dataset::open` in this module goes through
+    /// `io_open_fresh` (it is the ONLY counted fresh-open constructor). A bare
+    /// `Dataset::open` is FORBIDDEN — it bypasses `fresh_open_count` and so HIDES
+    /// the open from the FD-leak regression guard
+    /// (`search_does_not_leak_file_descriptors_under_load`), which is exactly how
+    /// the BUG-FD24 hot-path leak went unnoticed. Read paths that can reuse a
+    /// cached handle must NOT open at all (clone the cached `Dataset` +
+    /// `checkout_*` off it — that shares object_store + session, no new FDs). The
+    /// only non-open dataset constructor is `Dataset::write` (create path), which
+    /// is a distinct semantic (it makes a new empty dataset, not a re-open of an
+    /// existing one) and is the single deliberate exception.
     async fn io_open_fresh(&self, uri: &str) -> Result<Dataset, StoreError> {
         self.fresh_open_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -608,11 +620,10 @@ impl LanceStore {
         let path = self.dataset_path(domain);
         let uri = path.to_string_lossy().to_string();
 
-        // Try to open existing dataset.
+        // Try to open existing dataset (counted — even a cache-miss open is
+        // funnelled through `io_open_fresh` so it is visible to the FD guard).
         let ds = if path.exists() {
-            Dataset::open(&uri)
-                .await
-                .map_err(|e| StoreError::Internal(format!("failed to open dataset: {}", e)))?
+            self.io_open_fresh(&uri).await?
         } else {
             // Create a new empty dataset with the schema.
             let schema = self.chunk_schema();
@@ -667,9 +678,9 @@ impl LanceStore {
         }
 
         let uri = path.to_string_lossy().to_string();
-        let ds = Dataset::open(&uri)
-            .await
-            .map_err(|e| StoreError::Internal(format!("failed to open dataset: {}", e)))?;
+        // Counted fresh open (cache miss). Once cached, subsequent reads reuse the
+        // handle and never re-open (BUG-FD24).
+        let ds = self.io_open_fresh(&uri).await?;
 
         let arc_ds = Arc::new(RwLock::new(ds));
         let mut datasets = self.datasets.write().await;
@@ -699,9 +710,12 @@ impl LanceStore {
     ) -> Result<Dataset, StoreError> {
         let path = self.dataset_path(domain);
         let uri = path.to_string_lossy().to_string();
-        let ds = Dataset::open(&uri)
-            .await
-            .map_err(|e| StoreError::Internal(format!("failed to open dataset for write: {}", e)))?;
+        // Write path: a fresh branch-bound handle is intentional (it must not
+        // share the cached main handle), but it is still counted via `io_open_fresh`
+        // so the open is VISIBLE to the FD guard. Write opens are one-shot per
+        // mutation (not a hot read loop), so the count growth is bounded and
+        // expected.
+        let ds = self.io_open_fresh(&uri).await?;
 
         if branch == MAIN_BRANCH {
             // Native default branch — writes already target it.
@@ -724,9 +738,8 @@ impl LanceStore {
             return Ok(Vec::new());
         }
         let uri = path.to_string_lossy().to_string();
-        let ds = Dataset::open(&uri)
-            .await
-            .map_err(|e| StoreError::Internal(format!("open for list_branches failed: {}", e)))?;
+        // Counted fresh open (administrative/branch-listing path, not a hot loop).
+        let ds = self.io_open_fresh(&uri).await?;
         let branches = ds
             .list_branches()
             .await
@@ -766,9 +779,8 @@ impl LanceStore {
             )));
         }
         let uri = path.to_string_lossy().to_string();
-        let mut ds = Dataset::open(&uri)
-            .await
-            .map_err(|e| StoreError::Internal(format!("open for create_branch failed: {}", e)))?;
+        // Counted fresh open (one-shot branch-create path, not a hot loop).
+        let mut ds = self.io_open_fresh(&uri).await?;
 
         ds.create_branch(branch, from_version, None)
             .await
@@ -796,9 +808,8 @@ impl LanceStore {
             return Ok(std::collections::HashSet::new());
         }
         let uri = path.to_string_lossy().to_string();
-        let ds = Dataset::open(&uri)
-            .await
-            .map_err(|e| StoreError::Internal(format!("open for data-file paths failed: {}", e)))?;
+        // Counted fresh open (block-reuse proof / diagnostic path, not a hot loop).
+        let ds = self.io_open_fresh(&uri).await?;
         let ds = if branch == MAIN_BRANCH {
             ds
         } else {
@@ -836,9 +847,11 @@ impl LanceStore {
             return Ok(None);
         }
         let uri = path.to_string_lossy().to_string();
-        let ds = Dataset::open(&uri)
-            .await
-            .map_err(|e| StoreError::Internal(format!("uncached open failed: {}", e)))?;
+        // Counted fresh open. This is deliberately uncached (the background
+        // optimize worker must not hold the cached handle's write lock), but it is
+        // still funnelled through `io_open_fresh` so it is VISIBLE to the FD guard.
+        // It runs once per optimize cycle, not per query.
+        let ds = self.io_open_fresh(&uri).await?;
 
         if branch == MAIN_BRANCH {
             return Ok(Some(ds));
@@ -869,9 +882,10 @@ impl LanceStore {
             return Ok(());
         }
         let uri = path.to_string_lossy().to_string();
-        let ds = Dataset::open(&uri)
-            .await
-            .map_err(|e| StoreError::Internal(format!("refresh open failed: {}", e)))?;
+        // Counted fresh open. Invalidate-on-write re-opens at the default branch
+        // head so subsequent cached reads see the new version/tags; routed through
+        // `io_open_fresh` so even this write-side re-open is VISIBLE to the FD guard.
+        let ds = self.io_open_fresh(&uri).await?;
 
         let arc_ds = Arc::new(RwLock::new(ds));
         let mut datasets = self.datasets.write().await;
@@ -1627,42 +1641,46 @@ impl LanceStore {
     /// INVARIANT: uses a filter on the doc_id column (indexed), NOT a full scan.
     /// Layout A: reads the BRANCH head (checked out), not the cached main handle —
     /// so a lookup on a feature branch sees the branch's data, not main's.
+    ///
+    /// FD (BUG-FD24): BOTH the main and the non-main paths read off the CACHED
+    /// domain handle. The non-main path clones the cached `Dataset` (shares its
+    /// object_store + session via `Arc`) and `checkout_branch` off the clone —
+    /// `checkout_by_ref` REUSES that object_store + session, so it opens NO fresh
+    /// file descriptors. It must NOT `Dataset::open` per call (which would spin up
+    /// a new object_store + session and leak the index reader FDs under repeated
+    /// `/similar`/lookup load on a feature branch — the same leak class as the
+    /// `io_search` non-main path, which uses this exact pattern).
     pub async fn io_lookup_doc_chunks(
         &self,
         domain: &str,
         branch: &str,
         doc_id: &str,
     ) -> Result<Vec<ChunkHit>, StoreError> {
-        // Read the branch head. For main, the cached handle is the default
-        // branch; for a feature branch, check out a branch-bound handle.
-        let path = self.dataset_path(domain);
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let owned_ds;
-        let ds: &Dataset = if branch == MAIN_BRANCH {
-            // READ-ONLY (BLOCKER-2): never resurrect a deleted domain on lookup.
-            // The `path.exists()` guard above means we only reach here when the
-            // dataset exists, but use the non-creating open for defence in depth.
-            let ds_arc = match self.io_open_dataset_readonly(domain).await? {
-                Some(ds) => ds,
-                None => return Ok(Vec::new()),
-            };
-            let guard = ds_arc.read().await;
-            // Read+collect under the guard, then return early — simplest correct path.
-            return Self::scan_doc_chunks(&guard, doc_id).await;
-        } else {
-            let uri = path.to_string_lossy().to_string();
-            let base = Dataset::open(&uri)
-                .await
-                .map_err(|e| StoreError::Internal(format!("lookup open failed: {}", e)))?;
-            owned_ds = base.checkout_branch(branch).await.map_err(|e| {
-                StoreError::Internal(format!("lookup checkout '{}' failed: {}", branch, e))
-            })?;
-            &owned_ds
+        // READ-ONLY (BLOCKER-2): never resurrect a deleted domain on lookup. An
+        // absent dataset has no chunks for any doc.
+        let cached = match self.io_open_dataset_readonly(domain).await? {
+            Some(ds) => ds,
+            None => return Ok(Vec::new()),
         };
 
-        Self::scan_doc_chunks(ds, doc_id).await
+        if branch == MAIN_BRANCH {
+            // Main = the cached default-branch handle; scan under the read guard.
+            let guard = cached.read().await;
+            return Self::scan_doc_chunks(&guard, doc_id).await;
+        }
+
+        // Non-main: clone the cached handle (shares object_store + session via Arc)
+        // and check out the branch off the clone — NO fresh `Dataset::open`, so no
+        // FD pressure (mirrors `io_snapshot_from_cache`'s non-main path).
+        let base = {
+            let guard = cached.read().await;
+            guard.clone()
+        };
+        let branch_ds = base.checkout_branch(branch).await.map_err(|e| {
+            StoreError::Internal(format!("lookup checkout '{}' failed: {}", branch, e))
+        })?;
+
+        Self::scan_doc_chunks(&branch_ds, doc_id).await
     }
 
     /// Scan a dataset handle for all chunks of `doc_id` (filter on indexed column).
@@ -4137,6 +4155,152 @@ mod tests {
         );
     }
 
+    // --- BUG-FD24 (FIX 1): the NON-MAIN branch path of `io_lookup_doc_chunks`
+    //     (the `/similar` doc-chunk lookup on a feature branch) did a raw
+    //     `Dataset::open` per call — a fresh object_store + session whose vector-
+    //     index reader files leak FDs under repeated lookup load, the SAME leak
+    //     class the committed `io_search` non-main fix already closed. The main
+    //     path was already cached; only the feature-branch path leaked.
+    //
+    //     This test indexes a feature branch with a real ANN index, then issues
+    //     many feature-branch lookups and asserts BOTH (a) reads perform no fresh
+    //     `Dataset::open` per call and (b) the process open-FD count stays FLAT.
+    //     RED against the raw `Dataset::open` (opens == lookups, FDs climb); GREEN
+    //     once the lookup clones the cached handle and checks the branch out off it
+    //     (shared object_store + session — no new FDs).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn similar_lookup_on_feature_branch_does_not_leak_file_descriptors_under_load() {
+        let dim = 16;
+        let config = VectorIndexConfig {
+            num_partitions: 4,
+            num_sub_vectors: 8,
+            nprobes: 4,
+            refine_factor: Some(10),
+        };
+        let (mut store, _tmp) = make_test_store(dim);
+        store.set_vector_index_config(config.clone());
+        let domain = "admin/fdbranch";
+        let branch = "feature";
+
+        // Seed main with one 300-chunk doc (above the 256 IVF_PQ training floor),
+        // then fork a feature branch from that version and add the same doc on the
+        // branch so the feature-branch lookup has chunks to return.
+        let corpus = 300usize;
+        let rows: Vec<ChunkRow> = (0..corpus)
+            .map(|i| ChunkRow {
+                doc_id: "doc/corpus".to_owned(),
+                doc_type: "Doc".to_owned(),
+                chunk_index: i as i32,
+                chunk_count: corpus as i32,
+                chunk_token_start: i as i32,
+                doc_token_len: corpus as i32,
+                embedding: fake_embedding(dim, 1.0 + i as f32),
+                content: format!("chunk content number {} lorem ipsum dolor", i),
+            })
+            .collect();
+        let main_version = store
+            .io_upsert_chunks(domain, "main", "doc/corpus", &rows)
+            .await
+            .expect("upsert corpus on main");
+
+        // Fork the feature branch from main's indexed version, then write on it.
+        store
+            .io_create_branch(domain, branch, main_version)
+            .await
+            .expect("create feature branch");
+        store
+            .io_upsert_chunks(domain, branch, "doc/corpus", &rows)
+            .await
+            .expect("upsert corpus on feature branch");
+
+        // Build the vector (ANN) index on the feature-branch head — the leaked FDs
+        // are its reader files. Open a branch-bound handle to index it, then refresh
+        // the cache so the cached clone the lookup reuses carries the index.
+        {
+            let mut branch_ds = store
+                .io_open_dataset_uncached(domain, branch)
+                .await
+                .expect("open feature branch for index build")
+                .expect("feature branch dataset exists");
+            crate::store::vector_index::io_ensure_vector_index(&mut branch_ds, &config)
+                .await
+                .expect("ensure vector index on feature branch");
+        }
+        store
+            .io_refresh_cached_dataset(domain, branch)
+            .await
+            .expect("refresh cache after feature-branch index build");
+
+        // Warm up: the first lookup populates/loads the cached handle + index reader
+        // once. Baselines are measured AFTER warm-up (steady-state to steady-state).
+        store
+            .io_lookup_doc_chunks(domain, branch, "doc/corpus")
+            .await
+            .expect("warmup lookup");
+        let baseline_fds = open_fd_count();
+        let baseline_opens = store.fresh_open_count();
+
+        // Sustained CONCURRENT feature-branch lookups (matches `/similar` load).
+        let load_iterations = 400usize;
+        let concurrency = 8usize;
+        let store = std::sync::Arc::new(store);
+        for _ in 0..(load_iterations / concurrency) {
+            let mut handles = Vec::with_capacity(concurrency);
+            for _ in 0..concurrency {
+                let s = std::sync::Arc::clone(&store);
+                handles.push(tokio::spawn(async move {
+                    s.io_lookup_doc_chunks(domain, branch, "doc/corpus").await
+                }));
+            }
+            for h in handles {
+                let hits = h
+                    .await
+                    .expect("lookup task join")
+                    .expect("feature-branch lookup must succeed (no FD exhaustion)");
+                assert!(!hits.is_empty(), "feature-branch lookup must return the doc's chunks");
+            }
+        }
+        let after_fds = open_fd_count();
+        let opens_added = store.fresh_open_count() - baseline_opens;
+        eprintln!(
+            "[fd-branch-lookup] lookups={} fresh_opens_added={} fds(baseline={}, after={}, delta={})",
+            load_iterations,
+            opens_added,
+            baseline_fds,
+            after_fds,
+            after_fds as i64 - baseline_fds as i64
+        );
+
+        // PRIMARY: feature-branch lookups must NOT open a fresh dataset per call —
+        // they must clone the cached handle and checkout the branch off it (shared
+        // object_store + session). A fresh open per lookup leaks the ANN index
+        // reader FDs (BUG-FD24, the non-main `io_search` fix's leak class).
+        assert!(
+            opens_added < (load_iterations as u64) / 4,
+            "feature-branch lookup opened a fresh dataset per call ({} fresh opens across {} \
+             lookups). The non-main lookup path must reuse the cached domain handle and \
+             checkout_branch off a clone, not Dataset::open fresh every call (BUG-FD24).",
+            opens_added,
+            load_iterations
+        );
+
+        // SECONDARY: open FD count must stay FLAT under load (a per-call fresh open
+        // would climb the index reader FDs unbounded). Slack covers runtime churn
+        // only — it must NOT scale with the number of lookups.
+        let slack = 64;
+        assert!(
+            after_fds <= baseline_fds + slack,
+            "open FD count grew under feature-branch lookup load (baseline={}, after {} \
+             lookups={}, slack={}). The non-main lookup is leaking the ANN index reader FDs \
+             per call — it must reuse the cached handle so the readers are bounded (BUG-FD24).",
+            baseline_fds,
+            load_iterations,
+            after_fds,
+            slack
+        );
+    }
+
     /// Build a real ANN-indexed corpus of MANY MULTI-CHUNK documents with planted
     /// near-duplicate pairs, then tag a commit. Returns (store, domain, commit).
     ///
@@ -4461,6 +4625,111 @@ mod tests {
             "duplicates scan opened {} fresh dataset(s) — it must reuse the cached \
              handle (checkout off the cached Arc), never Dataset::open (BUG-FD24)",
             after - before
+        );
+    }
+
+    /// SCALE-BLOCKING FD LEAK (the entity-resolution bench, real 2173-point
+    /// corpus): the duplicates scan's PER-POINT `nearest()` loop leaked file
+    /// descriptors live — open-FD climbed 20→226 over the scan, then aborted ("too
+    /// many open files"), even though the snapshot handle is the cached one (no
+    /// fresh `Dataset::open`). The per-point ANN query MUST keep the open-FD count
+    /// FLAT (bounded) across the whole N-point scan — the index/prefilter readers
+    /// each query opens must be released, not accumulated.
+    ///
+    /// This guards the ANN path directly: a real IVF_PQ-indexed corpus, the
+    /// CROSS-SET scope the bench exercises (set=Abt target=Buy, snippet on), one
+    /// warm-up scan to load the index reader once, then a full scan asserting the
+    /// process open-FD count stays bounded. Mirrors
+    /// `search_does_not_leak_file_descriptors_under_load`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn duplicate_scan_does_not_leak_file_descriptors_at_scale() {
+        let dim = 16;
+        // 60 families × 5 docs × 4 chunks = 1200 indexed points (Abt set = 600) —
+        // above the 256-row IVF_PQ training floor and large enough that a per-point
+        // FD leak would climb well past the default soft limit.
+        let families = 60;
+        let docs_per_family = 5;
+        let chunks_per_doc = 4;
+        let (store, domain, commit) = build_duplicate_corpus(
+            dim,
+            families,
+            docs_per_family,
+            chunks_per_doc,
+            |_fam, d| if d % 2 == 0 { "Abt".to_owned() } else { "Buy".to_owned() },
+        )
+        .await;
+
+        // Cross-set scope (set=Abt, target=Buy) — mirrors the bench that found the
+        // leak. snippet=true projects `content`, matching the bench's projection.
+        let scope = DuplicateScope {
+            set_doc_types: vec!["Abt".to_owned()],
+            set_doc_ids: vec![],
+            target_doc_types: vec!["Buy".to_owned()],
+            target_doc_ids: vec![],
+        };
+
+        // Warm up: one scan loads/caches the index reader once. Measure the baseline
+        // AFTER warm-up so we compare steady-state to steady-state.
+        store
+            .io_duplicate_groups(
+                domain, "main", &commit, 1.0, &scope, true,
+                DEFAULT_DUPLICATE_MAX_POINTS,
+            )
+            .await
+            .expect("warmup duplicate scan");
+
+        let baseline_fds = open_fd_count();
+        let baseline_opens = store.fresh_open_count();
+
+        // A second full cross-set ANN scan over the 600 Abt set points.
+        let groups = store
+            .io_duplicate_groups(
+                domain, "main", &commit, 1.0, &scope, true,
+                DEFAULT_DUPLICATE_MAX_POINTS,
+            )
+            .await
+            .expect("scaled duplicate scan must succeed (no FD exhaustion)");
+
+        let after_fds = open_fd_count();
+        let opens_added = store.fresh_open_count() - baseline_opens;
+        let points = families * docs_per_family * chunks_per_doc / 2;
+        eprintln!(
+            "[fd-dup] points={} groups={} fresh_opens_added={} fds(baseline={}, after={}, delta={})",
+            points,
+            groups.len(),
+            opens_added,
+            baseline_fds,
+            after_fds,
+            after_fds as i64 - baseline_fds as i64
+        );
+
+        // Correctness must be unchanged.
+        assert!(
+            !groups.is_empty(),
+            "duplicate scan returned no groups — the FD fix must not change correctness"
+        );
+
+        // The scan must reuse the cached snapshot handle (no fresh Dataset::open per
+        // point) AND keep the open FD count FLAT across the N-point ANN loop. Slack
+        // covers runtime/allocator/scheduler churn only — it must NOT scale with N.
+        assert_eq!(
+            opens_added, 0,
+            "duplicates scan opened {} fresh dataset(s) across the per-point loop — it must \
+             reuse the cached snapshot handle (BUG-FD24)",
+            opens_added
+        );
+        let slack = 64;
+        assert!(
+            after_fds <= baseline_fds + slack,
+            "open FD count grew across a {}-point duplicates ANN scan (baseline={}, after={}, \
+             slack={}). The per-point `nearest()` queries are leaking their vector-index \
+             reader FDs (BUG-FD24 family) — each per-point query's readers must be released \
+             so FDs stay bounded regardless of point count.",
+            points,
+            baseline_fds,
+            after_fds,
+            slack
         );
     }
 }
