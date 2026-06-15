@@ -11,7 +11,7 @@ use tokenizers::Tokenizer;
 
 use crate::chunk::{self, ChunkParams};
 use crate::config::Config;
-use crate::embed::{self, EmbeddingRole, Provider};
+use crate::embed::{self, EmbedResult, EmbeddingRole, Provider};
 use crate::ingest;
 use crate::kernel::distance::l2_normalize;
 use crate::kernel::error::ServiceError;
@@ -237,6 +237,7 @@ impl SearchService {
         let chunk_params = self.chunk_params.clone();
         let provider = self.config.embed_provider.clone();
         let http_client = self.http_client.clone();
+        let embed_batch_size = self.config.embed_batch_size;
         let task_id_clone = task_id.clone();
 
         // Spawn the indexing pipeline as a background task.
@@ -255,6 +256,7 @@ impl SearchService {
                 http_client: &http_client,
                 domain: &domain_str,
                 branch: &branch,
+                embed_batch_size,
             };
             let result = io_run_index_pipeline(&ctx, &commit, operations).await;
 
@@ -1083,16 +1085,26 @@ struct PipelineCtx<'a> {
     http_client: &'a reqwest::Client,
     domain: &'a str,
     branch: &'a str,
+    /// Cross-document embedding batch size (from Config, env-configurable).
+    embed_batch_size: usize,
 }
 
-/// Run the push pipeline for a set of operations (Phase 6A: one-push-one-fragment).
+/// Run the push pipeline for a set of operations (Phase 6A: one-push-one-fragment +
+/// cross-document embedding batching).
 /// Returns (indexed_count, skipped_docs) on success, or error message on failure.
 ///
 /// Architecture:
-///   COLLECT phase (per-doc, IO only for embedding):
-///     For each operation: chunk → embed → build ChunkRows, OR accumulate into
-///     delete_only_ids / skipped. Per-doc failure isolation: a poisoned doc skips
-///     only itself.
+///   COLLECT phase (cross-document batched embedding):
+///     A. Chunk all Insert/Changed docs (pure, no IO). Record errors per doc.
+///     B. Flatten all chunk texts into ONE ordered list with a mapping back to
+///        (doc_index, chunk_index). Accumulate Deleted doc_ids separately.
+///     C. Batch-embed: split the flat text list into batches of embed_batch_size,
+///        call io_embed per batch via io_embed_batched. Per-doc failure isolation:
+///        if a batch fails, retry individually; only the toxic text(s) are marked
+///        Failed — the rest succeed.
+///     D. Scatter embeddings back: for each doc, check all its chunk embeddings
+///        succeeded. If any failed, skip that doc entirely. Otherwise L2-normalise
+///        and build ChunkRows.
 ///   WRITE phase (batched, under pipeline lock):
 ///     1. Acquire per-(domain, branch) pipeline lock
 ///     2. io_batch_delete_append: two-version delete-then-append for all
@@ -1120,48 +1132,71 @@ async fn io_run_index_pipeline(
     commit: &str,
     operations: Vec<Operation>,
 ) -> Result<(u64, Vec<SkippedDoc>), String> {
-    // ─── COLLECT phase (per-doc, IO only for embedding) ─────────────────────
-    // Accumulate all rows for Insert/Changed, all doc_ids to delete (Changed +
-    // Deleted), and skip+record failures per doc. io_embed is per-doc (Step 3 batches).
+    // ─── COLLECT phase A: chunk all docs (pure, no IO) ──────────────────────
+    // Separate operations into:
+    //   - docs_to_embed: Vec<DocToEmbed> for Insert/Changed (chunked, ready for embed)
+    //   - delete_ids: doc_ids for Changed + Deleted (old chunks to remove)
+    //   - skipped: docs that failed chunking or Operation::Error
     //
     // Changed semantics: the old chunks for a Changed doc MUST be deleted before
     // inserting the replacement rows. A doc that shrinks from 5 chunks to 1 chunk
     // must not leave orphan chunks (chunk_index 1-4) behind. The delete_ids set
     // covers both Changed (replacement) and Deleted (pure removal) doc_ids.
-    let mut all_rows: Vec<ChunkRow> = Vec::new();
+
+    struct DocToEmbed {
+        id: String,
+        chunks: Vec<chunk::Chunk>,
+        is_changed: bool,
+    }
+
+    let mut docs_to_embed: Vec<DocToEmbed> = Vec::new();
     let mut delete_ids: Vec<String> = Vec::new();
     let mut skipped: Vec<SkippedDoc> = Vec::new();
-    let mut indexed_count: u64 = 0;
 
     for op in &operations {
         match op {
             Operation::Inserted { id, string } => {
-                match io_index_document_pure(ctx, id, string).await {
-                    Ok(mut rows) => {
-                        all_rows.append(&mut rows);
-                        indexed_count += 1;
+                match chunk::chunk_text(ctx.tokenizer, string, ctx.chunk_params) {
+                    Ok(chunks) if chunks.is_empty() => {
+                        skipped.push(SkippedDoc {
+                            id: id.clone(),
+                            message: "chunking produced zero chunks".to_owned(),
+                        });
+                    }
+                    Ok(chunks) => {
+                        docs_to_embed.push(DocToEmbed {
+                            id: id.clone(),
+                            chunks,
+                            is_changed: false,
+                        });
                     }
                     Err(e) => {
                         skipped.push(SkippedDoc {
                             id: id.clone(),
-                            message: e,
+                            message: format!("chunking failed: {}", e),
                         });
                     }
                 }
             }
             Operation::Changed { id, string } => {
-                match io_index_document_pure(ctx, id, string).await {
-                    Ok(mut rows) => {
-                        // Changed: delete ALL old chunks first (handles shrinking chunk count),
-                        // then insert replacement rows via the append.
-                        delete_ids.push(id.clone());
-                        all_rows.append(&mut rows);
-                        indexed_count += 1;
+                match chunk::chunk_text(ctx.tokenizer, string, ctx.chunk_params) {
+                    Ok(chunks) if chunks.is_empty() => {
+                        skipped.push(SkippedDoc {
+                            id: id.clone(),
+                            message: "chunking produced zero chunks".to_owned(),
+                        });
+                    }
+                    Ok(chunks) => {
+                        docs_to_embed.push(DocToEmbed {
+                            id: id.clone(),
+                            chunks,
+                            is_changed: true,
+                        });
                     }
                     Err(e) => {
                         skipped.push(SkippedDoc {
                             id: id.clone(),
-                            message: e,
+                            message: format!("chunking failed: {}", e),
                         });
                     }
                 }
@@ -1177,6 +1212,115 @@ async fn io_run_index_pipeline(
                 });
             }
         }
+    }
+
+    // ─── COLLECT phase B: flatten chunk texts into one ordered list ──────────
+    // Build a flat text list and a parallel mapping of (doc_index, chunk_index)
+    // so we can scatter embeddings back after the batched call.
+    let mut flat_texts: Vec<String> = Vec::new();
+    // Range per doc: (start_in_flat, count_in_flat) — lets us slice the results.
+    let mut doc_flat_ranges: Vec<(usize, usize)> = Vec::with_capacity(docs_to_embed.len());
+
+    for doc in &docs_to_embed {
+        let start = flat_texts.len();
+        for chunk in &doc.chunks {
+            flat_texts.push(chunk.text.clone());
+        }
+        doc_flat_ranges.push((start, doc.chunks.len()));
+    }
+
+    // ─── COLLECT phase C: batch-embed all texts ─────────────────────────────
+    // io_embed_batched issues ceil(N / batch_size) HTTP calls instead of N.
+    // Per-doc failure isolation is handled by the function: failed batches are
+    // retried individually, so only toxic texts get EmbedResult::Failed.
+    let embed_results = embed::io_embed_batched(
+        ctx.provider,
+        &flat_texts,
+        ctx.embed_batch_size,
+        EmbeddingRole::Document,
+        ctx.http_client,
+    )
+    .await;
+
+    // ─── COLLECT phase D: scatter embeddings → build ChunkRows per doc ──────
+    // For each doc, check that ALL its chunk embeddings succeeded. If any failed,
+    // skip the entire doc (per-doc isolation). Otherwise L2-normalise and build rows.
+    let mut all_rows: Vec<ChunkRow> = Vec::new();
+    let mut indexed_count: u64 = 0;
+
+    for (doc_idx, doc) in docs_to_embed.iter().enumerate() {
+        let (start, count) = doc_flat_ranges[doc_idx];
+        let doc_results = &embed_results[start..start + count];
+
+        // Check for any failed embeddings in this doc's chunks.
+        let first_failure = doc_results.iter().find_map(|r| match r {
+            EmbedResult::Failed(msg) => Some(msg.clone()),
+            EmbedResult::Ok(_) => None,
+        });
+
+        if let Some(failure_msg) = first_failure {
+            skipped.push(SkippedDoc {
+                id: doc.id.clone(),
+                message: failure_msg,
+            });
+            continue;
+        }
+
+        // All embeddings succeeded — extract, normalise, and build rows.
+        // Safety: first_failure check above guarantees all are Ok; if a future
+        // refactor breaks that invariant, we skip the doc rather than panicking.
+        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(doc_results.len());
+        let mut extraction_failed = false;
+        for r in doc_results {
+            match r {
+                EmbedResult::Ok(emb) => embeddings.push(emb.clone()),
+                EmbedResult::Failed(msg) => {
+                    skipped.push(SkippedDoc {
+                        id: doc.id.clone(),
+                        message: format!(
+                            "internal: EmbedResult::Failed after first_failure check: {}",
+                            msg
+                        ),
+                    });
+                    extraction_failed = true;
+                    break;
+                }
+            }
+        }
+        if extraction_failed {
+            continue;
+        }
+
+        // L2-normalise embeddings so that Lance's L2² metric = cosine distance.
+        for emb in &mut embeddings {
+            l2_normalize(emb);
+        }
+
+        // Build chunk rows.
+        let doc_type = ingest::extract_doc_type(&doc.id);
+        let rows: Vec<ChunkRow> = doc
+            .chunks
+            .iter()
+            .zip(embeddings)
+            .map(|(chunk, embedding)| ChunkRow {
+                doc_id: doc.id.clone(),
+                doc_type: doc_type.clone(),
+                chunk_index: chunk.index as i32,
+                chunk_count: chunk.count as i32,
+                chunk_token_start: chunk.token_start as i32,
+                doc_token_len: chunk.doc_token_len as i32,
+                embedding,
+                content: chunk.text.clone(),
+            })
+            .collect();
+
+        // If Changed, register for deletion of old chunks.
+        if doc.is_changed {
+            delete_ids.push(doc.id.clone());
+        }
+
+        all_rows.extend(rows);
+        indexed_count += 1;
     }
 
     // ─── WRITE phase (batched, under pipeline lock) ─────────────────────────
@@ -1288,60 +1432,3 @@ async fn io_optimize_on_uncached_handle(
     Ok(Some(final_version))
 }
 
-/// Chunk and embed a single document, returning its ChunkRows (Phase 6A: pure collect).
-///
-/// IO: calls io_embed (the only side-effect). No store writes.
-/// Per-doc failure isolation: errors are returned to the caller for skip+record;
-/// they never abort the entire commit.
-async fn io_index_document_pure(
-    ctx: &PipelineCtx<'_>,
-    doc_id: &str,
-    text: &str,
-) -> Result<Vec<ChunkRow>, String> {
-    // 1. Chunk the document.
-    let chunks = chunk::chunk_text(ctx.tokenizer, text, ctx.chunk_params)
-        .map_err(|e| format!("chunking failed: {}", e))?;
-
-    if chunks.is_empty() {
-        return Err("chunking produced zero chunks".to_owned());
-    }
-
-    // 2. Embed all chunks in a single batch, then L2-normalise for cosine distance.
-    let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-    let mut embeddings =
-        embed::io_embed(ctx.provider, &chunk_texts, EmbeddingRole::Document, ctx.http_client)
-            .await
-            .map_err(|e| format!("embedding failed: {}", e))?;
-
-    if embeddings.len() != chunks.len() {
-        return Err(format!(
-            "embedding count mismatch: expected {}, got {}",
-            chunks.len(),
-            embeddings.len()
-        ));
-    }
-
-    // L2-normalise embeddings so that Lance's L2² metric = cosine distance.
-    for emb in &mut embeddings {
-        l2_normalize(emb);
-    }
-
-    // 3. Build chunk rows.
-    let doc_type = ingest::extract_doc_type(doc_id);
-    let rows: Vec<ChunkRow> = chunks
-        .iter()
-        .zip(embeddings)
-        .map(|(chunk, embedding)| ChunkRow {
-            doc_id: doc_id.to_owned(),
-            doc_type: doc_type.clone(),
-            chunk_index: chunk.index as i32,
-            chunk_count: chunk.count as i32,
-            chunk_token_start: chunk.token_start as i32,
-            doc_token_len: chunk.doc_token_len as i32,
-            embedding,
-            content: chunk.text.clone(),
-        })
-        .collect();
-
-    Ok(rows)
-}

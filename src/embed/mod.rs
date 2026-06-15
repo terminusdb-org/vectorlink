@@ -206,7 +206,106 @@ pub async fn io_embed(
         .await
         .map_err(|e| EmbedError::ParseError(e.to_string()))?;
 
-    parse_embedding_response(&body_bytes, provider.expected_dim())
+    let embeddings = parse_embedding_response(&body_bytes, provider.expected_dim())?;
+
+    // Count-parity guard: the provider MUST return exactly one embedding per input.
+    // A short response would silently corrupt the scatter mapping in the batched
+    // pipeline (wrong embeddings assigned to wrong docs). Fail loud here so the
+    // io_embed_batched retry path isolates the offending batch.
+    if embeddings.len() != texts.len() {
+        return Err(EmbedError::ParseError(format!(
+            "count mismatch: sent {} texts, received {} embeddings",
+            texts.len(),
+            embeddings.len()
+        )));
+    }
+
+    Ok(embeddings)
+}
+
+/// Result of batched embedding: either a successful embedding vector or an error
+/// for that specific text position. Used to scatter results back with per-doc
+/// failure isolation.
+#[derive(Debug, Clone)]
+pub enum EmbedResult {
+    /// Embedding succeeded for this text position.
+    Ok(Vec<f32>),
+    /// Embedding failed for this text position (the text was toxic or the
+    /// provider rejected it individually after a batch retry).
+    Failed(String),
+}
+
+/// Batch-embed a flat list of texts in groups of `batch_size`, calling `io_embed`
+/// per batch. Returns one `EmbedResult` per input text, preserving order.
+///
+/// Per-doc failure isolation: if a batch call fails, the batch is retried as
+/// INDIVIDUAL per-text calls. Only the actually toxic text(s) get `EmbedResult::Failed`;
+/// the rest succeed. This ensures a single bad document does not fail the whole commit.
+///
+/// Panics if `batch_size == 0` (configuration error — fail-loud).
+pub async fn io_embed_batched(
+    provider: &Provider,
+    texts: &[String],
+    batch_size: usize,
+    role: EmbeddingRole,
+    client: &reqwest::Client,
+) -> Vec<EmbedResult> {
+    assert!(batch_size > 0, "embed_batch_size must be > 0 (configuration error)");
+
+    if texts.is_empty() {
+        return Vec::new();
+    }
+
+    let mut results: Vec<EmbedResult> = Vec::with_capacity(texts.len());
+
+    for batch in texts.chunks(batch_size) {
+        match io_embed(provider, batch, role, client).await {
+            Ok(embeddings) => {
+                // Happy path: batch succeeded. Push all embeddings.
+                for emb in embeddings {
+                    results.push(EmbedResult::Ok(emb));
+                }
+            }
+            Err(batch_err) => {
+                // WHY: A batch failure does not mean ALL texts in it are bad — often a
+                // single toxic input (empty, over-long, provider-rejected) poisons the
+                // whole request. We retry individually to isolate the toxic text(s).
+                // INVARIANT: io_embed_batched guarantees exactly one EmbedResult per input
+                // text. The individual retries below fulfil that for every text in the
+                // failed batch — successes get Ok, failures get Failed.
+                // CONSEQUENCE: Only the actually toxic text(s) are marked Failed; all
+                // other texts in the batch get their correct embeddings. The caller
+                // (pipeline scatter phase) skips only the affected doc(s).
+                eprintln!(
+                    "[embed] batch of {} texts failed, retrying individually: {}",
+                    batch.len(),
+                    batch_err
+                );
+                for text in batch {
+                    let single = std::slice::from_ref(text);
+                    match io_embed(provider, single, role, client).await {
+                        Ok(mut embeddings) => {
+                            if let Some(emb) = embeddings.pop() {
+                                results.push(EmbedResult::Ok(emb));
+                            } else {
+                                results.push(EmbedResult::Failed(
+                                    "individual retry returned empty".to_owned(),
+                                ));
+                            }
+                        }
+                        Err(individual_err) => {
+                            results.push(EmbedResult::Failed(format!(
+                                "embedding failed after individual retry: {}",
+                                individual_err
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    results
 }
 
 #[cfg(test)]

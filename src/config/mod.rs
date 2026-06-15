@@ -5,6 +5,10 @@
 
 use crate::embed::Provider;
 
+/// Default batch size for cross-document embedding (PO decision, 2026-06-15).
+/// Past the knee of the latency curve (88.8 ms/embed at bs=32 vs 228.8 at bs=1).
+const DEFAULT_EMBED_BATCH_SIZE: usize = 32;
+
 /// Application configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -14,6 +18,9 @@ pub struct Config {
     pub embed_provider: Provider,
     pub data_dir: String,
     pub tokenizer_path: String,
+    /// Number of texts to batch per embedding HTTP call (cross-document batching).
+    /// Configurable via `TDB_SEARCH_EMBED_BATCH_SIZE`; default 32.
+    pub embed_batch_size: usize,
 }
 
 impl Config {
@@ -48,6 +55,18 @@ impl Config {
             },
         };
 
+        let embed_batch_size: usize = std::env::var("TDB_SEARCH_EMBED_BATCH_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_EMBED_BATCH_SIZE);
+
+        // Fail-fast at boot: batch_size=0 would panic on first push (division / empty batches).
+        // Surface the misconfiguration immediately with a clear diagnostic.
+        assert!(
+            embed_batch_size > 0,
+            "TDB_SEARCH_EMBED_BATCH_SIZE must be >= 1, got 0 (check environment)"
+        );
+
         Self {
             admin_user: std::env::var("TDB_SEARCH_ADMIN_USER")
                 .unwrap_or_else(|_| "admin".to_owned()),
@@ -62,6 +81,7 @@ impl Config {
                 .unwrap_or_else(|_| "/data".to_owned()),
             tokenizer_path: std::env::var("TDB_SEARCH_TOKENIZER_PATH")
                 .unwrap_or_else(|_| "/data/tokenizer.json.bz2".to_owned()),
+            embed_batch_size,
         }
     }
 
@@ -78,6 +98,7 @@ impl Config {
             },
             data_dir: "/tmp/tdb-search-test".to_owned(),
             tokenizer_path: "spikes/tokenizer/tokenizer.json".to_owned(),
+            embed_batch_size: DEFAULT_EMBED_BATCH_SIZE,
         }
     }
 }
@@ -95,6 +116,7 @@ impl Default for Config {
             },
             data_dir: "/tmp/tdb-search-test".to_owned(),
             tokenizer_path: "spikes/tokenizer/tokenizer.json".to_owned(),
+            embed_batch_size: DEFAULT_EMBED_BATCH_SIZE,
         }
     }
 }
