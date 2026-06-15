@@ -1,0 +1,44 @@
+# Lightweight dev/E2E runtime image for tdb-search.
+#
+# Assembles in SECONDS: no in-container cargo build. Expects the debug binary
+# to already exist on the host (produced by `make dev` using persistent named
+# volumes). The binary is COPY'd in from the build context.
+#
+# Contract: identical runtime environment to the production Dockerfile —
+# same base image, same non-root user, same env vars, same port, same
+# tokenizer asset path. Only the binary differs (debug vs release/production).
+#
+# Usage:
+#   make dev                  # build debug binary (~seconds, incremental)
+#   make dev-image            # assemble this image from that binary
+#   docker compose up         # starts the fast dev container
+#
+# For the pristine production image, use `Dockerfile` directly (release/LTO).
+
+FROM debian:trixie-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+  && rm -rf /var/lib/apt/lists/*
+
+# Copy the pre-built debug binary from the host build context.
+COPY target/debug/tdb-search /usr/local/bin/tdb-search
+
+# Tokenizer asset (same location as production image).
+COPY assets/tokenizer.json.bz2 /opt/tdb-search/tokenizer.json.bz2
+
+# Non-root user for security (same as production Dockerfile).
+RUN useradd -r -s /bin/false tdb-search
+
+# Data directory for LanceDB datasets (owned by tdb-search user).
+RUN mkdir -p /data && chown tdb-search:tdb-search /data
+
+USER tdb-search
+
+ENV TDB_SEARCH_TOKENIZER_PATH=/opt/tdb-search/tokenizer.json.bz2
+ENV TDB_SEARCH_DATA_DIR=/data
+
+EXPOSE 8080
+
+ENTRYPOINT ["tdb-search"]

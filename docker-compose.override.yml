@@ -1,0 +1,19 @@
+# Local override — dev-loop configuration.
+#
+# 1. Overrides the tdb-search service to use Dockerfile.dev (pre-built debug
+#    binary, assembles in seconds) instead of the slow release Dockerfile.
+# 2. Adds indexer env vars to terminusdb for E2E testing (Phase 6 push-driver).
+#
+# NOT committed to source (gitignored). Developers get this via `make dev-image`.
+services:
+  terminusdb:
+    environment:
+      - TERMINUSDB_INDEXER_BACKEND=http_tdb_search
+      - TERMINUSDB_TDB_SEARCH_ENDPOINT=http://tdb-search:8080
+      - TERMINUSDB_SEARCH_ADMIN_SECRET=root
+
+  tdb-search:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: tdb-search:dev

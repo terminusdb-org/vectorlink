@@ -4701,6 +4701,7 @@ dependencies = [
  "lance",
  "lance-index",
  "lance-linalg",
+ "rand",
  "reqwest",
  "roaring",
  "serde",

@@ -1018,6 +1018,39 @@ async fn handle_health_ready(State(state): State<AppState>) -> Response {
     }
 }
 
+// ─────────────────────────── Compact ────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CompactParams {
+    pub domain: Option<String>,
+    pub branch: Option<String>,
+}
+
+/// POST /compact?domain=<org/db>[&branch=main] — trigger data compaction.
+/// Merges small data fragments (one per push) into fewer large fragments,
+/// reducing the FD count required for full-table scans. Admin-only, idempotent.
+/// Returns the number of fragments before/after compaction.
+async fn handle_compact(
+    State(state): State<AppState>,
+    Query(params): Query<CompactParams>,
+) -> Response {
+    let domain = match params.domain {
+        Some(d) if !d.is_empty() => d,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing required query parameter: domain".to_owned(),
+            );
+        }
+    };
+    let branch = params.branch.unwrap_or_else(|| "main".to_owned());
+
+    match state.service.compact_domain(&domain, &branch).await {
+        Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
+        Err(e) => service_error_to_response(e),
+    }
+}
+
 // ─────────────────────────── Router construction ──────────────────────────
 
 pub fn build_router(state: AppState) -> Router {
@@ -1031,6 +1064,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/similar", get(handle_similar).post(handle_similar_post))
         .route("/duplicates", get(handle_duplicates))
         .route("/resolve", post(handle_resolve))
+        .route("/compact", post(handle_compact))
         .route("/statistics", get(handle_statistics))
         .route("/domain", delete(handle_delete_domain))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));

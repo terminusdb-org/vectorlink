@@ -23,6 +23,11 @@ use crate::store::lance::{
     ChunkRow, DuplicateScope, LanceStore, SearchQuery, dedup_chunks_to_documents,
 };
 
+/// Max concurrent heavy-scan requests (/resolve, /duplicates). Each such request
+/// may spike ~64-96 working FDs via ANN queries; capping concurrency prevents
+/// stacked spikes from exhausting the default nofile=1024 limit under load.
+const HEAVY_SCAN_MAX_CONCURRENT: usize = 4;
+
 /// The search service — owns the store and config, provides the transport-agnostic API.
 #[derive(Clone)]
 pub struct SearchService {
@@ -35,6 +40,9 @@ pub struct SearchService {
     /// readiness (search additionally requires a warm embedding backend).
     ready_index: Arc<std::sync::atomic::AtomicBool>,
     ready_search: Arc<std::sync::atomic::AtomicBool>,
+    /// Semaphore limiting concurrent heavy-scan operations (/resolve, /duplicates)
+    /// to prevent stacked FD spikes from exceeding nofile under load (BUG-FD24).
+    heavy_scan_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// Outcome of a search that resolves through the catch-up layer (RISK-15).
@@ -94,6 +102,9 @@ impl SearchService {
             http_client: reqwest::Client::new(),
             ready_index,
             ready_search,
+            heavy_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                HEAVY_SCAN_MAX_CONCURRENT,
+            )),
         }
     }
 
@@ -252,6 +263,16 @@ impl SearchService {
             // releasing returns the commit to absent so a retry is allowed.
             match result {
                 Ok((indexed, skipped)) => {
+                    // Probabilistic background compaction (BUG-FD24): 5% chance
+                    // on a successful write that created fragments. Does NOT
+                    // block — spawns a background task if the roll hits.
+                    if indexed > 0 {
+                        LanceStore::maybe_trigger_background_compaction(
+                            Arc::clone(&store),
+                            domain_str.clone(),
+                            branch.clone(),
+                        );
+                    }
                     store
                         .record_task(
                             &task_id_clone,
@@ -782,6 +803,14 @@ impl SearchService {
             ));
         }
 
+        // Acquire heavy-scan permit (BUG-FD24): bounds concurrent /duplicates
+        // requests so stacked FD spikes cannot exhaust nofile under load.
+        let _permit = self
+            .heavy_scan_semaphore
+            .acquire()
+            .await
+            .map_err(|_| ServiceError::Internal("heavy-scan semaphore closed".to_owned()))?;
+
         let domain = Domain::from_resource_path(&rp);
         let domain_str = domain.as_str().to_owned();
         let branch = extract_branch(&rp);
@@ -840,6 +869,14 @@ impl SearchService {
                 "search capability not ready (embedding backend cold)".to_owned(),
             ));
         }
+
+        // Acquire heavy-scan permit (BUG-FD24): bounds concurrent /resolve requests
+        // so stacked FD spikes cannot exhaust nofile under load.
+        let _permit = self
+            .heavy_scan_semaphore
+            .acquire()
+            .await
+            .map_err(|_| ServiceError::Internal("heavy-scan semaphore closed".to_owned()))?;
 
         let domain = Domain::from_resource_path(&rp);
         let domain_str = domain.as_str().to_owned();
@@ -921,6 +958,98 @@ impl SearchService {
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Trigger data compaction for a domain's dataset on a given branch.
+    /// Merges small fragments (one per push) into fewer large fragments, reducing
+    /// the FD count for full-table scans. Returns before/after fragment counts.
+    ///
+    /// After compaction, all existing commit tags are re-pointed to the new
+    /// (compacted) version so that tag-resolved snapshots use the fewer-fragment
+    /// layout. Without re-tagging, old tags reference the pre-compaction version
+    /// which still has N fragments per original push.
+    ///
+    /// Admin-only, idempotent: re-running on an already-compacted dataset is fast
+    /// (the threshold check short-circuits if fragments <= 16).
+    pub async fn compact_domain(
+        &self,
+        domain_raw: &str,
+        branch: &str,
+    ) -> Result<serde_json::Value, ServiceError> {
+        let rp =
+            parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
+        let domain = Domain::from_resource_path(&rp);
+        let domain_str = domain.as_str().to_owned();
+
+        let ds = self
+            .store
+            .io_open_dataset_uncached(&domain_str, branch)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        let mut ds = match ds {
+            Some(d) => d,
+            None => {
+                return Err(ServiceError::NotFound(format!(
+                    "domain {} has no dataset on disk",
+                    domain_raw
+                )));
+            }
+        };
+
+        let fragments_before = ds.get_fragments().len();
+
+        crate::store::lance::io_compact_data(&mut ds)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        let fragments_after = ds.get_fragments().len();
+        let compacted_version = ds.version().version;
+
+        // Re-tag all commits pointing to older versions so that tag-resolved
+        // snapshots (io_snapshot_from_cache → checkout_version) read from the
+        // latest (fewest-fragment) layout. Without this, old tags reference
+        // pre-compaction versions that still open N fragment files per scan.
+        // Always retag stale tags — even if this invocation didn't compact
+        // (fragments already low), tags may be stale from a prior compaction.
+        let all_tags = ds
+            .tags()
+            .list()
+            .await
+            .map_err(|e| {
+                ServiceError::Internal(format!("tag list for retag failed: {}", e))
+            })?;
+        let mut tags_repointed = 0u64;
+        for (tag_name, tag_contents) in &all_tags {
+            if tag_contents.version != compacted_version {
+                ds.tags()
+                    .update(tag_name, compacted_version)
+                    .await
+                    .map_err(|e| {
+                        ServiceError::Internal(format!(
+                            "retag '{}' to v{} failed: {}",
+                            tag_name, compacted_version, e
+                        ))
+                    })?;
+                tags_repointed += 1;
+            }
+        }
+
+        // Refresh the cached handle so subsequent reads use the compacted data.
+        self.store
+            .io_refresh_cached_dataset(&domain_str, branch)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        Ok(serde_json::json!({
+            "domain": domain_raw,
+            "branch": branch,
+            "fragments_before": fragments_before,
+            "fragments_after": fragments_after,
+            "compacted": fragments_before != fragments_after,
+            "compacted_version": compacted_version,
+            "tags_repointed": tags_repointed
+        }))
     }
 
     /// Validate a domain string without side effects.

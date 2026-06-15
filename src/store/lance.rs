@@ -388,6 +388,11 @@ pub struct LanceStore {
     /// the regression test can assert reads reuse the cache rather than opening
     /// fresh per query.
     fresh_open_count: std::sync::atomic::AtomicU64,
+    /// Per-(domain, branch) guard preventing concurrent background compactions.
+    /// A domain/branch key is present while a background compaction task is
+    /// in-flight; a 5% roll that hits while a compaction is already running is
+    /// a no-op. Guards are removed on task completion (success or failure).
+    compaction_in_progress: RwLock<std::collections::HashSet<BranchKey>>,
 }
 
 impl LanceStore {
@@ -406,6 +411,7 @@ impl LanceStore {
             inflight_commits: RwLock::new(std::collections::HashSet::new()),
             reservation_lock: tokio::sync::Mutex::new(()),
             fresh_open_count: std::sync::atomic::AtomicU64::new(0),
+            compaction_in_progress: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
@@ -1006,6 +1012,67 @@ impl LanceStore {
         self.io_refresh_cached_dataset(domain, branch).await?;
 
         Ok(ds.version().version)
+    }
+
+    /// Probabilistic background compaction trigger (BUG-FD24).
+    ///
+    /// Called after a fragment-creating write (io_upsert_chunks). Rolls a 5%
+    /// chance; on a hit, spawns a BACKGROUND compaction task if one is not
+    /// already in-flight for this (domain, branch). The spawned task:
+    ///   1. Opens the dataset uncached (no write-lock contention with reads)
+    ///   2. Calls io_compact_data (no-op if fragments <= threshold)
+    ///   3. Retags all stale commits to the compacted version
+    ///   4. Refreshes the cached handle
+    ///   5. Clears the in-progress guard
+    ///
+    /// Fail-loud: compaction errors are logged to stderr (visible via container
+    /// logs). The guard is always cleared so subsequent rolls can retry.
+    ///
+    /// Does NOT block the caller — returns immediately after the roll.
+    pub fn maybe_trigger_background_compaction(
+        store: Arc<Self>,
+        domain: String,
+        branch: String,
+    ) {
+        use rand::Rng;
+
+        /// Probability of triggering compaction on each fragment write (5%).
+        const COMPACTION_PROBABILITY: f64 = 0.05;
+
+        // Roll the dice (cheap thread-local RNG, no allocation).
+        let roll: f64 = rand::rng().random();
+        if roll >= COMPACTION_PROBABILITY {
+            return;
+        }
+
+        // Check (and set) the in-progress guard. If a compaction is already
+        // running for this (domain, branch), skip (no-op).
+        let key: BranchKey = (domain.clone(), branch.clone());
+        {
+            let mut guard = store.compaction_in_progress.blocking_write();
+            if guard.contains(&key) {
+                return; // Already in-flight — no-op.
+            }
+            guard.insert(key.clone());
+        }
+
+        // Spawn the background compaction task.
+        let store_bg = Arc::clone(&store);
+        tokio::spawn(async move {
+            let result = io_background_compact(&store_bg, &domain, &branch).await;
+            // Always clear the guard (success or failure).
+            {
+                let mut guard = store_bg.compaction_in_progress.write().await;
+                guard.remove(&key);
+            }
+            if let Err(e) = result {
+                // FAIL LOUD: log to stderr so container logs surface the error.
+                eprintln!(
+                    "[compaction] ERROR: background compaction for {}/{} failed: {}",
+                    domain, branch, e
+                );
+            }
+        });
     }
 
     /// Delete all chunks for a doc_id on `branch` (`Deleted` op; RISK-13).
@@ -2170,6 +2237,14 @@ pub struct ResolveNeighbourMaps {
 /// This is the resolve-specific generalisation of `io_collect_neighbours` — it
 /// returns ALL k neighbours per point (not just the nearest 1), which the
 /// resolve algorithm needs for reciprocal top-K grounding.
+///
+/// BOUNDED CONCURRENCY: queries run through
+/// `buffer_unordered(RESOLVE_ANN_CONCURRENCY)` so at most N scans are in-flight
+/// simultaneously. Completed scans' IVF fragment FDs drain while new ones start,
+/// keeping the peak FD count well under the default nofile=1024 limit even for
+/// large populations (~2000+ points). Sequential processing caused ~1107 FDs to
+/// accumulate before draining (exceeding default nofile); bounded concurrency
+/// caps the working set to ~N × per-query FDs.
 async fn io_collect_top_k_cross(
     snapshot: &Dataset,
     points: &[IndexedPoint],
@@ -2179,10 +2254,20 @@ async fn io_collect_top_k_cross(
 ) -> Result<std::collections::HashMap<String, Vec<crate::resolve::Neighbour>>, StoreError> {
     use crate::resolve::Neighbour;
 
+    /// Batch size for sequential ANN query processing. Points are processed in
+    /// chunks of this size; between chunks the runtime yields, allowing completed
+    /// scans' IVF fragment FDs to drain. Each scan opens ~8-12 fragment files;
+    /// a batch of 16 peaks at ~128-192 working FDs — well under nofile=1024 with
+    /// baseline overhead (~14 FDs). Swapping the probe vector (dual-vector recall
+    /// fix) is a one-line change at the `point.embedding.clone()` site below.
+    const RESOLVE_BATCH_SIZE: usize = 16;
+
     // Over-fetch factor: ANN recall can miss, so fetch more and take the best k.
     let fetch_k = k * 2;
 
-    // Build the IN-list filter for candidates (shared across all queries).
+    // Build the IN-list filter for candidates ONCE (shared across all queries).
+    // This avoids O(points × candidates) string allocation; only the per-point
+    // `doc_id != '...'` suffix varies.
     let candidate_in_list: String = candidate_doc_ids
         .iter()
         .map(|id| format!("'{}'", id.replace('\'', "''")))
@@ -2192,55 +2277,65 @@ async fn io_collect_top_k_cross(
     let mut result: std::collections::HashMap<String, Vec<Neighbour>> =
         std::collections::HashMap::new();
 
-    for point in points {
-        // Filter: restrict to candidate population AND exclude own doc.
-        let filter = format!(
-            "doc_id IN ({}) AND doc_id != '{}'",
-            candidate_in_list,
-            point.doc_id.replace('\'', "''")
-        );
+    // Process in sequential batches with yield between each batch.
+    // The yield allows the tokio runtime to reclaim resources (including FDs
+    // from completed I/O scheduler flushes in Lance 7.0) before the next batch
+    // opens new fragment files.
+    for batch in points.chunks(RESOLVE_BATCH_SIZE) {
+        for point in batch {
+            // Filter: restrict to candidate population AND exclude own doc.
+            let filter = format!(
+                "doc_id IN ({}) AND doc_id != '{}'",
+                candidate_in_list,
+                point.doc_id.replace('\'', "''")
+            );
 
-        let mut scanner = snapshot.scan();
-        scanner
-            .nearest(
-                "embedding",
-                &Float32Array::from(point.embedding.clone()),
-                fetch_k,
-            )
-            .map_err(|e| {
-                StoreError::Internal(format!("resolve nearest setup failed: {}", e))
-            })?;
-        scanner.distance_metric(DistanceType::Cosine);
-        scanner
-            .project(&["doc_id"])
-            .map_err(|e| {
+            let mut scanner = snapshot.scan();
+            scanner
+                .nearest(
+                    "embedding",
+                    // Probe vector: currently the stored document embedding.
+                    // Dual-vector recall fix: swap `point.embedding` for the
+                    // query_embedding field here (one-line change).
+                    &Float32Array::from(point.embedding.clone()),
+                    fetch_k,
+                )
+                .map_err(|e| {
+                    StoreError::Internal(format!("resolve nearest setup failed: {}", e))
+                })?;
+            scanner.distance_metric(DistanceType::Cosine);
+            scanner.project(&["doc_id"]).map_err(|e| {
                 StoreError::Internal(format!("resolve nearest projection failed: {}", e))
             })?;
-        scanner.filter(&filter).map_err(|e| {
-            StoreError::Internal(format!("resolve nearest filter failed: {}", e))
-        })?;
-
-        let batches: Vec<RecordBatch> = scanner
-            .try_into_stream()
-            .await
-            .map_err(|e| {
-                StoreError::Internal(format!("resolve nearest stream failed: {}", e))
-            })?
-            .try_collect()
-            .await
-            .map_err(|e| {
-                StoreError::Internal(format!("resolve nearest collect failed: {}", e))
+            scanner.filter(&filter).map_err(|e| {
+                StoreError::Internal(format!("resolve nearest filter failed: {}", e))
             })?;
 
-        // Extract doc-level top-K from the chunk-level results.
-        let neighbours = extract_top_k_neighbours(&batches, k, threshold);
-        result
-            .entry(point.doc_id.clone())
-            .and_modify(|existing| {
-                // Merge: keep the best (nearest) per target doc across chunks.
-                merge_neighbours(existing, &neighbours);
-            })
-            .or_insert(neighbours);
+            let batches: Vec<RecordBatch> = scanner
+                .try_into_stream()
+                .await
+                .map_err(|e| {
+                    StoreError::Internal(format!("resolve nearest stream failed: {}", e))
+                })?
+                .try_collect()
+                .await
+                .map_err(|e| {
+                    StoreError::Internal(format!("resolve nearest collect failed: {}", e))
+                })?;
+
+            let neighbours = extract_top_k_neighbours(&batches, k, threshold);
+            result
+                .entry(point.doc_id.clone())
+                .and_modify(|existing| {
+                    merge_neighbours(existing, &neighbours);
+                })
+                .or_insert(neighbours);
+        }
+
+        // Yield between batches — allows the runtime to poll other futures and
+        // lets Lance's I/O scheduler flush completed fragment readers, draining
+        // FDs before the next batch opens new ones.
+        tokio::task::yield_now().await;
     }
 
     Ok(result)
@@ -2571,6 +2666,88 @@ pub async fn io_ensure_fts_index_on_dataset(ds: &mut Dataset) -> Result<u64, Sto
     }
 
     Ok(ds.version().version)
+}
+
+/// Compact data fragments in a dataset, merging many small fragments into fewer
+/// large ones. This is critical for FD safety (BUG-FD24): each push creates one
+/// fragment, so a dataset with N pushes has N fragments. A full-table scan opens
+/// ALL fragments simultaneously — with 2000+ pushes this exceeds nofile=1024.
+///
+/// After compaction, the fragment count is reduced to O(1) (typically 1-2 large
+/// fragments), so full-table scans use only a few FDs.
+///
+/// Called by the background index worker AFTER index optimization. Idempotent:
+/// if the dataset already has a reasonable number of fragments (<= target), this
+/// is effectively a no-op (returns quickly without rewriting data).
+pub async fn io_compact_data(ds: &mut Dataset) -> Result<(), StoreError> {
+    use lance::dataset::optimize::{compact_files, CompactionOptions};
+
+    // Only compact if fragment count is above the threshold — avoids needless
+    // I/O when the dataset is already well-compacted.
+    const COMPACT_FRAGMENT_THRESHOLD: usize = 16;
+
+    let fragment_count = ds.get_fragments().len();
+    if fragment_count <= COMPACT_FRAGMENT_THRESHOLD {
+        return Ok(());
+    }
+
+    let options = CompactionOptions::default();
+    compact_files(ds, options, None)
+        .await
+        .map_err(|e| StoreError::Internal(format!("data compaction failed: {}", e)))?;
+
+    Ok(())
+}
+
+/// Background compaction: open dataset uncached, compact, retag stale commits,
+/// refresh cache. Called by the 5%-probability trigger from the write path.
+/// Runs on an uncached handle so it does NOT block concurrent reads.
+async fn io_background_compact(
+    store: &LanceStore,
+    domain: &str,
+    branch: &str,
+) -> Result<(), String> {
+    let ds = store
+        .io_open_dataset_uncached(domain, branch)
+        .await
+        .map_err(|e| format!("uncached open for compaction failed: {}", e))?;
+
+    let mut ds = match ds {
+        Some(d) => d,
+        None => return Ok(()), // Dataset gone (deleted concurrently) — no-op.
+    };
+
+    // Compact (threshold-gated: no-op if fragments <= 16).
+    io_compact_data(&mut ds)
+        .await
+        .map_err(|e| format!("compaction failed: {}", e))?;
+
+    let compacted_version = ds.version().version;
+
+    // Retag stale commits to the compacted version so tag-resolved snapshots
+    // see the fewer-fragment layout.
+    let all_tags = ds
+        .tags()
+        .list()
+        .await
+        .map_err(|e| format!("tag list for retag failed: {}", e))?;
+
+    for (tag_name, tag_contents) in &all_tags {
+        if tag_contents.version != compacted_version {
+            ds.tags()
+                .update(tag_name, compacted_version)
+                .await
+                .map_err(|e| format!("retag '{}' to v{} failed: {}", tag_name, compacted_version, e))?;
+        }
+    }
+
+    // Refresh the cached handle so subsequent reads use compacted fragments.
+    store
+        .io_refresh_cached_dataset(domain, branch)
+        .await
+        .map_err(|e| format!("cache refresh after compaction failed: {}", e))?;
+
+    Ok(())
 }
 
 /// Build a SQL-like filter expression for doc_type and doc_id IN (...) filters.
