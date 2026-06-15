@@ -136,15 +136,23 @@ dev:
 	fi
 
 # dev-image: assemble the dev/E2E container image from the pre-built debug
-# binary. This is a simple COPY into debian:trixie-slim — no cargo build runs
-# inside the image. Requires target/debug/tdb-search to exist (run `make dev`
-# first, or use `make dev-up` which chains both). Assembles in ~2-5 seconds.
+# binary. Strips debug symbols for the container copy (1.2GB → ~30MB) while
+# keeping the full debug binary on host for local debugging/backtraces.
+# This is a simple COPY into debian:trixie-slim — no cargo build runs inside
+# the image. Requires target/debug/tdb-search to exist (run `make dev` first,
+# or use `make dev-up` which chains both). Assembles in ~5 seconds.
 .PHONY: dev-image
 dev-image:
 	@if [ ! -f target/debug/tdb-search ]; then \
 		echo "ERROR: target/debug/tdb-search not found. Run 'make dev' first." >&2 ; \
 		exit 1 ; \
 	fi
+	@echo "→ stripping debug binary for container (host copy unchanged)"
+	@docker run --rm \
+		--user "$$(id -u):$$(id -g)" \
+		-v "$$(pwd)/target/debug":/host \
+		$(BUILD_IMAGE) \
+		bash -c 'cp /host/tdb-search /host/tdb-search-stripped && strip /host/tdb-search-stripped'
 	docker build -f Dockerfile.dev -t tdb-search:dev .
 
 # dev-up: the full edit-run cycle in one command. Builds the debug binary
