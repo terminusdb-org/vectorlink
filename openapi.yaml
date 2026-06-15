@@ -493,15 +493,108 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NoIndexedLineage' }
 
+  /resolve:
+    post:
+      tags: [search]
+      operationId: resolve
+      summary: Batch entity resolution over stored vectors.
+      description: >
+        Server-side batch entity resolution: reciprocal cross-NN retrieval
+        over stored vectors, then a 3-threshold matching algorithm producing
+        a 3-partition output (matched, set_only, target_only). Replaces
+        N sequential /similar HTTP calls with a single in-process batch —
+        the engine holds all vectors and does the full reciprocal-NN +
+        threshold matching in one call.
+
+        k is how many candidates are evaluated per document in the set.
+
+        The SET and TARGET populations are defined by doc_type/doc_id lists
+        (same scoping as /duplicates). When no target is specified, target =
+        set (within-set dedup). The threshold is the GATHER cap (max distance
+        for a candidate NN to be considered); the three tau are independent
+        MATCHING thresholds applied after gathering.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResolveRequest' }
+            examples:
+              crossSet:
+                summary: Cross-set entity resolution
+                value:
+                  domain: admin/products
+                  commit: c1
+                  set_doc_types: ["Product"]
+                  target_doc_types: ["Catalogue"]
+                  threshold: 0.5
+                  tau_one_to_one: 0.45
+                  tau_one_to_many: 0.2
+                  tau_many_to_one: 0.2
+                  k: 5
+      responses:
+        '200':
+          description: >
+            3-partition resolve output: matched pairs, unmatched set records,
+            unmatched target records, plus resolution statistics.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResolveResult' }
+              examples:
+                result:
+                  value:
+                    matched:
+                      - set_id: "terminusdb:///prod/Product/A"
+                        target_id: "terminusdb:///cat/Catalogue/X"
+                        distance: 0.12
+                        stage: core
+                    set_only: ["terminusdb:///prod/Product/C"]
+                    target_only: ["terminusdb:///cat/Catalogue/Z"]
+                    stats:
+                      k: 5
+                      threshold: 0.5
+                      tau_one_to_one: 0.45
+                      tau_one_to_many: 0.2
+                      tau_many_to_one: 0.2
+                      edge_count: 142
+                      core_count: 80
+                      set_extra_count: 12
+                      target_extra_count: 5
+                      matched_count: 97
+                      set_only_count: 15
+                      target_only_count: 8
+                      set_points: 1087
+                      target_points: 1086
+                      elapsed_ms: 2400
+        '400':
+          description: Invalid parameters (tau > threshold, out-of-range, missing required).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NoIndexedLineage' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
+
   # ───────────────────────────── ops ───────────────────────────────────────
   /statistics:
     get:
       tags: [ops]
       operationId: statistics
-      summary: Engine statistics.
+      summary: Engine statistics (optionally scoped to a single domain).
       description: >
-        Operational counters across all indexed data. Counters are
-        best-effort/advisory (may be approximate under concurrency).
+        Operational counters. When `domain` is supplied, returns statistics for
+        that domain ONLY (domains=1, counts scoped). When absent, returns
+        server-wide aggregates (admin/internal use — TerminusDB always sends
+        domain for user-facing requests).
+      parameters:
+        - name: domain
+          in: query
+          required: false
+          schema: { type: string }
+          description: >
+            TerminusDB graphspec domain (e.g. "admin/mydb" or
+            "org/db/local/branch/dev"). When present, statistics are scoped to
+            this domain only.
+          example: admin/abt_buy_e2e
       responses:
         '200':
           description: Statistics.
@@ -509,7 +602,17 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Statistics' }
               examples:
-                stats:
+                scoped:
+                  summary: Domain-scoped statistics
+                  value:
+                    domains: 1
+                    branches: 1
+                    indexed_commits: 1
+                    documents: 2173
+                    chunks: 4200
+                    pending_index_fragments: 0
+                global:
+                  summary: Global statistics (no domain param)
                   value:
                     domains: 3
                     branches: 9
@@ -1107,6 +1210,121 @@ components:
             description: >
               The [0, 1] cosine distance of the group's best matching chunks
               (0 = identical, 0.5 = unrelated, 1 = opposite).
+
+    ResolveRequest:
+      type: object
+      required: [domain, commit, threshold, tau_one_to_one]
+      properties:
+        domain:
+          type: string
+          description: Full graphspec (same as /search, /duplicates).
+          example: admin/products
+        commit:
+          type: string
+          description: Opaque commit hash — the snapshot to resolve against.
+        set_doc_types:
+          type: array
+          items: { type: string }
+          description: Document types defining the SET population.
+        set_doc_ids:
+          type: array
+          items: { type: string }
+          description: Document IDs defining the SET population.
+        target_doc_types:
+          type: array
+          items: { type: string }
+          description: Document types defining the TARGET population.
+        target_doc_ids:
+          type: array
+          items: { type: string }
+          description: Document IDs defining the TARGET population.
+        threshold:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: >
+            GATHER cap: max [0,1] cosine distance for a candidate NN to be
+            considered. The recall lever — widening recovers more-distant matches.
+        tau_one_to_one:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: >
+            1:1 mutual-best CORE threshold. Must be <= threshold.
+        tau_one_to_many:
+          type: [number, "null"]
+          format: float
+          minimum: 0
+          maximum: 1
+          description: >
+            Set-side extras threshold. Null to disable. Must be <= threshold.
+        tau_many_to_one:
+          type: [number, "null"]
+          format: float
+          minimum: 0
+          maximum: 1
+          description: >
+            Target-side extras threshold. Null to disable. Must be <= threshold.
+        k:
+          type: integer
+          minimum: 1
+          default: 5
+          description: NN fan-out per point (how many documents to evaluate per document).
+        ancestors:
+          type: array
+          items: { type: string }
+          description: Nearest-first ancestor window for catch-up resolution.
+
+    ResolveResult:
+      type: object
+      required: [matched, set_only, target_only, stats]
+      properties:
+        matched:
+          type: array
+          description: Resolved match pairs with stage and distance.
+          items:
+            type: object
+            required: [set_id, target_id, distance, stage]
+            properties:
+              set_id:    { type: string, description: The matched set record. }
+              target_id: { type: string, description: The matched target record. }
+              distance:
+                type: number
+                format: float
+                description: "[0,1] cosine distance between matched records."
+              stage:
+                type: string
+                enum: [core, set_extra, target_extra]
+                description: Which resolution stage produced this match.
+        set_only:
+          type: array
+          items: { type: string }
+          description: Set records with no match under any active tau.
+        target_only:
+          type: array
+          items: { type: string }
+          description: Target records with no match under any active tau.
+        stats:
+          type: object
+          description: Resolution statistics.
+          properties:
+            k:                 { type: integer }
+            threshold:         { type: number, format: float }
+            tau_one_to_one:    { type: number, format: float }
+            tau_one_to_many:   { type: [number, "null"], format: float }
+            tau_many_to_one:   { type: [number, "null"], format: float }
+            edge_count:        { type: integer }
+            core_count:        { type: integer }
+            set_extra_count:   { type: integer }
+            target_extra_count: { type: integer }
+            matched_count:     { type: integer }
+            set_only_count:    { type: integer }
+            target_only_count: { type: integer }
+            set_points:        { type: integer }
+            target_points:     { type: integer }
+            elapsed_ms:        { type: integer, description: "Wall-clock milliseconds for the batch resolve." }
 
     Statistics:
       type: object
