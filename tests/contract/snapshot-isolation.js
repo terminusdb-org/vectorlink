@@ -46,6 +46,8 @@ describe("Snapshot isolation", function () {
   const BRANCH = "main"
 
   before(async function () {
+    // Clean up any stale state from prior runs (each test must be independently runnable).
+    await agent().delete("/domain").query({ domain: DOMAIN }).set("Authorization", authHeader())
     // Commit iso_c0: only has doc/alpha.
     await pushAndWait(DOMAIN, BRANCH, "iso_c0", [
       { op: "Inserted", id: "terminusdb:///snap/Animals/alpha", string: "The alpha wolf leads the pack through the forest at dawn." },
@@ -55,6 +57,10 @@ describe("Snapshot isolation", function () {
     await pushAndWait(DOMAIN, BRANCH, "iso_c1", [
       { op: "Inserted", id: "terminusdb:///snap/Animals/beta", string: "The beta fish is a colourful freshwater species popular in aquariums." },
     ])
+  })
+
+  after(async function () {
+    await agent().delete("/domain").query({ domain: DOMAIN }).set("Authorization", authHeader())
   })
 
   it("search at iso_c0 finds alpha but NOT beta", async function () {

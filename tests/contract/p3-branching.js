@@ -58,6 +58,8 @@ describe("P3 branching + assign (HTTP pipeline)", function () {
   const DOMAIN = "admin/branch_test"
 
   before(async function () {
+    // Clean up any stale state from prior runs (each test must be independently runnable).
+    await agent().delete("/domain").query({ domain: DOMAIN }).set("Authorization", authHeader())
     // main @ bc0: two docs.
     await pushAndWait(DOMAIN, "main", "bc0", [
       { op: "Inserted", id: "terminusdb:///br/People/leia", string: "Princess Leia leads the Rebel Alliance against the Empire." },
@@ -143,5 +145,9 @@ describe("P3 branching + assign (HTTP pipeline)", function () {
       .set("Authorization", authHeader())
       .expect(200)
     expect(ids(tgt.body).sort()).to.deep.equal(ids(src.body).sort(), "branch assign must search identically to source")
+  })
+
+  after(async function () {
+    await agent().delete("/domain").query({ domain: DOMAIN }).set("Authorization", authHeader())
   })
 })

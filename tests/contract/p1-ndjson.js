@@ -6,6 +6,21 @@ const { expect } = require("chai")
 const { agent, authHeader } = require("../lib/agent")
 
 describe("P1-NDJSON: Push parse", function () {
+  before(async function () {
+    // Clean up any stale state from prior runs (each test must be independently runnable).
+    const domainsUsed = ["admin/db", "admin/malformed"]
+    for (const d of domainsUsed) {
+      await agent().delete("/domain").query({ domain: d }).set("Authorization", authHeader())
+    }
+  })
+
+  after(async function () {
+    const domainsUsed = ["admin/db", "admin/malformed"]
+    for (const d of domainsUsed) {
+      await agent().delete("/domain").query({ domain: d }).set("Authorization", authHeader())
+    }
+  })
+
   // P1-NDJSON-1: Incremental parse (large stream processed without buffering whole).
   // Verify that a multi-line NDJSON body is accepted and
   // processed (returns a task id). The bounded-memory assertion requires a

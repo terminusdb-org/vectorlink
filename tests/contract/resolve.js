@@ -54,6 +54,8 @@ describe("POST /resolve — batch entity resolution", function () {
   const BRANCH = "main"
 
   before(async function () {
+    // Clean up any stale state from prior runs (each test must be independently runnable).
+    await agent().delete("/domain").query({ domain: DOMAIN }).set("Authorization", authHeader())
     // Index a small corpus with two populations:
     //   SET: Product/A and Product/B (similar products)
     //   TARGET: Catalogue/X and Catalogue/Y (X matches A, Y is unrelated)
@@ -61,23 +63,23 @@ describe("POST /resolve — batch entity resolution", function () {
       {
         op: "Inserted",
         id: "terminusdb:///resolve/Product/A",
-        string: "Premium wireless noise-cancelling headphones with 30-hour battery life and active noise reduction technology"
+        string: "Premium wireless noise-cancelling headphones with 30-hour battery life and active noise reduction technology",
       },
       {
         op: "Inserted",
         id: "terminusdb:///resolve/Product/B",
-        string: "The ancient art of Japanese tea ceremony emphasises mindfulness and precise ceremonial movements"
+        string: "The ancient art of Japanese tea ceremony emphasises mindfulness and precise ceremonial movements",
       },
       {
         op: "Inserted",
         id: "terminusdb:///resolve/Catalogue/X",
-        string: "High-end wireless headphones featuring noise cancellation and extended battery life for long listening sessions"
+        string: "High-end wireless headphones featuring noise cancellation and extended battery life for long listening sessions",
       },
       {
         op: "Inserted",
         id: "terminusdb:///resolve/Catalogue/Y",
-        string: "Industrial grade concrete mixing equipment for large construction projects and infrastructure development"
-      }
+        string: "Industrial grade concrete mixing equipment for large construction projects and infrastructure development",
+      },
     ])
   })
 
@@ -98,7 +100,7 @@ describe("POST /resolve — batch entity resolution", function () {
         tau_one_to_one: 0.45,
         tau_one_to_many: 0.3,
         tau_many_to_one: 0.3,
-        k: 5
+        k: 5,
       })
       .expect(200)
 
@@ -113,9 +115,9 @@ describe("POST /resolve — batch entity resolution", function () {
     const hasHeadphoneMatch = matchedPairs.some(
       ([s, t]) =>
         s === "terminusdb:///resolve/Product/A" &&
-        t === "terminusdb:///resolve/Catalogue/X"
+        t === "terminusdb:///resolve/Catalogue/X",
     )
-    expect(hasHeadphoneMatch, "Product/A should match Catalogue/X (headphones)").to.be.true
+    expect(hasHeadphoneMatch, "Product/A should match Catalogue/X (headphones)").to.equal(true)
 
     // Stats must report point counts.
     expect(res.body.stats.set_points).to.be.at.least(1)
@@ -135,7 +137,7 @@ describe("POST /resolve — batch entity resolution", function () {
         target_doc_types: ["Catalogue"],
         threshold: 0.05,
         tau_one_to_one: 0.05,
-        k: 5
+        k: 5,
       })
       .expect(200)
 
@@ -150,7 +152,7 @@ describe("POST /resolve — batch entity resolution", function () {
         target_doc_types: ["Catalogue"],
         threshold: 0.5,
         tau_one_to_one: 0.45,
-        k: 5
+        k: 5,
       })
       .expect(200)
 
@@ -168,8 +170,8 @@ describe("POST /resolve — batch entity resolution", function () {
         set_doc_types: ["Product"],
         target_doc_types: ["Catalogue"],
         threshold: 0.3,
-        tau_one_to_one: 0.5,  // > threshold -> error
-        k: 5
+        tau_one_to_one: 0.5, // > threshold -> error
+        k: 5,
       })
 
     expect(res.status).to.equal(400)
@@ -187,8 +189,8 @@ describe("POST /resolve — batch entity resolution", function () {
         target_doc_types: ["Catalogue"],
         threshold: 0.3,
         tau_one_to_one: 0.2,
-        tau_one_to_many: 0.4,  // > threshold -> error
-        k: 5
+        tau_one_to_many: 0.4, // > threshold -> error
+        k: 5,
       })
 
     expect(res.status).to.equal(400)
@@ -233,8 +235,8 @@ describe("POST /resolve — batch entity resolution", function () {
         domain: DOMAIN,
         commit: "resolve_c0",
         threshold: 0.5,
-        tau_one_to_one: 1.5,  // out of [0, 1]
-        k: 5
+        tau_one_to_one: 1.5, // out of [0, 1]
+        k: 5,
       })
     expect(res.status).to.equal(400)
   })
@@ -247,7 +249,7 @@ describe("POST /resolve — batch entity resolution", function () {
         commit: "resolve_c0",
         threshold: 0.5,
         tau_one_to_one: 0.3,
-        k: 5
+        k: 5,
       })
     expect(res.status).to.equal(401)
   })

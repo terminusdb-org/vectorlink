@@ -53,6 +53,8 @@ describe("Indexing pipeline (real embeddings)", function () {
 
   // Index a batch of documents.
   before(async function () {
+    // Clean up any stale state from prior runs (each test must be independently runnable).
+    await agent().delete("/domain").query({ domain: DOMAIN }).set("Authorization", authHeader())
     const operations = [
       { op: "Inserted", id: "terminusdb:///itest/People/yoda", string: "Yoda is a wise and ancient Jedi master who teaches the ways of the Force." },
       { op: "Inserted", id: "terminusdb:///itest/People/luke", string: "Luke Skywalker is a young Jedi knight who brings hope to the galaxy." },
@@ -531,5 +533,9 @@ describe("Indexing pipeline (real embeddings)", function () {
       expect(res.body).to.be.an("array")
       expect(res.body.length).to.be.at.least(1, "original c0 snapshot must still be searchable")
     })
+  })
+
+  after(async function () {
+    await agent().delete("/domain").query({ domain: DOMAIN }).set("Authorization", authHeader())
   })
 })

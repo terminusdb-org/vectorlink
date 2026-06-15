@@ -55,6 +55,20 @@ describe("POST /push — 409 state machine (accepted / indexing / indexed + atom
   this.timeout(120000)
 
   const BRANCH = "main"
+  const ALL_DOMAINS = ["admin/sm_indexed", "admin/sm_inflight", "admin/sm_race", "admin/sm_release"]
+
+  before(async function () {
+    // Clean up any stale state from prior runs (each test must be independently runnable).
+    for (const d of ALL_DOMAINS) {
+      await agent().delete("/domain").query({ domain: d }).set("Authorization", authHeader())
+    }
+  })
+
+  after(async function () {
+    for (const d of ALL_DOMAINS) {
+      await agent().delete("/domain").query({ domain: d }).set("Authorization", authHeader())
+    }
+  })
 
   it("re-pushing an INDEXED commit returns 409 (the original bug)", async function () {
     const domain = "admin/sm_indexed"

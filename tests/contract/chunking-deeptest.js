@@ -120,6 +120,8 @@ describe("Chunking deep-test (real embeddings + real chunker)", function () {
   const BOUNDARY_ID = "terminusdb:///chunk/Documents/boundary"
 
   before(async function () {
+    // Clean up any stale state from prior runs (each test must be independently runnable).
+    await agent().delete("/domain").query({ domain: DOMAIN }).set("Authorization", authHeader())
     // c0: the deterministic 5-chunk document with planted head/middle/tail phrases.
     const result = await pushAndWait(DOMAIN, BRANCH, "c0", [
       { op: "Inserted", id: FIVE_CHUNK_ID, string: buildFiveChunkDoc() },

@@ -7,6 +7,21 @@ const { expect } = require("chai")
 const { agent, authHeader } = require("../lib/agent")
 
 describe("P1-CON: Contract shapes", function () {
+  before(async function () {
+    // Clean up any stale state from prior runs (each test must be independently runnable).
+    const domainsUsed = ["admin/star_wars", "admin/db", "admin/ndjson_test"]
+    for (const d of domainsUsed) {
+      await agent().delete("/domain").query({ domain: d }).set("Authorization", authHeader())
+    }
+  })
+
+  after(async function () {
+    const domainsUsed = ["admin/star_wars", "admin/db", "admin/ndjson_test"]
+    for (const d of domainsUsed) {
+      await agent().delete("/domain").query({ domain: d }).set("Authorization", authHeader())
+    }
+  })
+
   // P1-CON-1: GET /last-indexed
   describe("P1-CON-1: GET /last-indexed", function () {
     it("returns 200 with LastIndexed shape {branch, commit, version}", async function () {

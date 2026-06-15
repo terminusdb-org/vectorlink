@@ -1014,6 +1014,86 @@ impl LanceStore {
         Ok(ds.version().version)
     }
 
+    /// Batched write for one commit's operations (Phase 6A Step 1).
+    ///
+    /// Performs at most TWO Lance version advances in a fixed, crash-safe order:
+    ///   1. (Optional) Delete: `ds.delete(doc_id IN (...))` for all docs that are
+    ///      being replaced (Changed) or removed (Deleted). Creates deletion vectors
+    ///      only — no new data fragment. Handles shrinking chunk counts correctly
+    ///      (all old chunks for a doc_id are removed regardless of count change).
+    ///   2. (Optional) Append: `ds.append(batch)` with ALL new rows for Insert +
+    ///      Changed docs. Exactly ONE new data fragment for all rows.
+    ///
+    /// Crash safety (two-version delete-then-append, Option B):
+    ///   This is NOT an atomic single-version merge-insert. It performs two separate
+    ///   Lance version advances (delete, then append). Crash-safety comes from the
+    ///   untagged-commit→invisible→re-pushable property:
+    ///   - Crash before (1): no change. Commit remains untagged → invisible → re-pushable.
+    ///   - Crash after (1) but before (2): Changed/Deleted docs' old chunks removed
+    ///     (correct for Deleted; for Changed, commit untagged → invisible → re-pushable,
+    ///     the re-push will re-insert the replacement rows).
+    ///   - Crash after (2): both writes committed. Tag not yet written → re-push is
+    ///     idempotent (delete of already-deleted rows is no-op; append of same rows
+    ///     would duplicate, but since commit is untagged it was never served →
+    ///     re-push via the pipeline lock clears and retries correctly).
+    ///
+    /// Caller MUST hold the pipeline lock. Dataset existence is ensured internally.
+    ///
+    /// Returns the final Lance version after all writes.
+    pub async fn io_batch_delete_append(
+        &self,
+        domain: &str,
+        branch: &str,
+        delete_ids: &[String],
+        rows: &[ChunkRow],
+    ) -> Result<u64, StoreError> {
+        // Serialise dataset creation against DELETE /domain (BLOCKER-2 / #6):
+        let _domain_guard = self.acquire_domain_guard(domain).await;
+
+        // Ensure the domain dataset exists (creates the main branch on first use).
+        self.io_open_dataset(domain, branch).await?;
+
+        // Use a SINGLE mutable handle for both delete and append. This ensures
+        // the append version is built ON TOP of the post-delete version (the append
+        // inherits the deletion vectors). Using separate handles would risk the
+        // second Dataset::open returning a stale version if the filesystem hasn't
+        // flushed the latest_version_hint before the second open reads it.
+        let mut ds = self.io_open_branch_for_write(domain, branch).await?;
+
+        // --- Phase 1: delete old chunks for Changed + Deleted doc_ids ---
+        // Creates deletion vectors only (no new data fragment). Handles shrinking
+        // chunk counts: ALL rows for a doc_id are removed regardless of old/new count.
+        if !delete_ids.is_empty() {
+            let filter = build_doc_id_in_filter(delete_ids);
+            ds.delete(&filter)
+                .await
+                .map_err(|e| StoreError::Internal(format!("batch delete failed: {}", e)))?;
+        }
+
+        // --- Phase 2: append all new rows (one fragment for all Insert + Changed) ---
+        // Since Phase 1 already deleted old rows for Changed docs, this is a pure
+        // append — no merge semantics needed. Produces exactly ONE new data fragment.
+        // The append builds on the post-delete version (same handle), so the final
+        // manifest correctly includes the deletion vectors.
+        if !rows.is_empty() {
+            let batch = self.rows_to_batch(rows)?;
+            let schema = self.chunk_schema();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+            ds.append(reader, None)
+                .await
+                .map_err(|e| StoreError::Internal(format!("batch append failed: {}", e)))?;
+        }
+
+        // Capture the version from the write handle BEFORE refreshing the cache.
+        // This is the authoritative post-write version (delete + append).
+        let version = ds.version().version;
+
+        // Refresh the cached handle so subsequent reads see the new data.
+        self.io_refresh_cached_dataset(domain, branch).await?;
+
+        Ok(version)
+    }
+
     /// Probabilistic background compaction trigger (BUG-FD24).
     ///
     /// Called after a fragment-creating write (io_upsert_chunks). Rolls a 5%
@@ -1047,9 +1127,21 @@ impl LanceStore {
 
         // Check (and set) the in-progress guard. If a compaction is already
         // running for this (domain, branch), skip (no-op).
+        //
+        // WHY: blocking_write() panics when called from within a tokio runtime
+        // (this fn is invoked from a tokio::spawn context).
+        // INVARIANT: compaction is probabilistic (5% roll); a skipped roll is
+        // retried on the next successful write. Steady-state compaction rate is
+        // negligibly affected by rare contention skips.
+        // CONSEQUENCE: if contention persists (pathological), fragments accumulate
+        // until contention clears and a roll succeeds. This is bounded by the
+        // 5% trigger rate and is self-healing.
         let key: BranchKey = (domain.clone(), branch.clone());
         {
-            let mut guard = store.compaction_in_progress.blocking_write();
+            let mut guard = match store.compaction_in_progress.try_write() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
             if guard.contains(&key) {
                 return; // Already in-flight — no-op.
             }
@@ -2750,7 +2842,19 @@ async fn io_background_compact(
     Ok(())
 }
 
-/// Build a SQL-like filter expression for doc_type and doc_id IN (...) filters.
+/// Build a Lance SQL filter expression `doc_id IN ('id1', 'id2', ...)` for batch
+/// deletion of documents by their doc_id. SQL-escapes single quotes in doc_ids.
+///
+/// Precondition: `ids` is non-empty (caller must check). A filter on an empty set
+/// is a logic error (Lance will reject the empty IN-list).
+fn build_doc_id_in_filter(ids: &[String]) -> String {
+    let values: Vec<String> = ids
+        .iter()
+        .map(|id| format!("'{}'", id.replace('\'', "''")))
+        .collect();
+    format!("doc_id IN ({})", values.join(", "))
+}
+
 fn build_filter_expression(doc_types: &[String], doc_ids: &[String]) -> String {
     let mut parts = Vec::new();
 

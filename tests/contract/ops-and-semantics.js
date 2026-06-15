@@ -61,6 +61,11 @@ describe("Operation semantics (Changed / Deleted / Error) — e2e", function () 
   const DOMAIN = "admin/ops_semantics"
   const BRANCH = "main"
 
+  before(async function () {
+    // Clean up any stale state from prior runs (each test must be independently runnable).
+    await agent().delete("/domain").query({ domain: DOMAIN }).set("Authorization", authHeader())
+  })
+
   after(async function () {
     await agent().delete("/domain").query({ domain: DOMAIN }).set("Authorization", authHeader())
   })
@@ -149,6 +154,11 @@ describe("Search semantics — /similar, /duplicates, empty-query, multilingual"
   const BRANCH = "main"
 
   before(async function () {
+    // Clean up any stale state from prior runs (each test must be independently runnable).
+    const domainsUsed = [DOMAIN, "admin/multilingual"]
+    for (const d of domainsUsed) {
+      await agent().delete("/domain").query({ domain: d }).set("Authorization", authHeader())
+    }
     await pushAndWait(DOMAIN, BRANCH, "ss_c0", [
       // Two genuinely related docs (both about lightsaber combat) + one unrelated.
       { op: "Inserted", id: "terminusdb:///ss/Topic/saber1", string: "Lightsaber combat form Soresu emphasises tight defensive bladework and patience." },
@@ -158,7 +168,10 @@ describe("Search semantics — /similar, /duplicates, empty-query, multilingual"
   })
 
   after(async function () {
-    await agent().delete("/domain").query({ domain: DOMAIN }).set("Authorization", authHeader())
+    const domainsUsed = [DOMAIN, "admin/multilingual"]
+    for (const d of domainsUsed) {
+      await agent().delete("/domain").query({ domain: d }).set("Authorization", authHeader())
+    }
   })
 
   it("/similar returns a genuinely related doc as a neighbour", async function () {
@@ -458,6 +471,8 @@ describe("Duplicates at scale — multi-chunk corpus must NOT return [] (e2e)", 
   })
 
   before(async function () {
+    // Clean up any stale state from prior runs (each test must be independently runnable).
+    await agent().delete("/domain").query({ domain: D }).set("Authorization", authHeader())
     const ops = []
     for (let f = 0; f < NUM_FAMILIES; f++) {
       const theme = `Topic family ${f} unique subject matter alpha${f} beta${f} gamma${f}`

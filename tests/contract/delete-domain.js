@@ -48,6 +48,14 @@ describe("DELETE /domain", function () {
 
   const DOMAIN = "admin/delete_me"
 
+  before(async function () {
+    // Clean up any stale state from prior runs (each test must be independently runnable).
+    const domainsUsed = [DOMAIN, "admin/resurrect_search", "admin/resurrect_index", "admin/queued_drain"]
+    for (const d of domainsUsed) {
+      await agent().delete("/domain").query({ domain: d }).set("Authorization", authHeader())
+    }
+  })
+
   it("removes a domain entirely; search at its commit is then gone", async function () {
     // Seed an indexed commit.
     await pushAndWait(DOMAIN, "main", "del_c0", [

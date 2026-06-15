@@ -1085,21 +1085,29 @@ struct PipelineCtx<'a> {
     branch: &'a str,
 }
 
-/// Run the push pipeline for a set of operations.
+/// Run the push pipeline for a set of operations (Phase 6A: one-push-one-fragment).
 /// Returns (indexed_count, skipped_docs) on success, or error message on failure.
 ///
-/// Pipeline ordering (solves BLOCKER-1 by construction):
-///   1. Acquire per-(domain, branch) pipeline lock
-///   2. Upsert chunks → version N (data written)
-///   3. Optimize indices (FTS + vector ANN) → version N+K (indices built)
-///      - Uses an UNCACHED dataset handle so searches on other branches aren't blocked
-///   4. Tag commit → version N+K (commit becomes searchable with full index coverage)
-///   5. Update last-indexed tracking
-///   6. Release pipeline lock
+/// Architecture:
+///   COLLECT phase (per-doc, IO only for embedding):
+///     For each operation: chunk → embed → build ChunkRows, OR accumulate into
+///     delete_only_ids / skipped. Per-doc failure isolation: a poisoned doc skips
+///     only itself.
+///   WRITE phase (batched, under pipeline lock):
+///     1. Acquire per-(domain, branch) pipeline lock
+///     2. io_batch_delete_append: two-version delete-then-append for all
+///        Insert/Changed rows + Deleted doc_ids → 1–2 fragments per commit
+///     3. Optimize indices (FTS + vector ANN) on uncached handle — O(delta)
+///     4. Tag commit → indexed version (commit becomes searchable)
+///     5. Update last-indexed tracking
+///     6. Release pipeline lock
 ///
-/// A commit is NOT resolvable until step 4 completes — `io_search` returns
-/// "commit not indexed" (404) for uncommitted work. This is correct + fail-loud
-/// (Phase 3 upgrades to graceful nearest-ancestor fallback).
+/// Crash safety (two-version delete-then-append):
+///   - Delete first, append second. Crash between them leaves only the
+///     pure-Deleted docs removed (correct) and the commit untagged (re-pushable).
+///   - Tag/last-indexed advance ONLY after both writes land.
+///   - NOT atomic single-version; crash-safety comes from the
+///     untagged-commit→invisible→re-pushable property.
 ///
 /// Serialised per-(domain, branch): at most ONE unindexed commit per branch at
 /// any time. The pipeline lock prevents a second push from starting until the
@@ -1112,22 +1120,43 @@ async fn io_run_index_pipeline(
     commit: &str,
     operations: Vec<Operation>,
 ) -> Result<(u64, Vec<SkippedDoc>), String> {
-    // Acquire the per-branch lock. Held for the entire upsert→optimize→tag sequence.
-    // This ensures at most one unindexed commit per branch and prevents snapshot
-    // isolation violations (a later commit's data cannot leak into an earlier tag).
-    let _guard = ctx.store.acquire_pipeline_lock(ctx.domain, ctx.branch).await;
-
-    let mut indexed_count: u64 = 0;
+    // ─── COLLECT phase (per-doc, IO only for embedding) ─────────────────────
+    // Accumulate all rows for Insert/Changed, all doc_ids to delete (Changed +
+    // Deleted), and skip+record failures per doc. io_embed is per-doc (Step 3 batches).
+    //
+    // Changed semantics: the old chunks for a Changed doc MUST be deleted before
+    // inserting the replacement rows. A doc that shrinks from 5 chunks to 1 chunk
+    // must not leave orphan chunks (chunk_index 1-4) behind. The delete_ids set
+    // covers both Changed (replacement) and Deleted (pure removal) doc_ids.
+    let mut all_rows: Vec<ChunkRow> = Vec::new();
+    let mut delete_ids: Vec<String> = Vec::new();
     let mut skipped: Vec<SkippedDoc> = Vec::new();
-    let mut last_version: u64 = 0;
+    let mut indexed_count: u64 = 0;
 
     for op in &operations {
         match op {
-            Operation::Inserted { id, string } | Operation::Changed { id, string } => {
-                match io_index_document(ctx, id, string).await {
-                    Ok(version) => {
+            Operation::Inserted { id, string } => {
+                match io_index_document_pure(ctx, id, string).await {
+                    Ok(mut rows) => {
+                        all_rows.append(&mut rows);
                         indexed_count += 1;
-                        last_version = version;
+                    }
+                    Err(e) => {
+                        skipped.push(SkippedDoc {
+                            id: id.clone(),
+                            message: e,
+                        });
+                    }
+                }
+            }
+            Operation::Changed { id, string } => {
+                match io_index_document_pure(ctx, id, string).await {
+                    Ok(mut rows) => {
+                        // Changed: delete ALL old chunks first (handles shrinking chunk count),
+                        // then insert replacement rows via the append.
+                        delete_ids.push(id.clone());
+                        all_rows.append(&mut rows);
+                        indexed_count += 1;
                     }
                     Err(e) => {
                         skipped.push(SkippedDoc {
@@ -1138,17 +1167,7 @@ async fn io_run_index_pipeline(
                 }
             }
             Operation::Deleted { id } => {
-                match ctx.store.io_delete_doc(ctx.domain, ctx.branch, id).await {
-                    Ok(version) => {
-                        last_version = version;
-                    }
-                    Err(e) => {
-                        skipped.push(SkippedDoc {
-                            id: id.clone(),
-                            message: format!("delete failed: {}", e),
-                        });
-                    }
-                }
+                delete_ids.push(id.clone());
             }
             Operation::Error { message } => {
                 // Per spec: Operation::Error → skip+record, do not fail the whole task.
@@ -1160,15 +1179,35 @@ async fn io_run_index_pipeline(
         }
     }
 
-    // Step 3: Optimize indices on an UNCACHED handle (Fix #2: doesn't block searches).
-    // FTS + vector ANN are built incrementally via optimize_indices(append()) — O(delta).
-    // This runs BEFORE tagging so the tagged version has full index coverage (BLOCKER-1 fix).
-    if last_version > 0 {
+    // ─── WRITE phase (batched, under pipeline lock) ─────────────────────────
+    // Only proceed if there is actual work (rows to insert/update or docs to delete).
+    let has_work = !all_rows.is_empty() || !delete_ids.is_empty();
+
+    if has_work {
+        // Acquire the per-branch lock. Held for the entire write→optimize→tag sequence.
+        // This ensures at most one unindexed commit per branch and prevents snapshot
+        // isolation violations (a later commit's data cannot leak into an earlier tag).
+        let _guard = ctx.store.acquire_pipeline_lock(ctx.domain, ctx.branch).await;
+
+        // Batched write (Option B): two-version delete-then-append under pipeline lock.
+        //   1. Delete: all Changed + Deleted doc_ids (removes old chunks, handles shrinking).
+        //   2. Append: all new rows for Insert + Changed docs (one fragment).
+        // Crash safety: crash after (1) but before (2) leaves commit untagged → re-pushable.
+        // Produces 1–2 fragments total (vs N per-doc fragments before Phase 6A).
+        let last_version = ctx
+            .store
+            .io_batch_delete_append(ctx.domain, ctx.branch, &delete_ids, &all_rows)
+            .await
+            .map_err(|e| format!("batch delete-append failed: {}", e))?;
+
+        // Optimize indices on an UNCACHED handle (Fix #2: doesn't block searches).
+        // FTS + vector ANN are built incrementally via optimize_indices(append()) — O(delta).
+        // This runs BEFORE tagging so the tagged version has full index coverage (BLOCKER-1 fix).
         let indexed_version = io_optimize_on_uncached_handle(ctx.store, ctx.domain, ctx.branch)
             .await
             .map_err(|e| format!("index optimization failed: {}", e))?;
 
-        // Step 4: Tag the commit to the INDEXED version (data + indices).
+        // Tag the commit to the INDEXED version (data + indices).
         // After this point, the commit is resolvable and fully searchable.
         let tag_version = indexed_version.unwrap_or(last_version);
         ctx.store
@@ -1176,7 +1215,7 @@ async fn io_run_index_pipeline(
             .await
             .map_err(|e| format!("failed to tag commit: {}", e))?;
 
-        // Step 5: Update last-indexed tracking.
+        // Update last-indexed tracking.
         ctx.store
             .update_last_indexed(ctx.domain, ctx.branch, commit, tag_version)
             .await;
@@ -1191,6 +1230,13 @@ async fn io_run_index_pipeline(
 /// Uses `io_open_dataset_uncached` so the write operations don't hold the shared
 /// `Arc<RwLock<Dataset>>` and block concurrent search reads (Fix #2).
 /// After optimization, refreshes the cached handle.
+///
+/// The index creation/optimization calls internally use DataFusion, which calls
+/// `Handle::current().block_on()` in some code paths (e.g. HashJoinExec). This
+/// panics when called from within a tokio::spawn context ("Cannot block the current
+/// thread from within a runtime"). To avoid this, the index operations run on a
+/// dedicated blocking thread via `spawn_blocking`, with a fresh single-threaded
+/// runtime for the async Lance calls.
 async fn io_optimize_on_uncached_handle(
     store: &LanceStore,
     domain: &str,
@@ -1206,17 +1252,32 @@ async fn io_optimize_on_uncached_handle(
         None => return Ok(None),
     };
 
-    // FTS: create inverted index or incrementally append new fragments.
-    crate::store::lance::io_ensure_fts_index_on_dataset(&mut ds)
-        .await
-        .map_err(|e| format!("FTS optimize failed: {}", e))?;
+    // Run index optimization on a blocking thread with its own runtime to avoid
+    // the DataFusion "Cannot block from within a runtime" panic (see doc comment).
+    let vector_config = store.vector_index_config().clone();
+    let final_version = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to create optimize runtime: {}", e))?;
 
-    // Vector ANN: create IVF_PQ index (if enough rows) or incrementally append.
-    crate::store::vector_index::io_ensure_vector_index(&mut ds, store.vector_index_config())
-        .await
-        .map_err(|e| format!("vector optimize failed: {}", e))?;
+        rt.block_on(async {
+            // FTS: create inverted index or incrementally append new fragments.
+            crate::store::lance::io_ensure_fts_index_on_dataset(&mut ds)
+                .await
+                .map_err(|e| format!("FTS optimize failed: {}", e))?;
 
-    let final_version = ds.version().version;
+            // Vector ANN: create IVF_PQ index (if enough rows) or incrementally append.
+            crate::store::vector_index::io_ensure_vector_index(&mut ds, &vector_config)
+                .await
+                .map_err(|e| format!("vector optimize failed: {}", e))?;
+
+            Ok::<u64, String>(ds.version().version)
+        })
+    })
+    .await
+    .map_err(|e| format!("optimize task panicked: {}", e))?
+    .map_err(|e: String| e)?;
 
     // Refresh the cached handle so subsequent reads see the optimized indices.
     store
@@ -1227,12 +1288,16 @@ async fn io_optimize_on_uncached_handle(
     Ok(Some(final_version))
 }
 
-/// Index a single document: chunk → embed → upsert.
-async fn io_index_document(
+/// Chunk and embed a single document, returning its ChunkRows (Phase 6A: pure collect).
+///
+/// IO: calls io_embed (the only side-effect). No store writes.
+/// Per-doc failure isolation: errors are returned to the caller for skip+record;
+/// they never abort the entire commit.
+async fn io_index_document_pure(
     ctx: &PipelineCtx<'_>,
     doc_id: &str,
     text: &str,
-) -> Result<u64, String> {
+) -> Result<Vec<ChunkRow>, String> {
     // 1. Chunk the document.
     let chunks = chunk::chunk_text(ctx.tokenizer, text, ctx.chunk_params)
         .map_err(|e| format!("chunking failed: {}", e))?;
@@ -1278,12 +1343,5 @@ async fn io_index_document(
         })
         .collect();
 
-    // 4. Upsert into the store.
-    let version = ctx
-        .store
-        .io_upsert_chunks(ctx.domain, ctx.branch, doc_id, &rows)
-        .await
-        .map_err(|e| format!("upsert failed: {}", e))?;
-
-    Ok(version)
+    Ok(rows)
 }

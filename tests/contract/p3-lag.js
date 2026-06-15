@@ -108,10 +108,24 @@ describe("P3-LAG — lag, catch-up, durable resolution", function () {
   const BRANCH = "main"
 
   before(async function () {
+    // Clean up any stale state from prior runs (each test must be independently runnable).
+    // DELETE /domain is idempotent (204 for non-existent domains).
+    const domainsUsed = [DOMAIN, "admin/blocker1", "admin/lag_recover", "admin/lag_noindex", "admin/restart_invariant"]
+    for (const d of domainsUsed) {
+      await agent().delete("/domain").query({ domain: d }).set("Authorization", authHeader())
+    }
     // Seed a single indexed commit c0 on main.
     await pushAndWait(DOMAIN, BRANCH, "lag_c0", [
       { op: "Inserted", id: "terminusdb:///lag/People/yoda", string: "Yoda is a wise old Jedi master who trains young Padawans." },
     ])
+  })
+
+  after(async function () {
+    // Clean up all domains used by this test suite.
+    const domainsUsed = [DOMAIN, "admin/blocker1", "admin/lag_recover", "admin/lag_noindex", "admin/restart_invariant"]
+    for (const d of domainsUsed) {
+      await agent().delete("/domain").query({ domain: d }).set("Authorization", authHeader())
+    }
   })
 
   it("P3-LAG-1: search a not-yet-indexed commit serves the nearest PROVEN ancestor and flags stale", async function () {
