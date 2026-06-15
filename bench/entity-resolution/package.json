@@ -15,6 +15,9 @@
     "bench:v2:duplicates": "node src/bench-v2.js --mode duplicates abt-buy-v2",
     "bench:v2:similar": "node src/bench-v2.js --mode similar abt-buy-v2",
     "bench:v2:similar:reload": "node src/bench-v2.js --mode similar --reload abt-buy-v2",
+    "bench:resolve": "node src/bench-resolve.js",
+    "bench:resolve:core": "node src/bench-resolve.js --tau-one-to-one 0.45",
+    "bench:resolve:extras": "node src/bench-resolve.js --tau-one-to-one 0.45 --tau-one-to-many 0.2 --tau-many-to-one 0.2",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {

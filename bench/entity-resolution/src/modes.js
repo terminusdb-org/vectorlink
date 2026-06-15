@@ -34,7 +34,7 @@ function sleep(ms) {
 // ── search mode ─────────────────────────────────────────────────────────────
 // One /search per record. The query text is the record's RENDERED text; the
 // candidate pool is scoped to the opposite side's doc_type so hits straddle.
-async function ioGatherSearch(ds, abt, buy, { k, queryDelayMs }) {
+async function ioGatherSearch(ds, abt, buy, { k, queryDelayMs, searchMode = "vector" }) {
   // The snapshot holds BOTH catalogues; we scope the query SERVER-SIDE to the
   // target catalogue's doc_type so the engine returns exactly the k nearest
   // opposite-side hits — no client over-fetch, smaller per-query reader footprint
@@ -49,7 +49,7 @@ async function ioGatherSearch(ds, abt, buy, { k, queryDelayMs }) {
         domain: ds.domain,
         commit: ds.commit,
         q: rec.text,
-        mode: "vector",
+        mode: searchMode,
         count: k,
         docTypes: [targetDocType],
       });
@@ -77,7 +77,7 @@ async function ioGatherSearch(ds, abt, buy, { k, queryDelayMs }) {
     return out;
   };
 
-  log(`search mode: Abt→Buy (${abt.length} queries) then Buy→Abt (${buy.length} queries), top-${k}`);
+  log(`search mode (${searchMode}): Abt→Buy (${abt.length} queries) then Buy→Abt (${buy.length} queries), top-${k}`);
   const abtToBuy = await direction(abt, "Buy");
   const buyToAbt = await direction(buy, "Abt");
   return { abtToBuy, buyToAbt };

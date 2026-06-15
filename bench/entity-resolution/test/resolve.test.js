@@ -5,214 +5,441 @@ const assert = require("node:assert/strict");
 const {
   resolve,
   buildCandidateGraph,
-  groundMutualTopK,
-  connectedComponents,
+  groundCore,
+  setExtras,
+  targetExtras,
+  resolveThresholds,
+  maxActiveTau,
+  DEFAULTS,
+  CARDINALITIES,
+  CARDINALITY_PRESETS,
 } = require("../src/resolve");
+
+// Suppress unused-import lint for exports verified by require() above.
+void CARDINALITIES;
+void CARDINALITY_PRESETS;
+void DEFAULTS;
 
 // Helper: build a Map from a plain object of arrays.
 const m = (obj) => new Map(Object.entries(obj));
 
-test("buildCandidateGraph caps edges at τ and keeps the minimum observed distance", () => {
-  const abtToBuy = m({ a1: [{ id: "b1", distance: 0.2 }, { id: "b2", distance: 0.7 }] });
-  const buyToAbt = m({ b1: [{ id: "a1", distance: 0.25 }], b2: [{ id: "a1", distance: 0.7 }] });
-  const g = buildCandidateGraph(abtToBuy, buyToAbt, 5, 0.5);
-  // b2 edge (0.7 > 0.5) pruned; a1-b1 keeps min(0.2, 0.25) = 0.2.
+// ── Threshold resolution + validation ────────────────────────────────────────
+
+test("resolveThresholds: many-to-many preset activates all three tau", () => {
+  const t = resolveThresholds({ cardinality: "many-to-many" });
+  assert.equal(t.tauOneToOne, 0.45);
+  assert.equal(t.tauOneToMany, 0.2);
+  assert.equal(t.tauManyToOne, 0.2);
+});
+
+test("resolveThresholds: one-to-many preset disables target-side extras", () => {
+  const t = resolveThresholds({ cardinality: "one-to-many" });
+  assert.equal(t.tauOneToOne, 0.45);
+  assert.equal(t.tauOneToMany, 0.2);
+  assert.equal(t.tauManyToOne, null);
+});
+
+test("resolveThresholds: one-to-one preset disables both extras", () => {
+  const t = resolveThresholds({ cardinality: "one-to-one" });
+  assert.equal(t.tauOneToOne, 0.45);
+  assert.equal(t.tauOneToMany, null);
+  assert.equal(t.tauManyToOne, null);
+});
+
+test("resolveThresholds: explicit overrides take precedence over preset", () => {
+  const t = resolveThresholds({ cardinality: "one-to-one", tauOneToMany: 0.3, tauManyToOne: 0.15 });
+  assert.equal(t.tauOneToOne, 0.45); // from preset
+  assert.equal(t.tauOneToMany, 0.3); // override
+  assert.equal(t.tauManyToOne, 0.15); // override
+});
+
+test("resolveThresholds: extras-looser-than-core is ALLOWED (no error)", () => {
+  // Independent knobs — no hard-enforced relationship.
+  assert.doesNotThrow(() => resolveThresholds({ tauOneToOne: 0.2, tauOneToMany: 0.5, tauManyToOne: 0.8 }));
+});
+
+test("resolveThresholds: out-of-[0,1] fails loud", () => {
+  assert.throws(() => resolveThresholds({ tauOneToOne: -0.1 }), /tauOneToOne/);
+  assert.throws(() => resolveThresholds({ tauOneToOne: 1.5 }), /tauOneToOne/);
+  assert.throws(() => resolveThresholds({ tauOneToMany: 2 }), /tauOneToMany/);
+  assert.throws(() => resolveThresholds({ tauManyToOne: -1 }), /tauManyToOne/);
+});
+
+test("resolveThresholds: unknown cardinality fails loud", () => {
+  assert.throws(() => resolveThresholds({ cardinality: "bogus" }), /cardinality/);
+});
+
+test("maxActiveTau returns the loosest active tau", () => {
+  assert.equal(maxActiveTau({ tauOneToOne: 0.4, tauOneToMany: 0.2, tauManyToOne: 0.3 }), 0.4);
+  assert.equal(maxActiveTau({ tauOneToOne: 0.2, tauOneToMany: 0.5, tauManyToOne: null }), 0.5);
+  assert.equal(maxActiveTau({ tauOneToOne: 0.3, tauOneToMany: null, tauManyToOne: null }), 0.3);
+});
+
+// ── Candidate graph ──────────────────────────────────────────────────────────
+
+test("buildCandidateGraph caps edges at tau and keeps the minimum observed distance", () => {
+  const setToTarget = m({ a1: [{ id: "b1", distance: 0.2 }, { id: "b2", distance: 0.7 }] });
+  const targetToSet = m({ b1: [{ id: "a1", distance: 0.25 }], b2: [{ id: "a1", distance: 0.7 }] });
+  const g = buildCandidateGraph(setToTarget, targetToSet, 5, 0.5);
   assert.equal(g.edges.size, 1);
   const [edge] = [...g.edges.values()];
-  assert.equal(edge.abtId, "a1");
-  assert.equal(edge.buyId, "b1");
+  assert.equal(edge.setId, "a1");
+  assert.equal(edge.targetId, "b1");
   assert.equal(edge.distance, 0.2);
 });
 
-test("mutual top-K grounding accepts only pairs in BOTH directions' top-K", () => {
-  // a1 <-> b1 mutual. a2 -> b2 but b2's nearest is a3 (not mutual) -> not grounded.
-  const abtToBuy = m({
+// ── Core grounding (tauOneToOne) ─────────────────────────────────────────────
+
+test("groundCore: only mutual pairs passing tauOneToOne are grounded", () => {
+  const setToTarget = m({
     a1: [{ id: "b1", distance: 0.1 }],
     a2: [{ id: "b2", distance: 0.3 }],
   });
-  const buyToAbt = m({
+  const targetToSet = m({
     b1: [{ id: "a1", distance: 0.1 }],
-    b2: [{ id: "a3", distance: 0.2 }],
+    b2: [{ id: "a3", distance: 0.2 }], // not mutual with a2
   });
-  const g = buildCandidateGraph(abtToBuy, buyToAbt, 5, 0.5);
-  const { grounded } = groundMutualTopK(g);
-  assert.equal(grounded.length, 1);
-  assert.equal(grounded[0].abtId, "a1");
-  assert.equal(grounded[0].buyId, "b1");
+  const g = buildCandidateGraph(setToTarget, targetToSet, 5, 0.5);
+  const core = groundCore(g, 0.5);
+  assert.equal(core.length, 1);
+  assert.equal(core[0].setId, "a1");
+  assert.equal(core[0].targetId, "b1");
+  assert.equal(core[0].stage, "core");
 });
 
-test("connected components partition the residual into independent clusters", () => {
-  // Two disjoint knots: {a1,a2}×{b1,b2} and {a3}×{b3}.
-  const edges = [
-    { abtId: "a1", buyId: "b1", distance: 0.3 },
-    { abtId: "a1", buyId: "b2", distance: 0.4 },
-    { abtId: "a2", buyId: "b1", distance: 0.35 },
-    { abtId: "a3", buyId: "b3", distance: 0.2 },
-  ];
-  const comps = connectedComponents(edges);
-  assert.equal(comps.length, 2);
-  const sizes = comps.map((c) => c.abtIds.size + c.buyIds.size).sort();
-  assert.deepEqual(sizes, [2, 4]);
+test("groundCore: tighter tauOneToOne excludes a mutual pair that is too distant", () => {
+  const setToTarget = m({ a1: [{ id: "b1", distance: 0.3 }] });
+  const targetToSet = m({ b1: [{ id: "a1", distance: 0.3 }] });
+  const g = buildCandidateGraph(setToTarget, targetToSet, 5, 0.5);
+  const core = groundCore(g, 0.2);
+  assert.equal(core.length, 0, "pair at d=0.3 excluded by tauOneToOne=0.2");
 });
 
-test("per-cluster optimal assignment beats greedy on the spec's failure case (assignment=optimal)", () => {
-  // No mutual-NN grounding here (asymmetric top-1s), so everything goes to Step 5.
-  // Greedy would take a1->b1 (0.10), forcing a2->b2 (0.90): total 1.00, and a2 mis-paired.
-  // Optimal: a1->b2 (0.20) + a2->b1 (0.30) = 0.50, both well-paired.
-  // NB: this is the 1:1 (Buy-exclusive) semantics — selected explicitly via
-  // assignment="optimal". The DEFAULT (per-source) is tested separately below;
-  // for THIS dataset's many-to-one truth, per-source is the correct default
-  // (Hungarian's "stealing" only applies when the Buy side is exclusive).
-  const abtToBuy = m({
-    a1: [{ id: "b1", distance: 0.1 }, { id: "b2", distance: 0.2 }],
-    a2: [{ id: "b1", distance: 0.3 }, { id: "b2", distance: 0.9 }],
-  });
-  // Buy side reports NO reciprocal candidates, so NOTHING is mutually grounded
-  // and both Abt fall to Step 5 within one connected component — exactly where
-  // optimal-vs-greedy diverges. (Edges still come from the Abt→Buy direction.)
-  const buyToAbt = m({ b1: [], b2: [] });
-  const r = resolve(abtToBuy, buyToAbt, { k: 5, threshold: 0.5, assignment: "optimal" });
-  assert.equal(r.grounded.length, 0, "expected no grounded pairs in this construction");
-  assert.equal(r.assigned.length, 2);
-  const byAbt = new Map(r.assigned.map((p) => [p.abtId, p.buyId]));
-  assert.equal(byAbt.get("a1"), "b2");
-  assert.equal(byAbt.get("a2"), "b1");
-});
-
-test("DEFAULT assignment is per-source (many-to-one): N Abt may share ONE Buy — no recall loss", () => {
-  // Three Abt all genuinely match Buy b1 (many-to-one truth). None mutually
-  // grounded (b1's reciprocal list is empty here). Under the correct many-to-one
-  // semantics every Abt takes its nearest ≤τ Buy and a Buy is NON-exclusive, so
-  // all three pairs are emitted. (Hungarian/optimal would emit only ONE — a
-  // recall bug for this truth model; see resolve.js header + agent memory.)
-  const abtToBuy = m({
-    a1: [{ id: "b1", distance: 0.1 }],
-    a2: [{ id: "b1", distance: 0.2 }],
-    a3: [{ id: "b1", distance: 0.3 }],
-  });
-  const buyToAbt = m({ b1: [] });
-  const r = resolve(abtToBuy, buyToAbt, { k: 5, threshold: 0.5 });
-  assert.equal(r.assigned.length, 3, "all three many-to-one matches must be emitted");
-  assert.equal(r.unmatchedAbt.length, 0, "no Abt left unmatched");
-  const byAbt = new Map(r.assigned.map((p) => [p.abtId, p.buyId]));
-  assert.equal(byAbt.get("a1"), "b1");
-  assert.equal(byAbt.get("a2"), "b1");
-  assert.equal(byAbt.get("a3"), "b1");
-});
-
-test("per-source assignment: each Abt takes its OWN nearest ≤τ Buy independently", () => {
-  // a1 nearest is b1 (0.1), a2 nearest is b2 (0.15). No Buy contention.
-  const abtToBuy = m({
-    a1: [{ id: "b1", distance: 0.1 }, { id: "b2", distance: 0.4 }],
-    a2: [{ id: "b2", distance: 0.15 }, { id: "b1", distance: 0.45 }],
-  });
-  const buyToAbt = m({ b1: [], b2: [] });
-  const r = resolve(abtToBuy, buyToAbt, { k: 5, threshold: 0.5 });
-  const byAbt = new Map(r.assigned.map((p) => [p.abtId, p.buyId]));
-  assert.equal(byAbt.get("a1"), "b1");
-  assert.equal(byAbt.get("a2"), "b2");
-});
-
-test("a Buy grounded to one Abt may still serve a DIFFERENT ungrounded Abt (many-to-one), and the grounded pair is NOT duplicated", () => {
-  // a1 mutually grounds with b1. a2 (ungrounded) also has b1 as its nearest ≤τ.
-  // Under many-to-one this is legitimate Buy reuse: a2->b1 is emitted as assigned,
-  // a1->b1 stays grounded, and the (a1,b1) pair appears exactly once.
-  const abtToBuy = m({
-    a1: [{ id: "b1", distance: 0.1 }],
-    a2: [{ id: "b1", distance: 0.3 }],
-  });
-  const buyToAbt = m({ b1: [{ id: "a1", distance: 0.1 }] });
-  const r = resolve(abtToBuy, buyToAbt, { k: 5, threshold: 0.5 });
-  assert.equal(r.grounded.length, 1);
-  assert.equal(r.grounded[0].abtId, "a1");
-  // a1 (grounded) must NOT be re-assigned in Step 5; only a2 is assigned.
-  assert.ok(!r.assigned.some((p) => p.abtId === "a1"), "grounded Abt a1 must not be re-assigned");
-  assert.ok(r.assigned.some((p) => p.abtId === "a2" && p.buyId === "b1"), "a2 may legitimately share b1");
-});
-
-test("invalid assignment strategy fails loud", () => {
-  const abtToBuy = m({ a1: [{ id: "b1", distance: 0.1 }] });
-  const buyToAbt = m({ b1: [] });
-  assert.throws(
-    () => resolve(abtToBuy, buyToAbt, { assignment: "bogus" }),
-    /assignment/,
-    "an unknown assignment strategy must throw, not silently default",
-  );
-});
-
-test("a record with no ≤ τ candidate is left unmatched (abstain, §4.6)", () => {
-  const abtToBuy = m({
-    a1: [{ id: "b1", distance: 0.1 }],
-    a2: [{ id: "b2", distance: 0.8 }], // > τ -> pruned -> no edge
-  });
-  const buyToAbt = m({ b1: [{ id: "a1", distance: 0.1 }], b2: [{ id: "a2", distance: 0.8 }] });
-  const r = resolve(abtToBuy, buyToAbt, { k: 5, threshold: 0.5 });
-  assert.ok(r.unmatchedAbt.includes("a2"), "a2 should be unmatched");
-  assert.ok(!r.groups.some((g) => g.abtId === "a2"), "a2 should not appear in any group");
-});
-
-test("runaway component falls back to greedy under maxComponentSize", () => {
-  // A dense 3×3 fully-connected knot; cap at 4 forces the greedy fallback.
-  const abtToBuy = m({
-    a1: [{ id: "b1", distance: 0.1 }, { id: "b2", distance: 0.2 }, { id: "b3", distance: 0.3 }],
-    a2: [{ id: "b1", distance: 0.15 }, { id: "b2", distance: 0.25 }, { id: "b3", distance: 0.35 }],
-    a3: [{ id: "b1", distance: 0.12 }, { id: "b2", distance: 0.22 }, { id: "b3", distance: 0.32 }],
-  });
-  const buyToAbt = m({ b1: [], b2: [], b3: [] });
-  // The runaway guard exists only in the OPTIMAL (Hungarian) path — that is the
-  // sole strategy with the O(n³) step a cap must protect. per-source (default)
-  // is linear and never needs the fallback. So this test targets assignment="optimal".
-  const r = resolve(abtToBuy, buyToAbt, { k: 5, threshold: 0.5, maxComponentSize: 4, assignment: "optimal" });
-  assert.equal(r.stats.runawayComponents, 1, "the oversized component should fall back to greedy");
-  assert.ok(r.stats.maxComponentObserved > 4);
-});
-
-test("mutual-top-K recovers a rank-2 true pair (refinement C over top-1)", () => {
-  // a1's nearest Buy is a near-miss b9 at rank1, true b1 at rank2; b1's nearest
-  // Abt is a1. With k>=2 the mutual membership grounds (a1,b1).
-  const abtToBuy = m({ a1: [{ id: "b9", distance: 0.30 }, { id: "b1", distance: 0.32 }] });
-  const buyToAbt = m({
-    b1: [{ id: "a1", distance: 0.32 }],
-    b9: [{ id: "a7", distance: 0.10 }],
-  });
-  const grounded = resolve(abtToBuy, buyToAbt, { k: 5, threshold: 0.5 }).grounded;
-  assert.ok(grounded.some((g) => g.abtId === "a1" && g.buyId === "b1"), "rank-2 mutual pair grounded");
-});
-
-test("grounding commits ONE pair per Abt (the nearest mutual neighbour)", () => {
-  // a1 has mutual edges to BOTH b1 (d=0.1) and b2 (d=0.2) — both Buy have a1 in
-  // their top-K and a1 has both in its top-K. The corrected grounding emits only
-  // the NEAREST mutual edge (b1, d=0.1) per §8.2: one committed pair per Abt.
-  const abtToBuy = m({ a1: [{ id: "b1", distance: 0.1 }, { id: "b2", distance: 0.2 }] });
-  const buyToAbt = m({
+test("groundCore: per-set-record nearest mutual (one core pair per set record)", () => {
+  const setToTarget = m({ a1: [{ id: "b1", distance: 0.1 }, { id: "b2", distance: 0.2 }] });
+  const targetToSet = m({
     b1: [{ id: "a1", distance: 0.1 }],
     b2: [{ id: "a1", distance: 0.2 }],
   });
-  const r = resolve(abtToBuy, buyToAbt, { k: 5, threshold: 0.5 });
-  assert.equal(r.grounded.length, 1, "only ONE pair per Abt from grounding");
-  assert.equal(r.grounded[0].abtId, "a1");
-  assert.equal(r.grounded[0].buyId, "b1", "the NEAREST mutual neighbour wins");
-  assert.equal(r.grounded[0].distance, 0.1);
-  assert.equal(r.groups.length, 1, "total committed prediction set has one pair");
+  const g = buildCandidateGraph(setToTarget, targetToSet, 5, 0.5);
+  const core = groundCore(g, 0.5);
+  assert.equal(core.length, 1);
+  assert.equal(core[0].targetId, "b1", "nearest mutual wins");
 });
 
-test("one-per-Abt invariant: resolver throws on duplicate Abt in output (poka-yoke)", () => {
-  // This test ensures the poka-yoke assertion fires. Under normal operation the
-  // resolver cannot produce duplicates (grounding is one-per-Abt and assignment
-  // only processes un-grounded Abt). We verify the invariant structurally by
-  // confirming the output has no Abt duplicates across modes.
-  const abtToBuy = m({
-    a1: [{ id: "b1", distance: 0.1 }, { id: "b2", distance: 0.2 }, { id: "b3", distance: 0.3 }],
-    a2: [{ id: "b1", distance: 0.15 }, { id: "b2", distance: 0.25 }],
+// ── Set-side extras (tauOneToMany) ───────────────────────────────────────────
+
+test("setExtras: emits additional targets beyond the core pair, passing tauOneToMany", () => {
+  const setToTarget = m({ a1: [{ id: "b1", distance: 0.1 }, { id: "b2", distance: 0.15 }, { id: "b3", distance: 0.4 }] });
+  const targetToSet = m({
+    b1: [{ id: "a1", distance: 0.1 }],
+    b2: [],
+    b3: [],
   });
-  const buyToAbt = m({
+  const g = buildCandidateGraph(setToTarget, targetToSet, 5, 0.5);
+  const core = groundCore(g, 0.5); // a1::b1 grounded
+  assert.equal(core.length, 1);
+  // tauOneToMany = 0.2: b2 at 0.15 passes, b3 at 0.4 does not.
+  const extras = setExtras(g, core, 0.2);
+  const extraTargets = extras.map((e) => e.targetId);
+  assert.ok(extraTargets.includes("b2"), "b2 within tauOneToMany");
+  assert.ok(!extraTargets.includes("b3"), "b3 excluded by tauOneToMany");
+  assert.ok(extras.every((e) => e.stage === "set_extra"));
+});
+
+test("setExtras: disabled when null", () => {
+  const g = buildCandidateGraph(m({ a1: [{ id: "b1", distance: 0.1 }] }), m({ b1: [] }), 5, 0.5);
+  const extras = setExtras(g, [], null);
+  assert.equal(extras.length, 0);
+});
+
+// ── Target-side extras (tauManyToOne) ────────────────────────────────────────
+
+test("targetExtras: emits additional set records for a target, passing tauManyToOne", () => {
+  // a2::b1 is a target-directed-only edge: b1 has a2 in its top-K (the target
+  // "found" a2), but a2 does NOT have b1 in its top-K (a2's top-K points
+  // elsewhere). This makes it a pure target extra (not core, not set_extra).
+  const setToTarget = m({
+    a1: [{ id: "b1", distance: 0.1 }],
+    a2: [{ id: "b2", distance: 0.1 }], // a2's top-K points to b2, not b1
+  });
+  const targetToSet = m({
     b1: [{ id: "a1", distance: 0.1 }, { id: "a2", distance: 0.15 }],
-    b2: [{ id: "a1", distance: 0.2 }, { id: "a2", distance: 0.25 }],
-    b3: [{ id: "a1", distance: 0.3 }],
+    b2: [],
   });
-  const r = resolve(abtToBuy, buyToAbt, { k: 5, threshold: 0.5 });
-  // Each Abt appears exactly once in groups (the committed prediction set).
-  const abtIds = r.groups.map((g) => g.abtId);
-  const unique = new Set(abtIds);
-  assert.equal(abtIds.length, unique.size, "no Abt appears more than once in committed output");
+  const g = buildCandidateGraph(setToTarget, targetToSet, 5, 0.5);
+  const core = groundCore(g, 0.5); // a1::b1 is mutual (a1 has b1, b1 has a1)
+  assert.equal(core.length, 1, "only a1::b1 is core");
+  const extras = targetExtras(g, core, 0.2);
+  assert.ok(extras.some((e) => e.setId === "a2" && e.targetId === "b1"));
+  assert.ok(extras.every((e) => e.stage === "target_extra"));
+});
+
+test("targetExtras: disabled when null", () => {
+  const g = buildCandidateGraph(m({ a1: [{ id: "b1", distance: 0.1 }] }), m({ b1: [] }), 5, 0.5);
+  const extras = targetExtras(g, [], null);
+  assert.equal(extras.length, 0);
+});
+
+// ── Full resolve: many-to-many (DEFAULT) ─────────────────────────────────────
+
+test("many-to-many: core + set_extra + target_extra all present when edges qualify", () => {
+  // Topology with all 3 stages:
+  //   - a1::b1 mutual core (both in each other's top-K, d=0.05)
+  //   - a1::b2 set_extra: a1 has b2 in its top-K at d=0.08 (set-directed, d <= tauOneToMany=0.1)
+  //   - a2::b1 target_extra: b1 has a2 in its top-K at d=0.15 (target-directed),
+  //     but a2 does NOT have b1 in its top-K (a2's neighbours go elsewhere).
+  //     d=0.15 > tauOneToMany=0.1 (so not a set_extra even if it were set-directed)
+  //     d=0.15 <= tauManyToOne=0.2 (qualifies as target_extra).
+  const setToTarget = m({
+    a1: [{ id: "b1", distance: 0.05 }, { id: "b2", distance: 0.08 }],
+    a2: [{ id: "b3", distance: 0.05 }], // a2's top-K points to b3, NOT b1
+  });
+  const targetToSet = m({
+    b1: [{ id: "a1", distance: 0.05 }, { id: "a2", distance: 0.15 }],
+    b2: [],
+    b3: [],
+  });
+  const r = resolve(setToTarget, targetToSet, {
+    k: 5, tauOneToOne: 0.45, tauOneToMany: 0.1, tauManyToOne: 0.2,
+  });
+  const stages = new Set(r.matched.map((p) => p.stage));
+  assert.ok(stages.has("core"), "core pairs present (a1::b1 mutual)");
+  assert.ok(stages.has("set_extra"), "set extras present (a1::b2 at d=0.08, set-directed)");
+  assert.ok(stages.has("target_extra"), "target extras present (a2::b1 at d=0.15, target-directed only)");
+  assert.equal(r.set_only.length, 0);
+});
+
+test("many-to-many: tightening extras collapses toward core-only", () => {
+  const setToTarget = m({
+    a1: [{ id: "b1", distance: 0.1 }, { id: "b2", distance: 0.3 }],
+    a2: [{ id: "b1", distance: 0.25 }],
+  });
+  const targetToSet = m({
+    b1: [{ id: "a1", distance: 0.1 }],
+    b2: [],
+  });
+  const r = resolve(setToTarget, targetToSet, {
+    k: 5, tauOneToOne: 0.45, tauOneToMany: 0.05, tauManyToOne: 0.05,
+  });
+  assert.ok(r.matched.length >= 1);
+  assert.ok(r.matched.every((p) => p.stage === "core"), "only core when extras tau is very tight");
+});
+
+test("many-to-many: multiple targets per set record AND multiple set records per target", () => {
+  const setToTarget = m({
+    a1: [{ id: "b1", distance: 0.05 }, { id: "b2", distance: 0.08 }],
+    a2: [{ id: "b1", distance: 0.08 }],
+  });
+  const targetToSet = m({
+    b1: [{ id: "a1", distance: 0.05 }],
+    b2: [],
+  });
+  const r = resolve(setToTarget, targetToSet, {
+    k: 5, tauOneToOne: 0.45, tauOneToMany: 0.2, tauManyToOne: 0.2,
+  });
+  const keys = r.matched.map((p) => `${p.setId}::${p.targetId}`).sort();
+  assert.ok(keys.includes("a1::b1"), "core pair");
+  assert.ok(keys.includes("a1::b2"), "set extra");
+  assert.ok(keys.includes("a2::b1"), "target extra");
+});
+
+// ── Full resolve: one-to-many ────────────────────────────────────────────────
+
+test("one-to-many: no target-side extras (tauManyToOne disabled by preset)", () => {
+  const setToTarget = m({
+    a1: [{ id: "b1", distance: 0.05 }, { id: "b2", distance: 0.1 }],
+    a2: [{ id: "b1", distance: 0.1 }],
+  });
+  const targetToSet = m({
+    b1: [{ id: "a1", distance: 0.05 }],
+    b2: [],
+  });
+  const r = resolve(setToTarget, targetToSet, { k: 5, cardinality: "one-to-many" });
+  const stages = new Set(r.matched.map((p) => p.stage));
+  assert.ok(!stages.has("target_extra"), "target extras disabled under one-to-many");
+  assert.ok(stages.has("core"));
+});
+
+// ── Full resolve: one-to-one ─────────────────────────────────────────────────
+
+test("one-to-one: only core pairs (both extras disabled by preset)", () => {
+  const setToTarget = m({
+    a1: [{ id: "b1", distance: 0.1 }, { id: "b2", distance: 0.15 }],
+    a2: [{ id: "b1", distance: 0.12 }],
+  });
+  const targetToSet = m({
+    b1: [{ id: "a1", distance: 0.1 }, { id: "a2", distance: 0.12 }],
+    b2: [{ id: "a1", distance: 0.15 }],
+  });
+  const r = resolve(setToTarget, targetToSet, { k: 5, cardinality: "one-to-one" });
+  assert.ok(r.matched.every((p) => p.stage === "core"), "only core under one-to-one preset");
+});
+
+// ── 3-PARTITION OUTPUT ───────────────────────────────────────────────────────
+
+test("3-partition: set record with no edge under any active tau -> set_only", () => {
+  const setToTarget = m({
+    a1: [{ id: "b1", distance: 0.1 }],
+    a2: [{ id: "b2", distance: 0.8 }], // beyond all tau
+  });
+  const targetToSet = m({ b1: [{ id: "a1", distance: 0.1 }], b2: [] });
+  const r = resolve(setToTarget, targetToSet, {
+    k: 5, tauOneToOne: 0.45, tauOneToMany: 0.2, tauManyToOne: 0.2,
+  });
+  assert.ok(r.set_only.includes("a2"), "a2 in set_only");
+  assert.ok(!r.matched.some((p) => p.setId === "a2"));
+});
+
+test("3-partition: target record with no edge under any active tau -> target_only", () => {
+  const setToTarget = m({ a1: [{ id: "b1", distance: 0.1 }] });
+  const targetToSet = m({
+    b1: [{ id: "a1", distance: 0.1 }],
+    b2: [{ id: "a1", distance: 0.8 }], // beyond all tau
+  });
+  const r = resolve(setToTarget, targetToSet, {
+    k: 5, tauOneToOne: 0.45, tauOneToMany: 0.2, tauManyToOne: 0.2,
+  });
+  assert.ok(r.target_only.includes("b2"), "b2 in target_only");
+});
+
+test("3-partition: counts are consistent", () => {
+  const setToTarget = m({
+    a1: [{ id: "b1", distance: 0.1 }],
+    a2: [{ id: "b2", distance: 0.8 }],
+    a3: [{ id: "b1", distance: 0.15 }],
+  });
+  const targetToSet = m({
+    b1: [{ id: "a1", distance: 0.1 }, { id: "a3", distance: 0.15 }],
+    b2: [],
+    b3: [],
+  });
+  const r = resolve(setToTarget, targetToSet, {
+    k: 5, tauOneToOne: 0.45, tauOneToMany: 0.2, tauManyToOne: 0.2,
+  });
+  const matchedSetIds = new Set(r.matched.map((p) => p.setId));
+  const matchedTargetIds = new Set(r.matched.map((p) => p.targetId));
+  const allSet = [...setToTarget.keys()];
+  const allTarget = [...targetToSet.keys()];
+  for (const id of allSet) {
+    assert.ok(matchedSetIds.has(id) || r.set_only.includes(id), `set id ${id} in matched or set_only`);
+  }
+  for (const id of allTarget) {
+    assert.ok(matchedTargetIds.has(id) || r.target_only.includes(id), `target id ${id} in matched or target_only`);
+  }
+});
+
+// ── Deduplication ────────────────────────────────────────────────────────────
+
+test("deduplication: same pair from set_extra and target_extra is kept once (higher-confidence stage)", () => {
+  const setToTarget = m({
+    a1: [{ id: "b1", distance: 0.05 }],
+    a2: [{ id: "b1", distance: 0.1 }],
+  });
+  const targetToSet = m({ b1: [{ id: "a1", distance: 0.05 }] });
+  const r = resolve(setToTarget, targetToSet, {
+    k: 5, tauOneToOne: 0.45, tauOneToMany: 0.2, tauManyToOne: 0.2,
+  });
+  const a2b1 = r.matched.filter((p) => p.setId === "a2" && p.targetId === "b1");
+  assert.equal(a2b1.length, 1, "deduplicated to one entry");
+  assert.equal(a2b1[0].stage, "set_extra");
+});
+
+// ── Default cardinality ──────────────────────────────────────────────────────
+
+test("default cardinality is many-to-many", () => {
+  const setToTarget = m({ a1: [{ id: "b1", distance: 0.1 }] });
+  const targetToSet = m({ b1: [{ id: "a1", distance: 0.1 }] });
+  const r = resolve(setToTarget, targetToSet, { k: 5 });
+  assert.equal(r.stats.cardinality, "many-to-many");
+});
+
+// ── Preset + override interaction ────────────────────────────────────────────
+
+test("one-to-one preset with explicit tauOneToMany override activates set extras", () => {
+  const setToTarget = m({
+    a1: [{ id: "b1", distance: 0.05 }, { id: "b2", distance: 0.1 }],
+  });
+  const targetToSet = m({ b1: [{ id: "a1", distance: 0.05 }], b2: [] });
+  const r = resolve(setToTarget, targetToSet, {
+    k: 5, cardinality: "one-to-one", tauOneToMany: 0.2,
+  });
+  const hasSetExtra = r.matched.some((p) => p.stage === "set_extra");
+  assert.ok(hasSetExtra, "explicit tauOneToMany override activates set extras even on one-to-one preset");
+});
+
+// ── INDEPENDENCE ACCEPTANCE TEST (the PO's bug symptom) ──────────────────────
+// Proves that changing tauOneToMany ALONE (tauManyToOne fixed) changes the
+// matched set, AND changing tauManyToOne alone changes it — i.e. the three
+// thresholds are genuinely independent.
+
+test("INDEPENDENCE: changing tauOneToMany alone changes matched count (tauManyToOne fixed)", () => {
+  // A graph with set-directed edges at various distances so tauOneToMany sweep
+  // produces different matched counts.
+  const setToTarget = m({
+    a1: [{ id: "b1", distance: 0.05 }, { id: "b2", distance: 0.12 }, { id: "b3", distance: 0.18 }],
+  });
+  const targetToSet = m({
+    b1: [{ id: "a1", distance: 0.05 }],
+    b2: [],
+    b3: [],
+  });
+  // tauManyToOne fixed at null (disabled) → only set-extras vary.
+  const rTight = resolve(setToTarget, targetToSet, {
+    k: 5, tauOneToOne: 0.45, tauOneToMany: 0.1, tauManyToOne: null,
+  });
+  const rLoose = resolve(setToTarget, targetToSet, {
+    k: 5, tauOneToOne: 0.45, tauOneToMany: 0.2, tauManyToOne: null,
+  });
+  assert.notEqual(rTight.matched.length, rLoose.matched.length,
+    "different tauOneToMany must produce different matched counts (independence)");
+  assert.ok(rLoose.matched.length > rTight.matched.length,
+    "looser tauOneToMany admits more matches");
+});
+
+test("INDEPENDENCE: changing tauManyToOne alone changes matched count (tauOneToMany fixed)", () => {
+  // A graph with target-directed-only edges at various distances.
+  // a2 and a3 are NOT in a1's setTopK — they come from b1's targetTopK only.
+  const setToTarget = m({
+    a1: [{ id: "b1", distance: 0.05 }],
+    a2: [{ id: "b2", distance: 0.05 }], // a2's top-K is b2, not b1
+    a3: [{ id: "b3", distance: 0.05 }], // a3's top-K is b3, not b1
+  });
+  const targetToSet = m({
+    b1: [{ id: "a1", distance: 0.05 }, { id: "a2", distance: 0.12 }, { id: "a3", distance: 0.18 }],
+    b2: [],
+    b3: [],
+  });
+  // tauOneToMany fixed at null (disabled) → only target-extras vary.
+  const rTight = resolve(setToTarget, targetToSet, {
+    k: 5, tauOneToOne: 0.45, tauOneToMany: null, tauManyToOne: 0.1,
+  });
+  const rLoose = resolve(setToTarget, targetToSet, {
+    k: 5, tauOneToOne: 0.45, tauOneToMany: null, tauManyToOne: 0.2,
+  });
+  assert.notEqual(rTight.matched.length, rLoose.matched.length,
+    "different tauManyToOne must produce different matched counts (independence)");
+  assert.ok(rLoose.matched.length > rTight.matched.length,
+    "looser tauManyToOne admits more matches");
+});
+
+test("INDEPENDENCE: one-to-many produces FEWER matches than many-to-many (distinct modes)", () => {
+  // Graph with both set-directed and target-directed-only edges.
+  const setToTarget = m({
+    a1: [{ id: "b1", distance: 0.05 }, { id: "b2", distance: 0.1 }],
+    a2: [{ id: "b3", distance: 0.05 }], // a2's top-K is b3, not b1
+  });
+  const targetToSet = m({
+    b1: [{ id: "a1", distance: 0.05 }, { id: "a2", distance: 0.12 }], // b1 found a2
+    b2: [],
+    b3: [],
+  });
+  const rMM = resolve(setToTarget, targetToSet, {
+    k: 5, tauOneToOne: 0.45, tauOneToMany: 0.2, tauManyToOne: 0.2,
+  });
+  const r1M = resolve(setToTarget, targetToSet, {
+    k: 5, cardinality: "one-to-many",
+  });
+  assert.ok(rMM.matched.length > r1M.matched.length,
+    "many-to-many includes target-directed extras that one-to-many excludes");
 });

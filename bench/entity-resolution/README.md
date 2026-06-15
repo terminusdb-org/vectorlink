@@ -177,7 +177,7 @@ every query), v2 indexes **both** catalogues into **one snapshot** and anchors a
 comparisons on already-stored vectors. v1 remains runnable as the **baseline**
 (`node src/bench.js abt-buy`, precision@1 83.16%).
 
-## The algorithm (pure, `src/resolve.js`)
+## The algorithm (pure, `src/resolve.js`) — 3-threshold model
 
 Given each record's top-K cross-catalogue neighbours in **both** directions
 (Abt→Buy and Buy→Abt, distances on the `[0,1]` cosine scale):
@@ -188,40 +188,63 @@ Given each record's top-K cross-catalogue neighbours in **both** directions
    each cross-NN direction to the opposite catalogue.
 2. **Reciprocal cross top-K NN** → a sparse bipartite candidate graph: an edge
    `(a,b)` exists iff `b ∈ topK(a)` **or** `a ∈ topK(b)`.
-3. **Threshold cap τ (default 0.5)** — prune every edge with distance `> τ`. A
-   record left with no edge is a legitimate non-match.
-4. **Mutual top-K grounding** — accept directly every pair mutually within the
-   other's top-K (`b ∈ topK(a)` **and** `a ∈ topK(b)`). Near-linear; resolves the
-   confident majority and removes those nodes before the only expensive step.
-5. **Assign the residual** (`--assignment`, default `per-source`):
-   - **`per-source` (DEFAULT — correct for this many-to-one truth).** The Abt-Buy
-     ground truth is **many-to-one**: an Abt maps to exactly **one** Buy, but a Buy
-     may match **several** Abt. The Buy side is therefore **non-exclusive** — there
-     is no contention for Buys, so each ungrounded Abt simply takes its **nearest
-     (argmin distance) ≤τ Buy**, and a Buy may be shared by several Abt. Ties break
-     to the lower Buy id (deterministic). This is both the optimal and the trivially
-     correct solution when targets are non-exclusive.
-   - **`optimal` (gated, for a 1:1 truth model).** Per-component **minimum-cost
-     bipartite (Hungarian)** assignment (`src/hungarian.js`), confined to small
-     **connected components** (never a global N×M matrix), with a **runaway-component
-     guard** that falls back to greedy on an oversized component (logged). This is
-     correct **only when both sides are exclusive** (1:1 truth) — spec §5's "an early
-     greedy pick steals the best target" argument assumes Buy exclusivity. Under the
-     Abt-Buy many-to-one truth it would **force one-Buy-per-Abt and drop legitimate
-     shared-Buy matches** (a recall loss), so it is NOT the default here. Kept
-     available for future 1:1 datasets (refinement D: "don't force 1:1 if the truth
-     isn't"; confirmed empirically — 3 Abt → 1 Buy yields 3 pairs under per-source, 1
-     under optimal).
-6. **Leave the rest unmatched** — abstain rather than force a least-bad pair.
+3. **Graph threshold = max(active τ)** — prune every edge with distance greater
+   than the **loosest active threshold**. A record left with no edge is a
+   legitimate non-match.
+4. **CORE — mutual top-K grounding (τ_one_to_one, default 0.45)** — per set
+   record, emit the NEAREST mutual-top-K pair (`b ∈ topK(a)` **and**
+   `a ∈ topK(b)`) passing `τ_one_to_one`. These are the high-confidence
+   reciprocal pairs. Near-linear.
+5. **SET-SIDE EXTRAS (τ_one_to_many, default 0.2)** — for each set record, emit
+   additional targets beyond the core pair passing `τ_one_to_many`. Produces
+   "one set record → several targets" edges.
+6. **TARGET-SIDE EXTRAS (τ_many_to_one, default 0.2)** — for each target, emit
+   additional set records beyond the core pair passing `τ_many_to_one`. Produces
+   "one target → several set records" edges.
+7. **Deduplicate** — a pair qualifying under both set_extra and target_extra is
+   kept once, at the higher-confidence stage (core > set_extra > target_extra).
+8. **Leave the rest unmatched** — abstain rather than force a least-bad pair.
 
-**Performance contract (§6):** the residual fragments into independent **connected
-components**, and the per-component assignment runs per cluster (never a global
-solve). Under `per-source` the assignment is **linear** in residual edges (no cubic
-step); under `optimal` the O(n³) Hungarian is structurally confined to clusters
-whose size **k** bounds, with the runaway guard as backstop. `k`, `τ`, and
-grounding-first are simultaneously the recall knobs and the cost knobs. Each run
-reports cluster-size distribution, the max component observed, runaway count, and
-per-cluster assignment time.
+### Three independent thresholds (the true precision interface)
+
+| Threshold | Controls | Default | Stage label |
+|-----------|----------|---------|-------------|
+| `τ_one_to_one` | closeness for the 1:1 mutual-best CORE | 0.45 | `core` |
+| `τ_one_to_many` | closeness for ADDITIONAL set-side matches | 0.2 | `set_extra` |
+| `τ_many_to_one` | closeness for ADDITIONAL target-side matches | 0.2 | `target_extra` |
+
+**Rules:**
+- Independent knobs — **no hard-enforced relationship** between them. Fail-loud
+  validation ONLY on out-of-[0,1], NOT on the relation between them (a caller may
+  legitimately set extras looser than the core).
+- Recommended ordering baked into the DEFAULTS (not enforced): core loosest
+  (catches most true pairs), extras tighter (avoids over-production).
+- A null tau **disables** that stage entirely.
+
+### Cardinality PRESETS (thin convenience wrappers)
+
+The three named modes are **thin presets** — convenience defaults for the three τ:
+
+| Preset | τ_one_to_one | τ_one_to_many | τ_many_to_one |
+|--------|-------------|---------------|---------------|
+| `many-to-many` (default) | 0.45 | 0.2 | 0.2 |
+| `one-to-many` | 0.45 | 0.2 | *disabled* |
+| `one-to-one` | 0.45 | *disabled* | *disabled* |
+
+Explicit `--tau-*` overrides take precedence over the preset.
+
+**Output is a 3-partition:**
+- `matched` — the pairs (denormalised set): `[{setId, targetId, distance, stage}]`
+- `set_only` — set records with NO match under any active τ
+- `target_only` — target records with NO match under any active τ
+
+> **FUTURE (noted, NOT built):** an auto-fit model that calculates the optimal τ
+> from the target distribution to force high F1 per dataset.
+
+> **SUPERSEDED (2026-06-14):** Previously reported numbers (88.8% precision /
+> 87.5% mapped precision / 78.9% F1 at k=5/τ=0.5) used a one-per-Abt grounding
+> model that under-counts the many-to-many truth. That model has been replaced
+> by the 3-threshold model above.
 
 ## Refinements baked in (A, E)
 
@@ -284,24 +307,39 @@ node src/bench-v2.js --mode duplicates abt-buy-v2        # npm run bench:v2:dupl
 node src/bench-v2.js --mode similar abt-buy-v2           # RUN DEFERRED (engine re-embeds anchor)
 ```
 
-Knobs (all printed per run): `--mode search|duplicates|similar`, `--k N`
-(fan-out, default 5), `--threshold T` (τ cap, default 0.5), `--assignment
-per-source|optimal` (default `per-source`, the many-to-one-correct path),
-`--max-component N` (runaway guard for `optimal`, default 200), `--reload`/`--force`
-(conscious re-index; `--no-load` is a reuse alias), `--no-cache` (ignore the
-candidate cache), `--gather-k N`, `--query-delay-ms N`. Unknown flags **fail loud**.
+Knobs (all printed per run): `--mode search|duplicates|similar`,
+`--search-mode vector|fts|hybrid` (engine retrieval mode, default `vector`),
+`--k N` (fan-out, default 5),
+`--threshold T` (engine/gather-side distance cap — gather once wide, then sweep τ
+narrow for free; default = loosest active τ; FAIL LOUD if any τ > threshold),
+`--tau-one-to-one T` (core τ, default 0.45),
+`--tau-one-to-many T` (set-side extras τ, default 0.2),
+`--tau-many-to-one T` (target-side extras τ, default 0.2),
+`--cardinality many-to-many|one-to-many|one-to-one` (preset, default
+`many-to-many`), `--max-component N` (runaway guard for `one-to-one`, default
+200), `--reload`/`--force` (conscious re-index; `--no-load` is a reuse alias),
+`--no-cache` (ignore the candidate cache), `--gather-k N`, `--query-delay-ms N`.
+Unknown flags **fail loud**.
 
 The **candidate cache** (`.candidate-cache/`) stores the gathered cross-NN lists so
-k/τ sweeps re-score for free. It is keyed by mode and validated against the snapshot
-**commit**, the cached **gatherK** (≥ requested k), and — for `duplicates` (whose
-gather applies τ server-side) — the cached **gather τ** (≥ requested τ). A reload, a
-tighter cached τ, or a commit mismatch all correctly **miss** the cache. A cache-hit
-gather time is printed as `[REPLAYED from cache]`.
+k/τ/threshold sweeps re-score for free. It is keyed by mode + searchMode and
+validated against: the snapshot **commit**, the cached **gatherK** (≥ requested k),
+and — for `duplicates` (whose gather applies threshold server-side) — the cached
+**gatherThreshold** (≥ requested threshold; a broader gather serves any narrower
+tau). For `search`/`similar` the engine returns top-K regardless of distance, so the
+gather threshold does not gate cache reuse. A cache-hit gather time is printed as
+`[REPLAYED from cache]`. The workflow: `--threshold 0.7` gathers once (wide), then
+`--tau-one-to-one 0.3/0.4/0.5` sweeps reuse it instantly.
 
-The scorecard reports: grounded (Step 4) vs assigned (Step 5) **pair counts and
-per-stage precision**, overall precision + recall vs the perfect mapping,
-**cluster-size distribution + assignment time** (the §6 contract), and wall-clock
-gather time vs the v1 baseline line.
+NOTE on `duplicates` mode: the engine's `/duplicates` endpoint returns **TOP-1** per
+set point, so widening `--threshold` recovers distant 1:1-core matches (recall of
+the core increases) but **cannot** recover 2nd+ matches (many-to-many extras) —
+those only surface via `search`/`similar` with the directional-extras constraint.
+
+The scorecard reports: the **3-partition** (matched / set_only / target_only),
+per-stage pair counts and precision (core / set_extra / target_extra), overall
+pair-based precision + recall + F1 vs the perfect mapping, the three active τ
+values and graph τ, and wall-clock gather + resolve times.
 
 ## Offline unit tests (pure logic — no engine)
 
@@ -315,9 +353,12 @@ npm test            # node --test test/*.test.js
 Covers: `hungarian` (min-cost assignment incl. the greedy-failure case,
 rectangular matrices), `text`/`sentenceCase` (brand de-allcaps, model-number
 preservation), the v2 `render` templates (refinements A + E), the `resolve`
-pipeline (τ cap, mutual-top-K grounding incl. rank-2 recovery, connected
-components, per-cluster optimal assignment beating greedy, runaway fallback,
-unmatched abstention), and `score-v2` (per-stage precision split, recall).
+pipeline (3-threshold model: resolveThresholds validation, maxActiveTau,
+groundCore, setExtras, targetExtras, preset + override interaction,
+deduplication with stage rank priority, 3-partition output, all three
+cardinality presets), `score-v2` (pair-based P/R/F1, many-to-many scoring,
+per-stage counts: core/set_extra/target_extra), and `bench-v2` (CLI parsing
+for --tau-* flags, candidate-cache reusability).
 
 ## Adding another dataset (v2)
 
