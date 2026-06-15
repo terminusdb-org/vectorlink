@@ -9,6 +9,7 @@ pub mod http_api;
 pub mod ingest;
 pub mod kernel;
 pub mod layeridx;
+pub mod resolve;
 pub mod service;
 pub mod store;
 

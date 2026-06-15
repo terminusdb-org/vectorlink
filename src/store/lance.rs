@@ -1606,6 +1606,84 @@ impl LanceStore {
         }
     }
 
+    /// Domain-scoped statistics — aggregates ONLY the named domain's footprint.
+    /// The `domain` parameter is the normalised org/db key (e.g. "admin/abt_buy_e2e").
+    /// Uses cached handles (no fresh opens) — FD-safe.
+    pub async fn statistics_for_domain(&self, domain: &str) -> Statistics {
+        let datasets = self.datasets.read().await;
+        let indexes = self.branch_indexes.read().await;
+
+        let mut domains_count: u64 = 0;
+        let mut distinct_branches: std::collections::HashSet<BranchKey> =
+            std::collections::HashSet::new();
+        let mut indexed_commits = 0u64;
+        let mut chunks = 0u64;
+        let mut distinct_docs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Check if this domain exists in datasets.
+        if datasets.contains_key(domain) {
+            domains_count = 1;
+        }
+
+        // Filter branch_indexes to only this domain.
+        for (key, bi) in indexes.iter() {
+            if key.0 == domain {
+                distinct_branches.insert(key.clone());
+                if domains_count == 0 {
+                    domains_count = 1;
+                }
+                if bi.commit.is_some() {
+                    indexed_commits += 1;
+                }
+            }
+        }
+        let branches = distinct_branches.len() as u64;
+
+        // Count rows and distinct doc_ids from this domain's dataset only.
+        if let Some(ds_arc) = datasets.get(domain) {
+            let ds = ds_arc.read().await;
+            if let Ok(count) = ds.count_rows(None).await {
+                chunks += count as u64;
+            }
+            // Scan doc_id column for distinct count.
+            let mut scanner = ds.scan();
+            if scanner.project(&["doc_id"]).is_ok() {
+                if let Ok(stream) = scanner.try_into_stream().await {
+                    if let Ok(batches) = stream.try_collect::<Vec<RecordBatch>>().await {
+                        for batch in &batches {
+                            if let Some(ids) = batch
+                                .column_by_name("doc_id")
+                                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                            {
+                                for i in 0..ids.len() {
+                                    distinct_docs.insert(ids.value(i).to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Count pending index fragments for this domain only.
+        let mut pending_index_fragments: u64 = 0;
+        if let Some(ds_arc) = datasets.get(domain) {
+            let ds = ds_arc.read().await;
+            if let Ok(pending) = crate::store::vector_index::count_unindexed_fragments(&ds).await {
+                pending_index_fragments += pending;
+            }
+        }
+
+        Statistics {
+            domains: domains_count,
+            branches,
+            indexed_commits,
+            documents: distinct_docs.len() as u64,
+            chunks,
+            pending_index_fragments,
+        }
+    }
+
     /// Vector/FTS/hybrid search over chunk rows at a given version.
     /// Returns chunk-level hits (caller dedups to documents).
     /// INVARIANT: searches the snapshot at the commit's tagged version, NOT the latest.
@@ -1981,10 +2059,273 @@ impl LanceStore {
             DEFAULT_DUPLICATE_MAX_PAIRS,
         ))
     }
+
+    /// Collect reciprocal cross-NN maps for entity resolution.
+    ///
+    /// Returns `(set_to_target, target_to_set)` where each map is
+    /// `HashMap<doc_id, Vec<Neighbour { id, distance }>>` on the reference [0,1]
+    /// cosine scale. Each entry's neighbours are sorted nearest-first and capped
+    /// at `k`.
+    ///
+    /// ALGORITHM:
+    ///  1. Open one cached snapshot (FD-safe: BUG-FD24).
+    ///  2. Scan set points (doc_id + embedding).
+    ///  3. Scan target points (doc_id + embedding).
+    ///  4. For each set point: ANN `nearest(k)` filtered to target doc_ids.
+    ///  5. For each target point: ANN `nearest(k)` filtered to set doc_ids.
+    ///
+    /// BOUNDED: the combined set+target point count must be <= `max_points`
+    /// (fail-loud). This prevents unbounded in-process loops.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn io_resolve_cross_neighbours(
+        &self,
+        domain: &str,
+        branch: &str,
+        commit: &str,
+        scope: &DuplicateScope,
+        k: usize,
+        threshold: f32,
+        max_points: usize,
+    ) -> Result<ResolveNeighbourMaps, StoreError> {
+        let snapshot = self.io_open_snapshot(domain, branch, commit).await?;
+
+        // Build filters for set and target populations.
+        let set_filter = build_filter_expression(&scope.set_doc_types, &scope.set_doc_ids);
+        let set_filter_opt = if set_filter.is_empty() { None } else { Some(set_filter) };
+
+        let target_filter =
+            build_filter_expression(&scope.target_doc_types, &scope.target_doc_ids);
+        let target_filter_opt =
+            if target_filter.is_empty() { None } else { Some(target_filter) };
+
+        // Scan set points (embeddings, no snippets).
+        let set_points = io_scan_points(&snapshot, set_filter_opt.as_deref(), false).await?;
+
+        // Scan target points. If no explicit target, target = set (within-set dedup).
+        let target_points = if scope.has_target() {
+            io_scan_points(&snapshot, target_filter_opt.as_deref(), false).await?
+        } else {
+            set_points.clone()
+        };
+
+        // Bounded check: combined population must be <= max_points.
+        let total_points = set_points.len() + target_points.len();
+        if total_points > max_points {
+            return Err(StoreError::Internal(format!(
+                "resolve refused: combined population has {} points (set={}, target={}), \
+                 exceeds the bound of {} — narrow the scope",
+                total_points,
+                set_points.len(),
+                target_points.len(),
+                max_points
+            )));
+        }
+
+        // Build the doc-id sets for filtering.
+        let target_doc_ids: Vec<String> = target_points
+            .iter()
+            .map(|p| p.doc_id.clone())
+            .collect::<std::collections::HashSet<String>>()
+            .into_iter()
+            .collect();
+
+        let set_doc_ids: Vec<String> = set_points
+            .iter()
+            .map(|p| p.doc_id.clone())
+            .collect::<std::collections::HashSet<String>>()
+            .into_iter()
+            .collect();
+
+        // For each set point: ANN top-K filtered to target doc_ids.
+        let set_to_target =
+            io_collect_top_k_cross(&snapshot, &set_points, &target_doc_ids, k, threshold).await?;
+
+        // For each target point: ANN top-K filtered to set doc_ids.
+        let target_to_set =
+            io_collect_top_k_cross(&snapshot, &target_points, &set_doc_ids, k, threshold).await?;
+
+        Ok(ResolveNeighbourMaps {
+            set_to_target,
+            target_to_set,
+        })
+    }
+}
+
+/// The two directional cross-NN maps for entity resolution.
+pub struct ResolveNeighbourMaps {
+    /// For each set doc_id: its top-K neighbours in the target population.
+    pub set_to_target:
+        std::collections::HashMap<String, Vec<crate::resolve::Neighbour>>,
+    /// For each target doc_id: its top-K neighbours in the set population.
+    pub target_to_set:
+        std::collections::HashMap<String, Vec<crate::resolve::Neighbour>>,
+}
+
+/// For each point in `points`, run a filtered top-K ANN query against `snapshot`
+/// restricted to the `candidate_doc_ids` population. Returns a map from each
+/// point's doc_id to its top-K neighbours (doc_id + normalised distance), sorted
+/// nearest-first. Doc-level dedup: the best (nearest) chunk per candidate doc is
+/// kept. The point's own doc_id is excluded from results.
+///
+/// This is the resolve-specific generalisation of `io_collect_neighbours` — it
+/// returns ALL k neighbours per point (not just the nearest 1), which the
+/// resolve algorithm needs for reciprocal top-K grounding.
+async fn io_collect_top_k_cross(
+    snapshot: &Dataset,
+    points: &[IndexedPoint],
+    candidate_doc_ids: &[String],
+    k: usize,
+    threshold: f32,
+) -> Result<std::collections::HashMap<String, Vec<crate::resolve::Neighbour>>, StoreError> {
+    use crate::resolve::Neighbour;
+
+    // Over-fetch factor: ANN recall can miss, so fetch more and take the best k.
+    let fetch_k = k * 2;
+
+    // Build the IN-list filter for candidates (shared across all queries).
+    let candidate_in_list: String = candidate_doc_ids
+        .iter()
+        .map(|id| format!("'{}'", id.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut result: std::collections::HashMap<String, Vec<Neighbour>> =
+        std::collections::HashMap::new();
+
+    for point in points {
+        // Filter: restrict to candidate population AND exclude own doc.
+        let filter = format!(
+            "doc_id IN ({}) AND doc_id != '{}'",
+            candidate_in_list,
+            point.doc_id.replace('\'', "''")
+        );
+
+        let mut scanner = snapshot.scan();
+        scanner
+            .nearest(
+                "embedding",
+                &Float32Array::from(point.embedding.clone()),
+                fetch_k,
+            )
+            .map_err(|e| {
+                StoreError::Internal(format!("resolve nearest setup failed: {}", e))
+            })?;
+        scanner.distance_metric(DistanceType::Cosine);
+        scanner
+            .project(&["doc_id"])
+            .map_err(|e| {
+                StoreError::Internal(format!("resolve nearest projection failed: {}", e))
+            })?;
+        scanner.filter(&filter).map_err(|e| {
+            StoreError::Internal(format!("resolve nearest filter failed: {}", e))
+        })?;
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .map_err(|e| {
+                StoreError::Internal(format!("resolve nearest stream failed: {}", e))
+            })?
+            .try_collect()
+            .await
+            .map_err(|e| {
+                StoreError::Internal(format!("resolve nearest collect failed: {}", e))
+            })?;
+
+        // Extract doc-level top-K from the chunk-level results.
+        let neighbours = extract_top_k_neighbours(&batches, k, threshold);
+        result
+            .entry(point.doc_id.clone())
+            .and_modify(|existing| {
+                // Merge: keep the best (nearest) per target doc across chunks.
+                merge_neighbours(existing, &neighbours);
+            })
+            .or_insert(neighbours);
+    }
+
+    Ok(result)
+}
+
+/// Extract doc-level top-K neighbours from ANN result batches.
+/// Deduplicates by doc_id (keeps best distance), caps at k, filters by threshold.
+/// Distances are normalised from Lance [0,2] to reference [0,1] scale.
+fn extract_top_k_neighbours(
+    batches: &[RecordBatch],
+    k: usize,
+    threshold: f32,
+) -> Vec<crate::resolve::Neighbour> {
+    use crate::resolve::Neighbour;
+
+    // Collect all (doc_id, distance) pairs, dedup by doc_id (min distance).
+    let mut best_per_doc: HashMap<String, f32> = HashMap::new();
+
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let doc_ids = match batch
+            .column_by_name("doc_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        {
+            Some(ids) => ids,
+            None => continue,
+        };
+        let distances = match batch
+            .column_by_name("_distance")
+            .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+        {
+            Some(d) => d,
+            None => continue,
+        };
+
+        for i in 0..batch.num_rows() {
+            let doc_id = doc_ids.value(i).to_owned();
+            let raw_dist = distances.value(i);
+            let norm_dist = normalized_cosine_from_lance(raw_dist);
+            if norm_dist > threshold {
+                continue;
+            }
+            best_per_doc
+                .entry(doc_id)
+                .and_modify(|best| {
+                    if norm_dist < *best {
+                        *best = norm_dist;
+                    }
+                })
+                .or_insert(norm_dist);
+        }
+    }
+
+    // Sort by distance (nearest first), take top k.
+    let mut sorted: Vec<(String, f32)> = best_per_doc.into_iter().collect();
+    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.truncate(k);
+
+    sorted
+        .into_iter()
+        .map(|(id, distance)| Neighbour { id, distance })
+        .collect()
+}
+
+/// Merge new neighbours into an existing list, keeping the best distance per doc.
+fn merge_neighbours(
+    existing: &mut Vec<crate::resolve::Neighbour>,
+    new: &[crate::resolve::Neighbour],
+) {
+    for n in new {
+        if let Some(e) = existing.iter_mut().find(|e| e.id == n.id) {
+            if n.distance < e.distance {
+                e.distance = n.distance;
+            }
+        } else {
+            existing.push(n.clone());
+        }
+    }
 }
 
 /// A single indexed point in the SET population: its owning document id, its
 /// embedding vector, and (when snippets are requested) its chunk text.
+#[derive(Clone)]
 struct IndexedPoint {
     doc_id: String,
     embedding: Vec<f32>,
@@ -3157,6 +3498,101 @@ mod tests {
         assert!(stats.chunks > 0, "chunks should be > 0 after upsert");
         assert!(stats.domains > 0, "domains should be > 0");
         assert!(stats.indexed_commits > 0, "indexed_commits should be > 0");
+    }
+
+    // --- scoped statistics returns only the named domain ---
+    #[tokio::test]
+    async fn statistics_for_domain_returns_only_target() {
+        let (store, _tmp) = make_test_store(8);
+
+        // Insert data into two distinct domains.
+        let rows_a = vec![ChunkRow {
+            doc_id: "doc/a1".to_owned(),
+            doc_type: "TypeA".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: fake_embedding(8, 1.0),
+            content: "domain alpha".to_owned(),
+        }];
+        let rows_b = vec![ChunkRow {
+            doc_id: "doc/b1".to_owned(),
+            doc_type: "TypeB".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: fake_embedding(8, 2.0),
+            content: "domain beta".to_owned(),
+        }];
+
+        store
+            .io_upsert_chunks("admin/alpha", "main", "doc/a1", &rows_a)
+            .await
+            .expect("upsert alpha");
+        store
+            .update_last_indexed("admin/alpha", "main", "c_alpha", 1)
+            .await;
+
+        store
+            .io_upsert_chunks("admin/beta", "main", "doc/b1", &rows_b)
+            .await
+            .expect("upsert beta");
+        store
+            .update_last_indexed("admin/beta", "main", "c_beta", 1)
+            .await;
+
+        // Global statistics sees both domains.
+        let global = store.statistics().await;
+        assert_eq!(global.domains, 2, "global should see 2 domains");
+
+        // Scoped statistics for alpha sees ONLY alpha.
+        let scoped_alpha = store.statistics_for_domain("admin/alpha").await;
+        assert_eq!(
+            scoped_alpha.domains, 1,
+            "scoped alpha: domains must be 1"
+        );
+        assert_eq!(
+            scoped_alpha.branches, 1,
+            "scoped alpha: branches must be 1"
+        );
+        assert_eq!(
+            scoped_alpha.indexed_commits, 1,
+            "scoped alpha: indexed_commits must be 1"
+        );
+        assert_eq!(
+            scoped_alpha.documents, 1,
+            "scoped alpha: documents must be 1 (doc/a1)"
+        );
+        assert!(
+            scoped_alpha.chunks > 0,
+            "scoped alpha: chunks must be > 0"
+        );
+
+        // Scoped statistics for beta sees ONLY beta.
+        let scoped_beta = store.statistics_for_domain("admin/beta").await;
+        assert_eq!(scoped_beta.domains, 1, "scoped beta: domains must be 1");
+        assert_eq!(scoped_beta.documents, 1, "scoped beta: documents must be 1");
+
+        // Scoped statistics for unknown domain sees nothing.
+        let scoped_unknown = store.statistics_for_domain("admin/nonexistent").await;
+        assert_eq!(
+            scoped_unknown.domains, 0,
+            "unknown domain: domains must be 0"
+        );
+        assert_eq!(
+            scoped_unknown.branches, 0,
+            "unknown domain: branches must be 0"
+        );
+        assert_eq!(
+            scoped_unknown.documents, 0,
+            "unknown domain: documents must be 0"
+        );
+        assert_eq!(
+            scoped_unknown.chunks, 0,
+            "unknown domain: chunks must be 0"
+        );
     }
 
     // --- commit tag isolation (different tags for different versions) ---

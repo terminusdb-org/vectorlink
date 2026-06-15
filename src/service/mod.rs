@@ -812,9 +812,91 @@ impl SearchService {
         Ok(paginated)
     }
 
-    /// Statistics.
+    /// Entity resolution: batch server-side matching over stored vectors.
+    ///
+    /// Replaces N sequential HTTP /similar calls with a single in-process batch:
+    /// scan both populations, collect reciprocal cross-NN in-process (FD-safe per
+    /// BUG-FD24), then run the 3-threshold matching algorithm (port of resolve.js).
+    ///
+    /// Returns the 3-partition output (matched, set_only, target_only) plus stats.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_with_options(
+        &self,
+        domain_raw: &str,
+        commit: &str,
+        scope: &DuplicateScope,
+        k: usize,
+        threshold: f32,
+        tau_one_to_one: f32,
+        tau_one_to_many: Option<f32>,
+        tau_many_to_one: Option<f32>,
+        ancestors: &[String],
+    ) -> Result<crate::resolve::ResolveResult, ServiceError> {
+        let rp =
+            parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
+
+        if !self.is_search_ready() {
+            return Err(ServiceError::Unavailable(
+                "search capability not ready (embedding backend cold)".to_owned(),
+            ));
+        }
+
+        let domain = Domain::from_resource_path(&rp);
+        let domain_str = domain.as_str().to_owned();
+        let branch = extract_branch(&rp);
+
+        // Resolve the searchable commit (catch-up resolution).
+        let served_commit = self
+            .resolve_searchable_commit(&domain, &branch, commit, ancestors)
+            .await?;
+
+        let start_time = std::time::Instant::now();
+
+        // Collect reciprocal cross-NN maps (in-process batch, FD-safe).
+        let maps = self
+            .store
+            .io_resolve_cross_neighbours(
+                &domain_str,
+                &branch,
+                &served_commit,
+                scope,
+                k,
+                threshold,
+                crate::store::lance::DEFAULT_DUPLICATE_MAX_POINTS,
+            )
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        // Run the pure matching algorithm.
+        let options = crate::resolve::ResolveOptions {
+            k,
+            threshold,
+            tau_one_to_one,
+            tau_one_to_many,
+            tau_many_to_one,
+        };
+
+        let elapsed_ms = start_time.elapsed().as_millis() as u64;
+        let result =
+            crate::resolve::resolve(&maps.set_to_target, &maps.target_to_set, &options, elapsed_ms);
+
+        Ok(result)
+    }
+
+    /// Global statistics — aggregates across ALL domains (admin/internal only).
     pub async fn statistics(&self) -> Result<Statistics, ServiceError> {
         Ok(self.store.statistics().await)
+    }
+
+    /// Domain-scoped statistics — aggregates ONLY the named domain's footprint.
+    /// Validates the domain string via parse_domain (fail-loud on invalid input).
+    pub async fn statistics_for_domain(&self, domain_raw: &str) -> Result<Statistics, ServiceError> {
+        let rp =
+            parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
+        let domain = Domain::from_resource_path(&rp);
+        let domain_str = domain.as_str().to_owned();
+
+        Ok(self.store.statistics_for_domain(&domain_str).await)
     }
 
     /// Delete a domain's ENTIRE footprint: the `{domain}.lance` dataset (all

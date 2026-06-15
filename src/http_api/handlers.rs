@@ -97,6 +97,24 @@ pub struct DuplicatesParams {
 
 // ─────────────────────────── Request body structs ─────────────────────────
 
+/// Request body for POST /resolve (entity resolution).
+#[derive(Debug, Deserialize)]
+pub struct ResolveRequestBody {
+    pub domain: Option<String>,
+    pub commit: Option<String>,
+    pub set_doc_types: Option<Vec<String>>,
+    pub set_doc_ids: Option<Vec<String>>,
+    pub target_doc_types: Option<Vec<String>>,
+    pub target_doc_ids: Option<Vec<String>>,
+    pub threshold: Option<f32>,
+    pub tau_one_to_one: Option<f32>,
+    pub tau_one_to_many: Option<f32>,
+    pub tau_many_to_one: Option<f32>,
+    pub k: Option<usize>,
+    /// Nearest-first ancestor window (same contract as /search POST).
+    pub ancestors: Option<Vec<String>>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SearchRequestBody {
     pub domain: Option<String>,
@@ -783,10 +801,169 @@ async fn handle_duplicates(
     }
 }
 
-async fn handle_statistics(State(state): State<AppState>) -> Response {
-    match state.service.statistics().await {
-        Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
+async fn handle_resolve(
+    State(state): State<AppState>,
+    Json(body): Json<ResolveRequestBody>,
+) -> Response {
+    let domain = body.domain.unwrap_or_default();
+    let commit = body.commit.unwrap_or_default();
+
+    if domain.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "missing required parameter: domain".to_owned(),
+        );
+    }
+    if commit.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "missing required parameter: commit".to_owned(),
+        );
+    }
+
+    // Threshold is required.
+    let threshold = match body.threshold {
+        Some(t) => t,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing required parameter: threshold".to_owned(),
+            );
+        }
+    };
+    if !(0.0..=1.0).contains(&threshold) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "threshold must be in [0, 1]".to_owned(),
+        );
+    }
+
+    // tau_one_to_one is required.
+    let tau_one_to_one = match body.tau_one_to_one {
+        Some(t) => t,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing required parameter: tau_one_to_one".to_owned(),
+            );
+        }
+    };
+    if !(0.0..=1.0).contains(&tau_one_to_one) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "tau_one_to_one must be in [0, 1]".to_owned(),
+        );
+    }
+    // Fail-loud: tau > threshold is the silent-recall trap.
+    if tau_one_to_one > threshold {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "tau_one_to_one ({}) > threshold ({}) — cannot filter looser than gathered",
+                tau_one_to_one, threshold
+            ),
+        );
+    }
+
+    // tau_one_to_many is optional (null = disabled).
+    let tau_one_to_many = body.tau_one_to_many;
+    if let Some(t) = tau_one_to_many {
+        if !(0.0..=1.0).contains(&t) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "tau_one_to_many must be in [0, 1]".to_owned(),
+            );
+        }
+        if t > threshold {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "tau_one_to_many ({}) > threshold ({}) — cannot filter looser than gathered",
+                    t, threshold
+                ),
+            );
+        }
+    }
+
+    // tau_many_to_one is optional (null = disabled).
+    let tau_many_to_one = body.tau_many_to_one;
+    if let Some(t) = tau_many_to_one {
+        if !(0.0..=1.0).contains(&t) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "tau_many_to_one must be in [0, 1]".to_owned(),
+            );
+        }
+        if t > threshold {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "tau_many_to_one ({}) > threshold ({}) — cannot filter looser than gathered",
+                    t, threshold
+                ),
+            );
+        }
+    }
+
+    let k = body.k.unwrap_or(5);
+    if k < 1 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "k must be >= 1".to_owned(),
+        );
+    }
+
+    let scope = crate::store::lance::DuplicateScope {
+        set_doc_types: body.set_doc_types.unwrap_or_default(),
+        set_doc_ids: body.set_doc_ids.unwrap_or_default(),
+        target_doc_types: body.target_doc_types.unwrap_or_default(),
+        target_doc_ids: body.target_doc_ids.unwrap_or_default(),
+    };
+    let ancestors = body.ancestors.unwrap_or_default();
+
+    match state
+        .service
+        .resolve_with_options(
+            &domain,
+            &commit,
+            &scope,
+            k,
+            threshold,
+            tau_one_to_one,
+            tau_one_to_many,
+            tau_many_to_one,
+            &ancestors,
+        )
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
         Err(e) => service_error_to_response(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StatisticsParams {
+    pub domain: Option<String>,
+}
+
+async fn handle_statistics(
+    State(state): State<AppState>,
+    Query(params): Query<StatisticsParams>,
+) -> Response {
+    match params.domain {
+        Some(ref d) if !d.is_empty() => {
+            match state.service.statistics_for_domain(d).await {
+                Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
+                Err(e) => service_error_to_response(e),
+            }
+        }
+        _ => {
+            // No domain filter — global statistics (admin/internal use only).
+            match state.service.statistics().await {
+                Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
+                Err(e) => service_error_to_response(e),
+            }
+        }
     }
 }
 
@@ -853,6 +1030,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/search", get(handle_search_get).post(handle_search_post))
         .route("/similar", get(handle_similar).post(handle_similar_post))
         .route("/duplicates", get(handle_duplicates))
+        .route("/resolve", post(handle_resolve))
         .route("/statistics", get(handle_statistics))
         .route("/domain", delete(handle_delete_domain))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
