@@ -250,10 +250,11 @@ async fn io_collect_top_k_cross(
             scanner
                 .nearest(
                     "embedding",
-                    // Probe vector: currently the stored document embedding.
-                    // Dual-vector recall fix: swap `point.embedding` for the
-                    // query_embedding field here (one-line change).
-                    &Float32Array::from(point.embedding.clone()),
+                    // Probe vector: the stored QUERY-role embedding (Phase 6A Step 5).
+                    // Asymmetric signal: set.query_embedding probes target.embedding
+                    // ANN index. Lifts /resolve recall from ~27% to ~94% at k=1
+                    // (spike evidence: dual-embed-spike.md).
+                    &Float32Array::from(point.query_embedding.clone()),
                     fetch_k,
                 )
                 .map_err(|e| {
@@ -375,16 +376,22 @@ fn merge_neighbours(
 }
 
 /// A single indexed point in the SET population: its owning document id, its
-/// embedding vector, and (when snippets are requested) its chunk text.
+/// query-role embedding (for the asymmetric probe), and (when snippets are
+/// requested) its chunk text.
 #[derive(Clone)]
 pub(super) struct IndexedPoint {
     pub(super) doc_id: String,
-    pub(super) embedding: Vec<f32>,
+    /// Query-role embedding for asymmetric probe (Phase 6A Step 5: dual-vector).
+    /// Used by /resolve and /duplicates to probe set.query_embedding against
+    /// target.embedding ANN index, lifting recall ~27%→94% at k=1.
+    pub(super) query_embedding: Vec<f32>,
     pub(super) content: Option<String>,
 }
 
-/// Scan the SET population's points (doc_id + embedding, plus content for
+/// Scan the SET population's points (doc_id + query_embedding, plus content for
 /// snippets) from a versioned snapshot, optionally filtered to the set scope.
+/// Projects ONLY `query_embedding` (not `embedding`) — YAGNI: the doc-role
+/// vector is not needed by the probe path (Phase 6A Step 5 dual-vector).
 async fn io_scan_points(
     snapshot: &Dataset,
     set_filter: Option<&str>,
@@ -392,9 +399,9 @@ async fn io_scan_points(
 ) -> Result<Vec<IndexedPoint>, StoreError> {
     let mut scanner = snapshot.scan();
     let projection: &[&str] = if snippet {
-        &["doc_id", "embedding", "content"]
+        &["doc_id", "query_embedding", "content"]
     } else {
-        &["doc_id", "embedding"]
+        &["doc_id", "query_embedding"]
     };
     scanner
         .project(projection)
@@ -416,8 +423,8 @@ async fn io_scan_points(
     batches_to_points(&batches, snippet)
 }
 
-/// Extract `IndexedPoint`s from projected RecordBatches (doc_id + embedding, plus
-/// content when snippets requested).
+/// Extract `IndexedPoint`s from projected RecordBatches (doc_id +
+/// query_embedding, plus content when snippets requested).
 /// FAIL-LOUD: a batch missing a required column, or an embedding row that is null,
 /// is a real schema/corruption error — never silently skipped (which would drop
 /// points and yield quietly-incomplete duplicate results).
@@ -433,11 +440,11 @@ fn batches_to_points(batches: &[RecordBatch], snippet: bool) -> Result<Vec<Index
             .ok_or_else(|| {
                 StoreError::Internal("duplicates scan: missing `doc_id` column".to_owned())
             })?;
-        let embeddings = batch
-            .column_by_name("embedding")
+        let query_embeddings = batch
+            .column_by_name("query_embedding")
             .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
             .ok_or_else(|| {
-                StoreError::Internal("duplicates scan: missing `embedding` column".to_owned())
+                StoreError::Internal("duplicates scan: missing `query_embedding` column".to_owned())
             })?;
         let contents = if snippet {
             Some(
@@ -453,10 +460,10 @@ fn batches_to_points(batches: &[RecordBatch], snippet: bool) -> Result<Vec<Index
         };
 
         for i in 0..n {
-            let embedding = extract_embedding_row(embeddings, i, doc_ids.value(i))?;
+            let query_embedding = extract_embedding_row(query_embeddings, i, doc_ids.value(i))?;
             points.push(IndexedPoint {
                 doc_id: doc_ids.value(i).to_owned(),
-                embedding,
+                query_embedding,
                 content: contents.map(|c| c.value(i).to_owned()),
             });
         }
@@ -508,7 +515,13 @@ async fn io_nearest_neighbour(
 
     let mut scanner = snapshot.scan();
     scanner
-        .nearest("embedding", &Float32Array::from(point.embedding.clone()), NEIGHBOUR_K)
+        .nearest(
+            "embedding",
+            // Dual-vector probe (Phase 6A Step 5): use the query-role embedding to
+            // probe the document-role ANN index. Same asymmetric signal as /resolve.
+            &Float32Array::from(point.query_embedding.clone()),
+            NEIGHBOUR_K,
+        )
         .map_err(|e| StoreError::Internal(format!("duplicates nearest setup failed: {}", e)))?;
     scanner.distance_metric(DistanceType::Cosine);
     let projection: &[&str] = if snippet {

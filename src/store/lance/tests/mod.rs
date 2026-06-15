@@ -188,6 +188,7 @@ async fn upsert_and_tag_commit_round_trips() {
             chunk_token_start: 0,
             doc_token_len: 40,
             embedding: fake_embedding(8, 1.0),
+            query_embedding: fake_embedding(8, 1.0),
             content: "Yoda is a wise Jedi.".to_owned(),
         },
         ChunkRow {
@@ -198,6 +199,7 @@ async fn upsert_and_tag_commit_round_trips() {
             chunk_token_start: 0,
             doc_token_len: 30,
             embedding: fake_embedding(8, 2.0),
+            query_embedding: fake_embedding(8, 2.0),
             content: "Mon Calamari are squid people.".to_owned(),
         },
     ];
@@ -241,6 +243,7 @@ async fn multi_chunk_doc_produces_multiple_rows() {
             chunk_token_start: 0,
             doc_token_len: 1500,
             embedding: fake_embedding(8, 1.0),
+            query_embedding: fake_embedding(8, 1.0),
             content: "Beginning of the article.".to_owned(),
         },
         ChunkRow {
@@ -251,6 +254,7 @@ async fn multi_chunk_doc_produces_multiple_rows() {
             chunk_token_start: 450,
             doc_token_len: 1500,
             embedding: fake_embedding(8, 2.0),
+            query_embedding: fake_embedding(8, 2.0),
             content: "Middle of the article.".to_owned(),
         },
         ChunkRow {
@@ -261,6 +265,7 @@ async fn multi_chunk_doc_produces_multiple_rows() {
             chunk_token_start: 900,
             doc_token_len: 1500,
             embedding: fake_embedding(8, 3.0),
+            query_embedding: fake_embedding(8, 3.0),
             content: "End of the article.".to_owned(),
         },
     ];
@@ -296,6 +301,7 @@ async fn lookup_doc_chunks_carries_stored_embedding() {
             chunk_token_start: 0,
             doc_token_len: 100,
             embedding: emb0.clone(),
+            query_embedding: emb0.clone(),
             content: "chunk zero".to_owned(),
         },
         ChunkRow {
@@ -306,6 +312,7 @@ async fn lookup_doc_chunks_carries_stored_embedding() {
             chunk_token_start: 50,
             doc_token_len: 100,
             embedding: emb1.clone(),
+            query_embedding: emb1.clone(),
             content: "chunk one".to_owned(),
         },
     ];
@@ -343,6 +350,7 @@ async fn delete_doc_removes_all_chunks() {
             chunk_token_start: 0,
             doc_token_len: 100,
             embedding: fake_embedding(8, 1.0),
+            query_embedding: fake_embedding(8, 1.0),
             content: "part 1".to_owned(),
         },
         ChunkRow {
@@ -353,6 +361,7 @@ async fn delete_doc_removes_all_chunks() {
             chunk_token_start: 50,
             doc_token_len: 100,
             embedding: fake_embedding(8, 2.0),
+            query_embedding: fake_embedding(8, 2.0),
             content: "part 2".to_owned(),
         },
     ];
@@ -609,6 +618,7 @@ async fn statistics_reflect_indexed_data() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: fake_embedding(8, 1.0),
+            query_embedding: fake_embedding(8, 1.0),
         content: "test".to_owned(),
     }];
 
@@ -638,6 +648,7 @@ async fn statistics_for_domain_returns_only_target() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: fake_embedding(8, 1.0),
+            query_embedding: fake_embedding(8, 1.0),
         content: "domain alpha".to_owned(),
     }];
     let rows_b = vec![ChunkRow {
@@ -648,6 +659,7 @@ async fn statistics_for_domain_returns_only_target() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: fake_embedding(8, 2.0),
+            query_embedding: fake_embedding(8, 2.0),
         content: "domain beta".to_owned(),
     }];
 
@@ -733,6 +745,7 @@ async fn different_commits_different_versions() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: fake_embedding(8, 1.0),
+            query_embedding: fake_embedding(8, 1.0),
         content: "version one".to_owned(),
     }];
     let v1 = store
@@ -753,6 +766,7 @@ async fn different_commits_different_versions() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: fake_embedding(8, 2.0),
+            query_embedding: fake_embedding(8, 2.0),
         content: "version two".to_owned(),
     }];
     let v2 = store
@@ -993,6 +1007,7 @@ async fn reindex_after_restart_resumes_forward_not_from_scratch() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: fake_embedding(8, 1.0),
+            query_embedding: fake_embedding(8, 1.0),
         content: "zero".to_owned(),
     };
     let v0 = store
@@ -1010,6 +1025,7 @@ async fn reindex_after_restart_resumes_forward_not_from_scratch() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: fake_embedding(8, 2.0),
+            query_embedding: fake_embedding(8, 2.0),
         content: "one".to_owned(),
     };
     let v1 = store
@@ -1045,6 +1061,7 @@ async fn reindex_after_restart_resumes_forward_not_from_scratch() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: fake_embedding(8, 3.0),
+            query_embedding: fake_embedding(8, 3.0),
         content: "two".to_owned(),
     };
     let v2 = restarted
@@ -1091,6 +1108,7 @@ async fn untagged_midindex_commit_is_not_complete_after_restart() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: fake_embedding(8, 1.0),
+            query_embedding: fake_embedding(8, 1.0),
         content: "zero".to_owned(),
     };
     let v0 = store
@@ -1109,6 +1127,7 @@ async fn untagged_midindex_commit_is_not_complete_after_restart() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: fake_embedding(8, 2.0),
+            query_embedding: fake_embedding(8, 2.0),
         content: "one".to_owned(),
     };
     let _v1 = store
@@ -1153,6 +1172,7 @@ async fn snapshot_isolation_search_at_old_commit_excludes_new_data() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: emb_a.clone(),
+        query_embedding: emb_a.clone(),
         content: "document A".to_owned(),
     }];
     let v0 = store
@@ -1174,6 +1194,7 @@ async fn snapshot_isolation_search_at_old_commit_excludes_new_data() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: emb_b.clone(),
+        query_embedding: emb_b.clone(),
         content: "document B".to_owned(),
     }];
     let v1 = store
@@ -1257,6 +1278,7 @@ async fn assign_is_tag_pointer_no_recompute() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: emb_a.clone(),
+        query_embedding: emb_a.clone(),
         content: "alpha".to_owned(),
     }];
     store
@@ -1271,6 +1293,7 @@ async fn assign_is_tag_pointer_no_recompute() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: fake_embedding(8, 2.0),
+        query_embedding: fake_embedding(8, 2.0),
         content: "beta".to_owned(),
     }];
     let v0 = store
@@ -1347,6 +1370,7 @@ async fn assign_unindexed_source_fails_loud() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: fake_embedding(8, 1.0),
+            query_embedding: fake_embedding(8, 1.0),
         content: "x".to_owned(),
     }];
     store.io_upsert_chunks("admin/a", "main", "doc/X", &r).await.unwrap();
@@ -1375,6 +1399,7 @@ async fn changed_replaces_full_chunk_set_no_stale() {
             chunk_token_start: 0,
             doc_token_len: 1500,
             embedding: fake_embedding(8, 1.0),
+            query_embedding: fake_embedding(8, 1.0),
             content: "original beginning".to_owned(),
         },
         ChunkRow {
@@ -1385,6 +1410,7 @@ async fn changed_replaces_full_chunk_set_no_stale() {
             chunk_token_start: 500,
             doc_token_len: 1500,
             embedding: fake_embedding(8, 2.0),
+            query_embedding: fake_embedding(8, 2.0),
             content: "original middle".to_owned(),
         },
         ChunkRow {
@@ -1395,6 +1421,7 @@ async fn changed_replaces_full_chunk_set_no_stale() {
             chunk_token_start: 1000,
             doc_token_len: 1500,
             embedding: fake_embedding(8, 3.0),
+            query_embedding: fake_embedding(8, 3.0),
             content: "original end".to_owned(),
         },
     ];
@@ -1417,6 +1444,7 @@ async fn changed_replaces_full_chunk_set_no_stale() {
         chunk_token_start: 0,
         doc_token_len: 40,
         embedding: fake_embedding(8, 9.0),
+            query_embedding: fake_embedding(8, 9.0),
         content: "shortened content".to_owned(),
     }];
     store
@@ -1453,6 +1481,7 @@ async fn deleted_removes_all_chunks_for_doc() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: fake_embedding(8, 1.0),
+            query_embedding: fake_embedding(8, 1.0),
         content: "keep me".to_owned(),
     }];
     let gone = vec![
@@ -1464,6 +1493,7 @@ async fn deleted_removes_all_chunks_for_doc() {
             chunk_token_start: 0,
             doc_token_len: 200,
             embedding: fake_embedding(8, 2.0),
+            query_embedding: fake_embedding(8, 2.0),
             content: "gone part 1".to_owned(),
         },
         ChunkRow {
@@ -1474,6 +1504,7 @@ async fn deleted_removes_all_chunks_for_doc() {
             chunk_token_start: 100,
             doc_token_len: 200,
             embedding: fake_embedding(8, 3.0),
+            query_embedding: fake_embedding(8, 3.0),
             content: "gone part 2".to_owned(),
         },
     ];
@@ -1511,6 +1542,7 @@ async fn delete_domain_removes_footprint_and_is_idempotent() {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: fake_embedding(8, 1.0),
+            query_embedding: fake_embedding(8, 1.0),
         content: "doomed".to_owned(),
     }];
     let v = store.io_upsert_chunks(domain, "main", "doc/1", &r).await.unwrap();
@@ -1707,6 +1739,7 @@ fn one_row(dim: usize, seed: f32, content: &str) -> ChunkRow {
         chunk_token_start: 0,
         doc_token_len: 10,
         embedding: fake_embedding(dim, seed),
+        query_embedding: fake_embedding(dim, seed + 0.5),
         content: content.to_owned(),
     }
 }
@@ -2096,6 +2129,7 @@ async fn search_does_not_leak_file_descriptors_under_load() {
             chunk_token_start: i as i32,
             doc_token_len: corpus as i32,
             embedding: fake_embedding(dim, 1.0 + i as f32),
+            query_embedding: fake_embedding(dim, 1.0 + i as f32),
             content: format!("chunk content number {} lorem ipsum dolor", i),
         })
         .collect();
@@ -2249,6 +2283,7 @@ async fn similar_lookup_on_feature_branch_does_not_leak_file_descriptors_under_l
             chunk_token_start: i as i32,
             doc_token_len: corpus as i32,
             embedding: fake_embedding(dim, 1.0 + i as f32),
+            query_embedding: fake_embedding(dim, 1.0 + i as f32),
             content: format!("chunk content number {} lorem ipsum dolor", i),
         })
         .collect();
@@ -2410,6 +2445,7 @@ async fn build_duplicate_corpus(
                     // Per-chunk spread (0.0002) << per-doc offset (0.02): own
                     // siblings are the nearest neighbours of any chunk.
                     embedding: fake_embedding(dim, doc_seed + c as f32 * 0.0002),
+                    query_embedding: fake_embedding(dim, doc_seed + c as f32 * 0.0002),
                     content: format!("family {} doc {} chunk {} lorem ipsum", fam, d, c),
                 });
             }

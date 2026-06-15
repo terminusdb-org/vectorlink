@@ -12,6 +12,10 @@ pub struct ChunkRow {
     pub chunk_token_start: i32,
     pub doc_token_len: i32,
     pub embedding: Vec<f32>,
+    /// Query-role embedding (search_query: prefix). STORED but NOT INDEXED — the
+    /// only ANN index remains on `embedding`. Used by /resolve and /duplicates to
+    /// probe with the asymmetric query→document signal (Phase 6A Step 5).
+    pub query_embedding: Vec<f32>,
     pub content: String,
 }
 

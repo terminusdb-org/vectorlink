@@ -210,6 +210,7 @@ mod tests {
             chunk_token_start: 0,
             doc_token_len: 100,
             embedding: seeded_normalized_embedding(dim, seed),
+            query_embedding: seeded_normalized_embedding(dim, seed + 10000),
             content: format!("content for {}", doc_id),
         }
     }
@@ -424,6 +425,7 @@ mod tests {
             chunk_token_start: 0,
             doc_token_len: 50,
             embedding: seeded_normalized_embedding(dim, new_doc_seed),
+            query_embedding: seeded_normalized_embedding(dim, new_doc_seed + 10000),
             content: "brand new unindexed document".to_owned(),
         };
         store

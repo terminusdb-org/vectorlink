@@ -1229,11 +1229,14 @@ async fn io_run_index_pipeline(
         doc_flat_ranges.push((start, doc.chunks.len()));
     }
 
-    // ─── COLLECT phase C: batch-embed all texts ─────────────────────────────
-    // io_embed_batched issues ceil(N / batch_size) HTTP calls instead of N.
-    // Per-doc failure isolation is handled by the function: failed batches are
-    // retried individually, so only toxic texts get EmbedResult::Failed.
-    let embed_results = embed::io_embed_batched(
+    // ─── COLLECT phase C: batch-embed all texts (DUAL — Document + Query) ───
+    // Phase 6A Step 5: embed each chunk TWICE — once with Document role (for the
+    // ANN-indexed `embedding` column) and once with Query role (for the stored
+    // `query_embedding` column used by /resolve and /duplicates to probe with the
+    // asymmetric query→document signal). Embed time ~doubles, mitigated by Step 3
+    // batching (batch_size=32). Index build time does NOT double — only ONE ANN
+    // index exists (on `embedding`).
+    let embed_results_doc = embed::io_embed_batched(
         ctx.provider,
         &flat_texts,
         ctx.embed_batch_size,
@@ -1242,21 +1245,35 @@ async fn io_run_index_pipeline(
     )
     .await;
 
-    // ─── COLLECT phase D: scatter embeddings → build ChunkRows per doc ──────
-    // For each doc, check that ALL its chunk embeddings succeeded. If any failed,
-    // skip the entire doc (per-doc isolation). Otherwise L2-normalise and build rows.
+    let embed_results_query = embed::io_embed_batched(
+        ctx.provider,
+        &flat_texts,
+        ctx.embed_batch_size,
+        EmbeddingRole::Query,
+        ctx.http_client,
+    )
+    .await;
+
+    // ─── COLLECT phase D: scatter BOTH embedding sets → build ChunkRows ─────
+    // For each doc, check that ALL its chunk embeddings (BOTH roles) succeeded.
+    // If any failed, skip the entire doc (per-doc isolation). Otherwise
+    // L2-normalise both sets and build rows with both vectors.
     let mut all_rows: Vec<ChunkRow> = Vec::new();
     let mut indexed_count: u64 = 0;
 
     for (doc_idx, doc) in docs_to_embed.iter().enumerate() {
         let (start, count) = doc_flat_ranges[doc_idx];
-        let doc_results = &embed_results[start..start + count];
+        let doc_results_doc = &embed_results_doc[start..start + count];
+        let doc_results_query = &embed_results_query[start..start + count];
 
-        // Check for any failed embeddings in this doc's chunks.
-        let first_failure = doc_results.iter().find_map(|r| match r {
-            EmbedResult::Failed(msg) => Some(msg.clone()),
-            EmbedResult::Ok(_) => None,
-        });
+        // Check for any failed embeddings in EITHER role for this doc's chunks.
+        let first_failure = doc_results_doc
+            .iter()
+            .chain(doc_results_query.iter())
+            .find_map(|r| match r {
+                EmbedResult::Failed(msg) => Some(msg.clone()),
+                EmbedResult::Ok(_) => None,
+            });
 
         if let Some(failure_msg) = first_failure {
             skipped.push(SkippedDoc {
@@ -1266,19 +1283,19 @@ async fn io_run_index_pipeline(
             continue;
         }
 
-        // All embeddings succeeded — extract, normalise, and build rows.
-        // Safety: first_failure check above guarantees all are Ok; if a future
-        // refactor breaks that invariant, we skip the doc rather than panicking.
-        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(doc_results.len());
+        // All embeddings succeeded — extract both sets, normalise, and build rows.
+        let mut embeddings_doc: Vec<Vec<f32>> = Vec::with_capacity(doc_results_doc.len());
+        let mut embeddings_query: Vec<Vec<f32>> = Vec::with_capacity(doc_results_query.len());
         let mut extraction_failed = false;
-        for r in doc_results {
+
+        for r in doc_results_doc {
             match r {
-                EmbedResult::Ok(emb) => embeddings.push(emb.clone()),
+                EmbedResult::Ok(emb) => embeddings_doc.push(emb.clone()),
                 EmbedResult::Failed(msg) => {
                     skipped.push(SkippedDoc {
                         id: doc.id.clone(),
                         message: format!(
-                            "internal: EmbedResult::Failed after first_failure check: {}",
+                            "internal: EmbedResult::Failed after first_failure check (doc): {}",
                             msg
                         ),
                     });
@@ -1291,18 +1308,41 @@ async fn io_run_index_pipeline(
             continue;
         }
 
-        // L2-normalise embeddings so that Lance's L2² metric = cosine distance.
-        for emb in &mut embeddings {
+        for r in doc_results_query {
+            match r {
+                EmbedResult::Ok(emb) => embeddings_query.push(emb.clone()),
+                EmbedResult::Failed(msg) => {
+                    skipped.push(SkippedDoc {
+                        id: doc.id.clone(),
+                        message: format!(
+                            "internal: EmbedResult::Failed after first_failure check (query): {}",
+                            msg
+                        ),
+                    });
+                    extraction_failed = true;
+                    break;
+                }
+            }
+        }
+        if extraction_failed {
+            continue;
+        }
+
+        // L2-normalise BOTH embedding sets so cosine metric works correctly.
+        for emb in &mut embeddings_doc {
+            l2_normalize(emb);
+        }
+        for emb in &mut embeddings_query {
             l2_normalize(emb);
         }
 
-        // Build chunk rows.
+        // Build chunk rows with both vectors.
         let doc_type = ingest::extract_doc_type(&doc.id);
         let rows: Vec<ChunkRow> = doc
             .chunks
             .iter()
-            .zip(embeddings)
-            .map(|(chunk, embedding)| ChunkRow {
+            .zip(embeddings_doc.into_iter().zip(embeddings_query))
+            .map(|(chunk, (embedding, query_embedding))| ChunkRow {
                 doc_id: doc.id.clone(),
                 doc_type: doc_type.clone(),
                 chunk_index: chunk.index as i32,
@@ -1310,6 +1350,7 @@ async fn io_run_index_pipeline(
                 chunk_token_start: chunk.token_start as i32,
                 doc_token_len: chunk.doc_token_len as i32,
                 embedding,
+                query_embedding,
                 content: chunk.text.clone(),
             })
             .collect();

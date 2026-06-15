@@ -198,6 +198,8 @@ impl LanceStore {
     }
 
     /// Get the Arrow schema for chunk rows (embedding dimension from config).
+    /// Includes BOTH `embedding` (document-role, ANN-INDEXED) and `query_embedding`
+    /// (query-role, STORED but NOT INDEXED — Phase 6A Step 5 dual-vector).
     pub(super) fn chunk_schema(&self) -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Utf8, false),
@@ -208,6 +210,18 @@ impl LanceStore {
             Field::new("doc_token_len", DataType::Int32, false),
             Field::new(
                 "embedding",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    self.dim as i32,
+                ),
+                false,
+            ),
+            // Query-role embedding: stored for /resolve and /duplicates to probe
+            // with the asymmetric query→document signal. NOT ANN-indexed — the
+            // only index lives on `embedding`. This column is a pure storage
+            // column read by `io_scan_points` during the resolve/duplicates scan.
+            Field::new(
+                "query_embedding",
                 DataType::FixedSizeList(
                     Arc::new(Field::new("item", DataType::Float32, true)),
                     self.dim as i32,
@@ -546,13 +560,20 @@ impl LanceStore {
                     Arc::new(Float32Array::from(Vec::<f32>::new())),
                     None,
                 )),
+                // query_embedding (same shape as embedding, stored but NOT indexed).
+                Arc::new(FixedSizeListArray::new(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dim,
+                    Arc::new(Float32Array::from(Vec::<f32>::new())),
+                    None,
+                )),
                 Arc::new(StringArray::from(Vec::<&str>::new())),
             ],
         )
         .expect("empty batch construction must not fail")
     }
 
-    /// Build a RecordBatch from chunk rows.
+    /// Build a RecordBatch from chunk rows (includes both embedding columns).
     pub(super) fn rows_to_batch(&self, rows: &[ChunkRow]) -> Result<RecordBatch, StoreError> {
         let schema = self.chunk_schema();
 
@@ -564,13 +585,26 @@ impl LanceStore {
         let doc_token_lens: Vec<i32> = rows.iter().map(|r| r.doc_token_len).collect();
         let contents: Vec<&str> = rows.iter().map(|r| r.content.as_str()).collect();
 
-        // Build the embedding FixedSizeList.
+        // Build the embedding FixedSizeList (document-role, ANN-indexed).
         let flat_embeddings: Vec<f32> = rows.iter().flat_map(|r| r.embedding.iter().copied()).collect();
         let values = Float32Array::from(flat_embeddings);
         let embedding_array = FixedSizeListArray::new(
             Arc::new(Field::new("item", DataType::Float32, true)),
             self.dim as i32,
             Arc::new(values),
+            None,
+        );
+
+        // Build the query_embedding FixedSizeList (query-role, stored NOT indexed).
+        let flat_query_embeddings: Vec<f32> = rows
+            .iter()
+            .flat_map(|r| r.query_embedding.iter().copied())
+            .collect();
+        let query_values = Float32Array::from(flat_query_embeddings);
+        let query_embedding_array = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            self.dim as i32,
+            Arc::new(query_values),
             None,
         );
 
@@ -584,6 +618,7 @@ impl LanceStore {
                 Arc::new(Int32Array::from(chunk_token_starts)),
                 Arc::new(Int32Array::from(doc_token_lens)),
                 Arc::new(embedding_array) as Arc<dyn arrow_array::Array>,
+                Arc::new(query_embedding_array) as Arc<dyn arrow_array::Array>,
                 Arc::new(StringArray::from(contents)),
             ],
         )

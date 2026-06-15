@@ -323,29 +323,45 @@ async fn io_index_one(
     }
 
     let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-    let mut embeddings =
+
+    // Phase 6A Step 5: embed with BOTH roles (document + query).
+    let mut embeddings_doc =
         embed::io_embed(provider, &chunk_texts, EmbeddingRole::Document, http_client)
             .await
-            .map_err(|e| format!("embedding failed: {}", e))?;
+            .map_err(|e| format!("embedding (doc) failed: {}", e))?;
+    let mut embeddings_query =
+        embed::io_embed(provider, &chunk_texts, EmbeddingRole::Query, http_client)
+            .await
+            .map_err(|e| format!("embedding (query) failed: {}", e))?;
 
-    if embeddings.len() != chunks.len() {
+    if embeddings_doc.len() != chunks.len() {
         return Err(format!(
-            "embedding count mismatch: expected {}, got {}",
+            "doc embedding count mismatch: expected {}, got {}",
             chunks.len(),
-            embeddings.len()
+            embeddings_doc.len()
+        ));
+    }
+    if embeddings_query.len() != chunks.len() {
+        return Err(format!(
+            "query embedding count mismatch: expected {}, got {}",
+            chunks.len(),
+            embeddings_query.len()
         ));
     }
 
-    // L2-normalise for cosine distance (same as the service pipeline).
-    for emb in &mut embeddings {
+    // L2-normalise both sets for cosine distance (same as the service pipeline).
+    for emb in &mut embeddings_doc {
+        l2_normalize(emb);
+    }
+    for emb in &mut embeddings_query {
         l2_normalize(emb);
     }
 
     let doc_type = ingest::extract_doc_type(doc_id);
     let rows: Vec<ChunkRow> = chunks
         .iter()
-        .zip(embeddings)
-        .map(|(ch, embedding)| ChunkRow {
+        .zip(embeddings_doc.into_iter().zip(embeddings_query))
+        .map(|(ch, (embedding, query_embedding))| ChunkRow {
             doc_id: doc_id.to_owned(),
             doc_type: doc_type.clone(),
             chunk_index: ch.index as i32,
@@ -353,6 +369,7 @@ async fn io_index_one(
             chunk_token_start: ch.token_start as i32,
             doc_token_len: ch.doc_token_len as i32,
             embedding,
+            query_embedding,
             content: ch.text.clone(),
         })
         .collect();

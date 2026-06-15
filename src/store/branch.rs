@@ -113,6 +113,7 @@ mod tests {
             chunk_token_start: 0,
             doc_token_len: 10,
             embedding: fake_embedding(dim, seed),
+            query_embedding: fake_embedding(dim, seed + 0.5),
             content: content.to_owned(),
         }
     }
