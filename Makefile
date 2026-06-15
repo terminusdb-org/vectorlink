@@ -27,6 +27,8 @@ help:
 	@echo "tdb-search — make targets"
 	@echo ""
 	@echo "  make dev              Incremental DEBUG build (fast iteration)"
+	@echo "  make dev-image        Assemble dev container from debug binary (seconds)"
+	@echo "  make dev-up           dev + dev-image + docker compose up (full edit-run)"
 	@echo "  make build-release    Production RELEASE build (lto=thin, slow)"
 	@echo "  make lint             Run ALL component linters (must pass before commit)"
 	@echo "  make lint-openapi     Strict OpenAPI 3.1 lint (Redocly $(REDOCLY_VERSION))"
@@ -132,6 +134,27 @@ dev:
 	else \
 		echo "• dev build skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
+
+# dev-image: assemble the dev/E2E container image from the pre-built debug
+# binary. This is a simple COPY into debian:trixie-slim — no cargo build runs
+# inside the image. Requires target/debug/tdb-search to exist (run `make dev`
+# first, or use `make dev-up` which chains both). Assembles in ~2-5 seconds.
+.PHONY: dev-image
+dev-image:
+	@if [ ! -f target/debug/tdb-search ]; then \
+		echo "ERROR: target/debug/tdb-search not found. Run 'make dev' first." >&2 ; \
+		exit 1 ; \
+	fi
+	docker build -f Dockerfile.dev -t tdb-search:dev .
+
+# dev-up: the full edit-run cycle in one command. Builds the debug binary
+# (incremental, seconds), assembles the dev container image, and brings up
+# the compose stack. The compose override (docker-compose.override.yml) points
+# tdb-search at Dockerfile.dev so `docker compose up --build` also works after
+# `make dev` has produced the binary.
+.PHONY: dev-up
+dev-up: dev dev-image
+	docker compose up -d tdb-search
 
 # build-release: RELEASE build (no LTO). Fast enough for `make pr` gate
 # (incremental relinks). LTO only in `make release-image` (production publish).
