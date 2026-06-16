@@ -2144,6 +2144,7 @@ mod tests_exact_duplicate_override {
     /// Seed a store with two documents:
     /// - doc_a with embedding `emb_a` and query_embedding `qemb_a`
     /// - doc_b with embedding `emb_b` and query_embedding `qemb_b`
+    ///
     /// Tags the commit and returns the domain string.
     async fn seed_two_docs(
         store: &LanceStore,
