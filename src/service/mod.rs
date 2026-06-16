@@ -477,7 +477,7 @@ impl SearchService {
         l2_normalize(&mut query_embedding);
 
         let search_query = SearchQuery {
-            query_embedding,
+            query_embedding: query_embedding.clone(),
             query_text: q.to_owned(),
             mode,
             start,
@@ -496,11 +496,45 @@ impl SearchService {
         let results = dedup_chunks_to_documents(chunk_hits, snippet);
 
         // Apply pagination.
-        let paginated: Vec<SearchHit> = results
+        let mut paginated: Vec<SearchHit> = results
             .into_iter()
             .skip(start)
             .take(count)
             .collect();
+
+        // SAME-ROLE EXACT-DUPLICATE OVERRIDE (query↔query): for each result,
+        // compare the incoming QUERY embedding (the embedded search text) with the
+        // result's stored query_embedding. If bit-identical (the search text IS the
+        // original document's text embedded in query role) → distance = 0.
+        let result_ids: Vec<String> = paginated.iter().map(|h| h.id.clone()).collect();
+        if !result_ids.is_empty() {
+            let result_query_embeddings = self
+                .store
+                .io_fetch_result_embeddings(
+                    &domain_str,
+                    &branch,
+                    &served_commit,
+                    &result_ids,
+                    "query_embedding",
+                )
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+            for hit in &mut paginated {
+                if let Some(stored_qe) = result_query_embeddings.get(&hit.id) {
+                    if crate::kernel::distance::vectors_equal(&query_embedding, stored_qe) {
+                        hit.distance = 0.0;
+                    }
+                }
+            }
+
+            // Re-sort after override: a hit that moved to 0.0 should sort first.
+            paginated.sort_by(|a, b| {
+                a.distance
+                    .partial_cmp(&b.distance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
 
         Ok(SearchOutcome {
             hits: paginated,
@@ -638,6 +672,17 @@ impl SearchService {
     /// PROVEN ancestor (never a descendant) and the served commit is returned so
     /// the transport reports staleness via `TerminusDB-Data-Version`. A branch
     /// with no indexed lineage → 404 (not a raw "commit not indexed" 500).
+    ///
+    /// PROBE SIGNAL: uses the source document's stored QUERY-role embedding
+    /// (`query_embedding`) to probe the DOCUMENT-role embedding ANN index. This
+    /// mirrors `/resolve`'s asymmetric query→document signal (Phase 6A Step 5),
+    /// superseding the old doc→doc probe.
+    ///
+    /// SAME-ROLE EXACT-DUPLICATE OVERRIDE: after ranking, if the source document's
+    /// DOCUMENT-role embedding is bit-identical to a result's DOCUMENT-role
+    /// embedding (doc↔doc same-role equality), that result's distance is
+    /// overridden to 0. This surfaces exact content duplicates at distance 0
+    /// regardless of the asymmetric ranking distance.
     #[allow(clippy::too_many_arguments)]
     pub async fn similar_with_options(
         &self,
@@ -685,41 +730,46 @@ impl SearchService {
             )));
         }
 
-        // Reuse the source document's STORED embedding (chunk 0, the best
-        // available) directly as the query vector — NO re-embedding round-trip.
-        // The lookup projects the vector from the snapshot, and every embedding is
-        // L2-normalised at insert time (both the service pipeline and the bulk
-        // loader normalise before write), so it is already on the unit sphere that
-        // Lance's cosine metric expects — no re-normalisation here.
-        //
-        // This is both faster (zero embed calls per /similar) and strictly more
-        // faithful than re-embedding the chunk text, which could drift from the
-        // stored vector due to batching/quantisation/provider non-determinism.
-        let query_embedding = doc_chunks[0].embedding.clone();
+        // PROBE: use the source document's stored QUERY-role embedding (asymmetric
+        // query→document signal — same as /resolve). This supersedes the old doc→doc
+        // probe and provides better recall via the asymmetric prefix separation.
+        let probe_embedding = doc_chunks[0].query_embedding.clone();
 
-        // FAIL-LOUD sanity check: the stored vector must be present, the right
-        // dimension, and unit-norm. A violation means the projection or the insert
-        // invariant is broken — surface it rather than silently search on garbage.
+        // Keep the source doc's DOCUMENT-role embedding for the same-role exact-
+        // duplicate override (doc↔doc equality check against result embeddings).
+        let source_doc_embedding = doc_chunks[0].embedding.clone();
+
+        // FAIL-LOUD sanity check: both stored vectors must be present and the right
+        // dimension. A violation means the projection or the insert invariant is
+        // broken — surface it rather than silently search on garbage.
         let expected_dim = self.config.embed_provider.expected_dim();
-        if query_embedding.len() != expected_dim {
+        if probe_embedding.len() != expected_dim {
             return Err(ServiceError::Internal(format!(
-                "stored embedding for {} has dimension {}, expected {}",
+                "stored query_embedding for {} has dimension {}, expected {}",
                 id,
-                query_embedding.len(),
+                probe_embedding.len(),
                 expected_dim
             )));
         }
-        let norm_sq: f32 = query_embedding.iter().map(|v| v * v).sum();
+        if source_doc_embedding.len() != expected_dim {
+            return Err(ServiceError::Internal(format!(
+                "stored embedding for {} has dimension {}, expected {}",
+                id,
+                source_doc_embedding.len(),
+                expected_dim
+            )));
+        }
+        let norm_sq: f32 = probe_embedding.iter().map(|v| v * v).sum();
         if (norm_sq - 1.0).abs() > 1e-3 {
             return Err(ServiceError::Internal(format!(
-                "stored embedding for {} is not L2-normalised (norm^2 = {}); \
+                "stored query_embedding for {} is not L2-normalised (norm^2 = {}); \
                  the insert-time normalisation invariant is violated",
                 id, norm_sq
             )));
         }
 
         let search_query = SearchQuery {
-            query_embedding,
+            query_embedding: probe_embedding,
             query_text: String::new(),
             mode: SearchMode::Vector,
             start,
@@ -738,12 +788,45 @@ impl SearchService {
         let all_results = dedup_chunks_to_documents(chunk_hits, snippet);
 
         // Exclude self from results and apply pagination.
-        let paginated: Vec<SearchHit> = all_results
+        let mut paginated: Vec<SearchHit> = all_results
             .into_iter()
             .filter(|hit| hit.id != id)
             .skip(start)
             .take(count)
             .collect();
+
+        // SAME-ROLE EXACT-DUPLICATE OVERRIDE (doc↔doc): for each result, fetch its
+        // stored DOCUMENT-role embedding and compare with the source's. If bit-
+        // identical → override distance to 0.
+        let result_ids: Vec<String> = paginated.iter().map(|h| h.id.clone()).collect();
+        if !result_ids.is_empty() && !source_doc_embedding.is_empty() {
+            let result_embeddings = self
+                .store
+                .io_fetch_result_embeddings(
+                    &domain_str,
+                    &branch,
+                    &served_commit,
+                    &result_ids,
+                    "embedding",
+                )
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+            for hit in &mut paginated {
+                if let Some(result_emb) = result_embeddings.get(&hit.id) {
+                    if crate::kernel::distance::vectors_equal(&source_doc_embedding, result_emb) {
+                        hit.distance = 0.0;
+                    }
+                }
+            }
+
+            // Re-sort after override: a hit that moved to 0.0 should sort first.
+            paginated.sort_by(|a, b| {
+                a.distance
+                    .partial_cmp(&b.distance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
 
         Ok(SimilarOutcome {
             hits: paginated,
@@ -836,7 +919,7 @@ impl SearchService {
             .resolve_searchable_commit(&domain, &branch, commit, ancestors)
             .await?;
 
-        let groups = self
+        let mut groups = self
             .store
             .io_duplicate_groups(
                 &domain_str,
@@ -849,6 +932,52 @@ impl SearchService {
             )
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        // SAME-ROLE EXACT-DUPLICATE OVERRIDE (doc↔doc): for each candidate pair,
+        // compare the two members' DOCUMENT-role embeddings. If bit-identical
+        // (genuinely the same content) → override the pair's distance to 0.
+        if !groups.is_empty() {
+            // Collect all unique doc_ids mentioned across all groups.
+            let all_doc_ids: Vec<String> = groups
+                .iter()
+                .flat_map(|g| g.group.iter().map(|m| m.id.clone()))
+                .collect::<std::collections::HashSet<String>>()
+                .into_iter()
+                .collect();
+
+            let doc_embeddings = self
+                .store
+                .io_fetch_result_embeddings(
+                    &domain_str,
+                    &branch,
+                    &served_commit,
+                    &all_doc_ids,
+                    "embedding",
+                )
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+            for group in &mut groups {
+                if group.group.len() == 2 {
+                    let emb_a = doc_embeddings.get(&group.group[0].id);
+                    let emb_b = doc_embeddings.get(&group.group[1].id);
+                    if let (Some(a), Some(b)) = (emb_a, emb_b) {
+                        if crate::kernel::distance::vectors_equal(a, b) {
+                            group.distance = 0.0;
+                        }
+                    }
+                }
+            }
+
+            // Re-sort after override: groups at distance 0 should sort first.
+            groups.sort_by(|a, b| {
+                a.distance
+                    .partial_cmp(&b.distance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.group[0].id.cmp(&b.group[0].id))
+                    .then_with(|| a.group[1].id.cmp(&b.group[1].id))
+            });
+        }
 
         // Bounded pagination over the deterministic (sorted) group list.
         let paginated = groups.into_iter().skip(start).take(count).collect();
@@ -928,8 +1057,43 @@ impl SearchService {
         };
 
         let elapsed_ms = start_time.elapsed().as_millis() as u64;
-        let result =
+        let mut result =
             crate::resolve::resolve(&maps.set_to_target, &maps.target_to_set, &options, elapsed_ms);
+
+        // SAME-ROLE EXACT-DUPLICATE OVERRIDE (doc↔doc): sweep all matched pairs
+        // and compare the set member's DOCUMENT-role embedding with the target
+        // member's DOCUMENT-role embedding. If bit-identical → override to 0.
+        if !result.matched.is_empty() {
+            let all_doc_ids: Vec<String> = result
+                .matched
+                .iter()
+                .flat_map(|m| [m.set_id.clone(), m.target_id.clone()])
+                .collect::<std::collections::HashSet<String>>()
+                .into_iter()
+                .collect();
+
+            let doc_embeddings = self
+                .store
+                .io_fetch_result_embeddings(
+                    &domain_str,
+                    &branch,
+                    &served_commit,
+                    &all_doc_ids,
+                    "embedding",
+                )
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+            for matched_pair in &mut result.matched {
+                let emb_set = doc_embeddings.get(&matched_pair.set_id);
+                let emb_target = doc_embeddings.get(&matched_pair.target_id);
+                if let (Some(a), Some(b)) = (emb_set, emb_target) {
+                    if crate::kernel::distance::vectors_equal(a, b) {
+                        matched_pair.distance = 0.0;
+                    }
+                }
+            }
+        }
 
         Ok(result)
     }
@@ -1884,7 +2048,7 @@ mod tests_risk26 {
         );
     }
 
-    /// edge case: no-op commit on a never-before-indexed domain (first commit is empty).
+    /// Edge case: no-op commit on a never-before-indexed domain (first commit is empty).
     /// The dataset auto-creates and the commit gets tagged to version 1.
     #[tokio::test]
     async fn noop_commit_on_fresh_domain_creates_dataset_and_tags() {
@@ -1925,6 +2089,683 @@ mod tests_risk26 {
         // ASSERT: the commit is tagged.
         let resolved = store.io_resolve_commit(domain, branch, "c0_first_empty").await.expect("resolve");
         assert!(resolved.is_some(), "first-ever empty commit must be tagged");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Same-role exact-duplicate distance override tests.
+// Verifies that bit-identical stored embeddings produce distance=0 across all
+// four search-family endpoints (/similar, /duplicates, /resolve). /search is
+// tested indirectly via io_fetch_result_embeddings because it requires a live
+// embedding server for the query embedding step.
+// ═══════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod tests_exact_duplicate_override {
+    use super::*;
+    use crate::kernel::distance::l2_normalize;
+    use crate::store::lance::{ChunkRow, DuplicateScope, LanceStore};
+    use std::sync::Arc;
+
+    /// Build a test SearchService with a small embedding dimension and no live
+    /// embedding server (search_ready=true to pass the gate, but no real embedding
+    /// calls will succeed — tests that don't need live embedding are safe).
+    fn make_test_service(store: Arc<LanceStore>, dim: usize) -> SearchService {
+        let config = Config {
+            admin_user: "admin".to_owned(),
+            admin_secret: "root".to_owned(),
+            port: 0,
+            embed_provider: crate::embed::Provider::OpenAiCompatible {
+                base_url: "http://127.0.0.1:0/no-server".to_owned(),
+                model: "test-model".to_owned(),
+                dim,
+            },
+            data_dir: "/tmp/test".to_owned(),
+            tokenizer_path: "spikes/tokenizer/tokenizer.json".to_owned(),
+            embed_batch_size: 32,
+        };
+        let tokenizer_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("spikes")
+            .join("tokenizer")
+            .join("tokenizer.json");
+        let tokenizer =
+            crate::chunk::io_load_tokenizer(&tokenizer_path).expect("test tokenizer must load");
+        let svc = SearchService::new(store, config, tokenizer);
+        svc.set_search_ready(true);
+        svc
+    }
+
+    /// Create a normalized embedding from a seed. Deterministic, L2-normalized.
+    fn make_embedding(dim: usize, seed: f32) -> Vec<f32> {
+        let mut v: Vec<f32> = (0..dim).map(|i| (seed + i as f32 * 0.1).sin()).collect();
+        l2_normalize(&mut v);
+        v
+    }
+
+    /// Seed a store with two documents:
+    /// - doc_a with embedding `emb_a` and query_embedding `qemb_a`
+    /// - doc_b with embedding `emb_b` and query_embedding `qemb_b`
+    /// Tags the commit and returns the domain string.
+    async fn seed_two_docs(
+        store: &LanceStore,
+        emb_a: Vec<f32>,
+        qemb_a: Vec<f32>,
+        emb_b: Vec<f32>,
+        qemb_b: Vec<f32>,
+        domain: &str,
+    ) -> String {
+        let row_a = ChunkRow {
+            doc_id: "doc/a".to_owned(),
+            doc_type: "Item".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: emb_a,
+            query_embedding: qemb_a,
+            content: "content of doc a".to_owned(),
+        };
+        let row_b = ChunkRow {
+            doc_id: "doc/b".to_owned(),
+            doc_type: "Item".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: emb_b,
+            query_embedding: qemb_b,
+            content: "content of doc b".to_owned(),
+        };
+
+        store
+            .io_upsert_chunks(domain, "main", "doc/a", std::slice::from_ref(&row_a))
+            .await
+            .expect("upsert doc/a");
+        store
+            .io_upsert_chunks(domain, "main", "doc/b", std::slice::from_ref(&row_b))
+            .await
+            .expect("upsert doc/b");
+
+        // Refresh and tag.
+        store
+            .io_refresh_cached_dataset(domain, "main")
+            .await
+            .expect("refresh");
+        let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+        let version = ds_arc.read().await.version().version;
+        let commit = "c_test".to_owned();
+        store
+            .io_tag_commit(domain, "main", &commit, version)
+            .await
+            .expect("tag");
+        store
+            .update_last_indexed(domain, "main", &commit, version)
+            .await;
+        commit
+    }
+
+    // ─── /similar: exact-duplicate override (doc↔doc) ─────────────────────────
+
+    /// /similar with bit-identical DOCUMENT embeddings: distance MUST be 0.
+    #[tokio::test]
+    async fn similar_identical_doc_embeddings_distance_zero() {
+        let dim = 16;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(LanceStore::new(tmp.path(), dim));
+
+        let emb = make_embedding(dim, 1.0);
+        let qemb_a = make_embedding(dim, 2.0);
+        let qemb_b = make_embedding(dim, 3.0);
+
+        // IDENTICAL doc-role embeddings for both docs.
+        let commit = seed_two_docs(
+            &store,
+            emb.clone(),
+            qemb_a.clone(),
+            emb.clone(),
+            qemb_b.clone(),
+            "admin/sim_ident",
+        )
+        .await;
+
+        let svc = make_test_service(Arc::clone(&store), dim);
+
+        let result = svc
+            .similar_with_options(
+                "admin/sim_ident",
+                &commit,
+                "doc/a",
+                0,
+                10,
+                &[],
+                &[],
+                false,
+                &[],
+            )
+            .await
+            .expect("similar must succeed");
+
+        // doc/b should appear with distance=0 (same doc-role embedding as doc/a).
+        let doc_b_hit = result.hits.iter().find(|h| h.id == "doc/b");
+        assert!(
+            doc_b_hit.is_some(),
+            "doc/b must appear in /similar results for doc/a"
+        );
+        assert_eq!(
+            doc_b_hit.unwrap().distance,
+            0.0,
+            "bit-identical doc-role embeddings must produce distance=0 via the override"
+        );
+    }
+
+    /// /similar with DIFFERENT document embeddings: distance MUST be > 0.
+    #[tokio::test]
+    async fn similar_different_doc_embeddings_distance_nonzero() {
+        let dim = 16;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(LanceStore::new(tmp.path(), dim));
+
+        let emb_a = make_embedding(dim, 1.0);
+        let emb_b = make_embedding(dim, 5.0); // Different seed → different embedding.
+        let qemb_a = make_embedding(dim, 2.0);
+        let qemb_b = make_embedding(dim, 3.0);
+
+        let commit = seed_two_docs(
+            &store,
+            emb_a,
+            qemb_a,
+            emb_b,
+            qemb_b,
+            "admin/sim_diff",
+        )
+        .await;
+
+        let svc = make_test_service(Arc::clone(&store), dim);
+
+        let result = svc
+            .similar_with_options(
+                "admin/sim_diff",
+                &commit,
+                "doc/a",
+                0,
+                10,
+                &[],
+                &[],
+                false,
+                &[],
+            )
+            .await
+            .expect("similar must succeed");
+
+        let doc_b_hit = result.hits.iter().find(|h| h.id == "doc/b");
+        assert!(
+            doc_b_hit.is_some(),
+            "doc/b must appear in /similar results for doc/a"
+        );
+        assert!(
+            doc_b_hit.unwrap().distance > 0.0,
+            "different doc-role embeddings must produce distance > 0, got {}",
+            doc_b_hit.unwrap().distance
+        );
+    }
+
+    // ─── /duplicates: exact-duplicate override (doc↔doc) ──────────────────────
+
+    /// /duplicates with bit-identical DOCUMENT embeddings: distance MUST be 0.
+    #[tokio::test]
+    async fn duplicates_identical_doc_embeddings_distance_zero() {
+        let dim = 16;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(LanceStore::new(tmp.path(), dim));
+
+        let emb = make_embedding(dim, 1.0);
+        let qemb_a = make_embedding(dim, 2.0);
+        let qemb_b = make_embedding(dim, 3.0);
+
+        // IDENTICAL doc-role embeddings.
+        let commit = seed_two_docs(
+            &store,
+            emb.clone(),
+            qemb_a,
+            emb.clone(),
+            qemb_b,
+            "admin/dup_ident",
+        )
+        .await;
+
+        let svc = make_test_service(Arc::clone(&store), dim);
+
+        let groups = svc
+            .duplicates_with_options(
+                "admin/dup_ident",
+                &commit,
+                1.0, // Permissive threshold — find everything.
+                &DuplicateScope::default(),
+                false,
+                0,
+                100,
+                &[],
+            )
+            .await
+            .expect("duplicates must succeed");
+
+        // The pair (doc/a, doc/b) should appear with distance=0.
+        let pair = groups.iter().find(|g| {
+            (g.group[0].id == "doc/a" && g.group[1].id == "doc/b")
+                || (g.group[0].id == "doc/b" && g.group[1].id == "doc/a")
+        });
+        assert!(
+            pair.is_some(),
+            "doc/a + doc/b must appear as a duplicate pair, got groups: {:?}",
+            groups.iter().map(|g| (&g.group[0].id, &g.group[1].id, g.distance)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            pair.unwrap().distance,
+            0.0,
+            "bit-identical doc-role embeddings must produce distance=0 via the override"
+        );
+    }
+
+    /// /duplicates with DIFFERENT document embeddings: distance MUST be > 0.
+    #[tokio::test]
+    async fn duplicates_different_doc_embeddings_distance_nonzero() {
+        let dim = 16;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(LanceStore::new(tmp.path(), dim));
+
+        let emb_a = make_embedding(dim, 1.0);
+        let emb_b = make_embedding(dim, 5.0); // Different seed.
+        let qemb_a = make_embedding(dim, 2.0);
+        let qemb_b = make_embedding(dim, 3.0);
+
+        let commit = seed_two_docs(
+            &store,
+            emb_a,
+            qemb_a,
+            emb_b,
+            qemb_b,
+            "admin/dup_diff",
+        )
+        .await;
+
+        let svc = make_test_service(Arc::clone(&store), dim);
+
+        let groups = svc
+            .duplicates_with_options(
+                "admin/dup_diff",
+                &commit,
+                1.0,
+                &DuplicateScope::default(),
+                false,
+                0,
+                100,
+                &[],
+            )
+            .await
+            .expect("duplicates must succeed");
+
+        let pair = groups.iter().find(|g| {
+            (g.group[0].id == "doc/a" && g.group[1].id == "doc/b")
+                || (g.group[0].id == "doc/b" && g.group[1].id == "doc/a")
+        });
+        assert!(
+            pair.is_some(),
+            "doc/a + doc/b must appear as a pair with permissive threshold=1.0"
+        );
+        assert!(
+            pair.unwrap().distance > 0.0,
+            "different doc-role embeddings must produce distance > 0, got {}",
+            pair.unwrap().distance
+        );
+    }
+
+    // ─── /resolve: exact-duplicate override (doc↔doc) ─────────────────────────
+
+    /// /resolve with bit-identical DOCUMENT embeddings: matched pair distance MUST be 0.
+    #[tokio::test]
+    async fn resolve_identical_doc_embeddings_distance_zero() {
+        let dim = 16;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(LanceStore::new(tmp.path(), dim));
+
+        let emb = make_embedding(dim, 1.0);
+        let qemb_a = make_embedding(dim, 2.0);
+        let qemb_b = make_embedding(dim, 3.0);
+
+        // Seed with two doc types for cross-set resolution.
+        let row_a = ChunkRow {
+            doc_id: "doc/set_item".to_owned(),
+            doc_type: "SetType".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: emb.clone(),
+            query_embedding: qemb_a,
+            content: "set item content".to_owned(),
+        };
+        let row_b = ChunkRow {
+            doc_id: "doc/target_item".to_owned(),
+            doc_type: "TargetType".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: emb.clone(), // IDENTICAL doc embedding.
+            query_embedding: qemb_b,
+            content: "target item content".to_owned(),
+        };
+
+        let domain = "admin/res_ident";
+        store
+            .io_upsert_chunks(domain, "main", "doc/set_item", std::slice::from_ref(&row_a))
+            .await
+            .expect("upsert set_item");
+        store
+            .io_upsert_chunks(domain, "main", "doc/target_item", std::slice::from_ref(&row_b))
+            .await
+            .expect("upsert target_item");
+        store
+            .io_refresh_cached_dataset(domain, "main")
+            .await
+            .expect("refresh");
+        let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+        let version = ds_arc.read().await.version().version;
+        let commit = "c_res";
+        store
+            .io_tag_commit(domain, "main", commit, version)
+            .await
+            .expect("tag");
+        store
+            .update_last_indexed(domain, "main", commit, version)
+            .await;
+
+        let svc = make_test_service(Arc::clone(&store), dim);
+
+        let scope = DuplicateScope {
+            set_doc_types: vec!["SetType".to_owned()],
+            target_doc_types: vec!["TargetType".to_owned()],
+            ..Default::default()
+        };
+
+        let result = svc
+            .resolve_with_options(
+                domain,
+                commit,
+                &scope,
+                5,     // k
+                1.0,   // threshold (permissive)
+                1.0,   // tau_one_to_one (permissive)
+                None,  // tau_one_to_many
+                None,  // tau_many_to_one
+                &[],   // ancestors
+            )
+            .await
+            .expect("resolve must succeed");
+
+        // The matched pair should have distance=0.
+        let matched_pair = result.matched.iter().find(|m| {
+            (m.set_id == "doc/set_item" && m.target_id == "doc/target_item")
+                || (m.set_id == "doc/target_item" && m.target_id == "doc/set_item")
+        });
+        assert!(
+            matched_pair.is_some(),
+            "set_item↔target_item must be matched, got: {:?}",
+            result.matched.iter().map(|m| (&m.set_id, &m.target_id, m.distance)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            matched_pair.unwrap().distance,
+            0.0,
+            "bit-identical doc-role embeddings must produce distance=0 via the override"
+        );
+    }
+
+    /// /resolve with DIFFERENT document embeddings: matched pair distance MUST be > 0.
+    #[tokio::test]
+    async fn resolve_different_doc_embeddings_distance_nonzero() {
+        let dim = 16;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(LanceStore::new(tmp.path(), dim));
+
+        let emb_a = make_embedding(dim, 1.0);
+        let emb_b = make_embedding(dim, 1.1); // Slightly different — close enough to match.
+        let qemb_a = make_embedding(dim, 2.0);
+        let qemb_b = make_embedding(dim, 3.0);
+
+        let row_a = ChunkRow {
+            doc_id: "doc/set_item".to_owned(),
+            doc_type: "SetType".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: emb_a,
+            query_embedding: qemb_a,
+            content: "set item content".to_owned(),
+        };
+        let row_b = ChunkRow {
+            doc_id: "doc/target_item".to_owned(),
+            doc_type: "TargetType".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: emb_b, // DIFFERENT doc embedding.
+            query_embedding: qemb_b,
+            content: "target item content".to_owned(),
+        };
+
+        let domain = "admin/res_diff";
+        store
+            .io_upsert_chunks(domain, "main", "doc/set_item", std::slice::from_ref(&row_a))
+            .await
+            .expect("upsert set_item");
+        store
+            .io_upsert_chunks(domain, "main", "doc/target_item", std::slice::from_ref(&row_b))
+            .await
+            .expect("upsert target_item");
+        store
+            .io_refresh_cached_dataset(domain, "main")
+            .await
+            .expect("refresh");
+        let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+        let version = ds_arc.read().await.version().version;
+        let commit = "c_res";
+        store
+            .io_tag_commit(domain, "main", commit, version)
+            .await
+            .expect("tag");
+        store
+            .update_last_indexed(domain, "main", commit, version)
+            .await;
+
+        let svc = make_test_service(Arc::clone(&store), dim);
+
+        let scope = DuplicateScope {
+            set_doc_types: vec!["SetType".to_owned()],
+            target_doc_types: vec!["TargetType".to_owned()],
+            ..Default::default()
+        };
+
+        let result = svc
+            .resolve_with_options(
+                domain,
+                commit,
+                &scope,
+                5,
+                1.0,
+                1.0,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect("resolve must succeed");
+
+        let matched_pair = result.matched.iter().find(|m| {
+            (m.set_id == "doc/set_item" && m.target_id == "doc/target_item")
+                || (m.set_id == "doc/target_item" && m.target_id == "doc/set_item")
+        });
+        assert!(
+            matched_pair.is_some(),
+            "set_item↔target_item must be matched (close embeddings with permissive tau)"
+        );
+        assert!(
+            matched_pair.unwrap().distance > 0.0,
+            "different doc-role embeddings must produce distance > 0, got {}",
+            matched_pair.unwrap().distance
+        );
+    }
+
+    // ─── io_fetch_result_embeddings (store-level): correctness guard ──────────
+
+    /// io_fetch_result_embeddings correctly returns stored doc-role embeddings.
+    #[tokio::test]
+    async fn fetch_result_embeddings_returns_stored_vectors() {
+        let dim = 8;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), dim);
+
+        let emb_a = make_embedding(dim, 1.0);
+        let emb_b = make_embedding(dim, 5.0);
+
+        let row_a = ChunkRow {
+            doc_id: "doc/x".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: emb_a.clone(),
+            query_embedding: make_embedding(dim, 2.0),
+            content: "x".to_owned(),
+        };
+        let row_b = ChunkRow {
+            doc_id: "doc/y".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: emb_b.clone(),
+            query_embedding: make_embedding(dim, 3.0),
+            content: "y".to_owned(),
+        };
+
+        let domain = "admin/fetch_emb";
+        store
+            .io_upsert_chunks(domain, "main", "doc/x", std::slice::from_ref(&row_a))
+            .await
+            .unwrap();
+        store
+            .io_upsert_chunks(domain, "main", "doc/y", std::slice::from_ref(&row_b))
+            .await
+            .unwrap();
+        store
+            .io_refresh_cached_dataset(domain, "main")
+            .await
+            .unwrap();
+        let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+        let version = ds_arc.read().await.version().version;
+        store
+            .io_tag_commit(domain, "main", "c1", version)
+            .await
+            .unwrap();
+
+        let result = store
+            .io_fetch_result_embeddings(
+                domain,
+                "main",
+                "c1",
+                &["doc/x".to_owned(), "doc/y".to_owned()],
+                "embedding",
+            )
+            .await
+            .expect("fetch must succeed");
+
+        assert_eq!(result.len(), 2);
+        assert!(
+            crate::kernel::distance::vectors_equal(result.get("doc/x").unwrap(), &emb_a),
+            "fetched embedding for doc/x must match what was stored"
+        );
+        assert!(
+            crate::kernel::distance::vectors_equal(result.get("doc/y").unwrap(), &emb_b),
+            "fetched embedding for doc/y must match what was stored"
+        );
+    }
+
+    /// io_fetch_result_embeddings with query_embedding column.
+    #[tokio::test]
+    async fn fetch_result_query_embeddings_returns_stored_vectors() {
+        let dim = 8;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), dim);
+
+        let qemb_a = make_embedding(dim, 7.0);
+        let qemb_b = make_embedding(dim, 9.0);
+
+        let row_a = ChunkRow {
+            doc_id: "doc/p".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: make_embedding(dim, 1.0),
+            query_embedding: qemb_a.clone(),
+            content: "p".to_owned(),
+        };
+        let row_b = ChunkRow {
+            doc_id: "doc/q".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: make_embedding(dim, 2.0),
+            query_embedding: qemb_b.clone(),
+            content: "q".to_owned(),
+        };
+
+        let domain = "admin/fetch_qemb";
+        store
+            .io_upsert_chunks(domain, "main", "doc/p", std::slice::from_ref(&row_a))
+            .await
+            .unwrap();
+        store
+            .io_upsert_chunks(domain, "main", "doc/q", std::slice::from_ref(&row_b))
+            .await
+            .unwrap();
+        store
+            .io_refresh_cached_dataset(domain, "main")
+            .await
+            .unwrap();
+        let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+        let version = ds_arc.read().await.version().version;
+        store
+            .io_tag_commit(domain, "main", "c1", version)
+            .await
+            .unwrap();
+
+        let result = store
+            .io_fetch_result_embeddings(
+                domain,
+                "main",
+                "c1",
+                &["doc/p".to_owned(), "doc/q".to_owned()],
+                "query_embedding",
+            )
+            .await
+            .expect("fetch must succeed");
+
+        assert_eq!(result.len(), 2);
+        assert!(
+            crate::kernel::distance::vectors_equal(result.get("doc/p").unwrap(), &qemb_a),
+            "fetched query_embedding for doc/p must match stored"
+        );
+        assert!(
+            crate::kernel::distance::vectors_equal(result.get("doc/q").unwrap(), &qemb_b),
+            "fetched query_embedding for doc/q must match stored"
+        );
     }
 }
 

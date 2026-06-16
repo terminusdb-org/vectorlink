@@ -396,6 +396,7 @@ fn dedup_chunks_to_documents_picks_best_chunk() {
             doc_token_len: 1000,
             content: "first chunk".to_owned(),
             embedding: Vec::new(),
+            query_embedding: Vec::new(),
         },
         ChunkHit {
             doc_id: "doc/1".to_owned(),
@@ -407,6 +408,7 @@ fn dedup_chunks_to_documents_picks_best_chunk() {
             doc_token_len: 1000,
             content: "second chunk".to_owned(),
             embedding: Vec::new(),
+            query_embedding: Vec::new(),
         },
         ChunkHit {
             doc_id: "doc/2".to_owned(),
@@ -418,6 +420,7 @@ fn dedup_chunks_to_documents_picks_best_chunk() {
             doc_token_len: 200,
             content: "only chunk".to_owned(),
             embedding: Vec::new(),
+            query_embedding: Vec::new(),
         },
     ];
 
@@ -448,6 +451,7 @@ fn dedup_single_chunk_doc_location_zero() {
         doc_token_len: 41,
         content: "short doc".to_owned(),
         embedding: Vec::new(),
+        query_embedding: Vec::new(),
     }];
 
     let results = dedup_chunks_to_documents(hits, true);
@@ -474,6 +478,7 @@ fn distance_transform_in_dedup() {
         doc_token_len: 10,
         content: "x".to_owned(),
         embedding: Vec::new(),
+        query_embedding: Vec::new(),
     }];
     let results = dedup_chunks_to_documents(hits, false);
     assert_eq!(results[0].distance, 0.0, "self-distance maps to 0");
@@ -493,6 +498,7 @@ fn dedup_normalised_distances_pass_through() {
             doc_token_len: 10,
             content: "rrf hit".to_owned(),
             embedding: Vec::new(),
+            query_embedding: Vec::new(),
         },
     ];
     let results = dedup_chunks_to_documents(hits, false);
@@ -519,6 +525,7 @@ fn fts_hits_have_nonzero_ordered_distances() {
             doc_token_len: 10,
             content: "best match".to_owned(),
             embedding: Vec::new(),
+            query_embedding: Vec::new(),
         },
         ChunkHit {
             doc_id: "doc/worse".to_owned(),
@@ -530,6 +537,7 @@ fn fts_hits_have_nonzero_ordered_distances() {
             doc_token_len: 10,
             content: "worse match".to_owned(),
             embedding: Vec::new(),
+            query_embedding: Vec::new(),
         },
     ];
 
@@ -562,6 +570,7 @@ fn vector_distance_scale_anchors_through_dedup() {
         doc_token_len: 10,
         content: "self".to_owned(),
         embedding: Vec::new(),
+        query_embedding: Vec::new(),
     };
     let results = dedup_chunks_to_documents(vec![hit_identical], false);
     assert_eq!(results[0].distance, 0.0, "identical → 0.0");
@@ -577,6 +586,7 @@ fn vector_distance_scale_anchors_through_dedup() {
         doc_token_len: 10,
         content: "ortho".to_owned(),
         embedding: Vec::new(),
+        query_embedding: Vec::new(),
     };
     let results = dedup_chunks_to_documents(vec![hit_orthogonal], false);
     assert!(
@@ -596,6 +606,7 @@ fn vector_distance_scale_anchors_through_dedup() {
         doc_token_len: 10,
         content: "opposite".to_owned(),
         embedding: Vec::new(),
+        query_embedding: Vec::new(),
     };
     let results = dedup_chunks_to_documents(vec![hit_opposite], false);
     assert_eq!(results[0].distance, 1.0, "opposite → 1.0");
@@ -1595,6 +1606,7 @@ fn rrf_merge_combines_ranked_lists() {
             doc_token_len: 10,
             content: "a".to_owned(),
             embedding: Vec::new(),
+            query_embedding: Vec::new(),
         },
         ChunkHit {
             doc_id: "B".to_owned(),
@@ -1606,6 +1618,7 @@ fn rrf_merge_combines_ranked_lists() {
             doc_token_len: 10,
             content: "b".to_owned(),
             embedding: Vec::new(),
+            query_embedding: Vec::new(),
         },
         ChunkHit {
             doc_id: "C".to_owned(),
@@ -1617,6 +1630,7 @@ fn rrf_merge_combines_ranked_lists() {
             doc_token_len: 10,
             content: "c".to_owned(),
             embedding: Vec::new(),
+            query_embedding: Vec::new(),
         },
     ];
 
@@ -1632,6 +1646,7 @@ fn rrf_merge_combines_ranked_lists() {
             doc_token_len: 10,
             content: "b".to_owned(),
             embedding: Vec::new(),
+            query_embedding: Vec::new(),
         },
         ChunkHit {
             doc_id: "C".to_owned(),
@@ -1643,6 +1658,7 @@ fn rrf_merge_combines_ranked_lists() {
             doc_token_len: 10,
             content: "c".to_owned(),
             embedding: Vec::new(),
+            query_embedding: Vec::new(),
         },
         ChunkHit {
             doc_id: "D".to_owned(),
@@ -1654,6 +1670,7 @@ fn rrf_merge_combines_ranked_lists() {
             doc_token_len: 10,
             content: "d".to_owned(),
             embedding: Vec::new(),
+            query_embedding: Vec::new(),
         },
     ];
 

@@ -19,6 +19,23 @@ pub fn l2_normalize(v: &mut [f32]) {
     }
 }
 
+/// Exact bit-equality check for two stored embedding vectors.
+///
+/// Returns `true` iff both vectors have the same length AND every element is
+/// exactly equal (`==` on `f32`). NO epsilon tolerance — this is deliberate:
+/// the vectors being compared are READ BACK FROM STORAGE (Lance), not recomputed.
+/// For genuinely identical documents they are the SAME BYTES written by the same
+/// pipeline run, so they are bit-identical floats. An epsilon would be HARMFUL:
+/// it could declare two near-identical-but-genuinely-different documents as
+/// "distance 0 / duplicate" — a false positive the duplicate check must avoid.
+///
+/// PRECONDITION: both vectors must be non-empty and the same dimension. A
+/// dimension mismatch returns `false` (never panics) — the caller should
+/// fail-loud on a dim mismatch BEFORE reaching this helper.
+pub fn vectors_equal(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x == y)
+}
+
 /// Compute normalized cosine distance between two L2-normalized vectors.
 /// Returns a value on the [0, 1] reference scale (same as `normalized_cosine_from_lance`):
 /// 0 = identical, 0.5 = unrelated/orthogonal, 1 = opposite.
@@ -124,6 +141,48 @@ mod tests {
             "opposite vectors should have distance ~1.0, got {}",
             result
         );
+    }
+
+    #[test]
+    fn vectors_equal_identical() {
+        let a = vec![0.1_f32, 0.2, 0.3, 0.4];
+        assert!(vectors_equal(&a, &a));
+    }
+
+    #[test]
+    fn vectors_equal_cloned() {
+        let a = vec![0.1_f32, 0.2, 0.3, 0.4];
+        let b = a.clone();
+        assert!(vectors_equal(&a, &b));
+    }
+
+    #[test]
+    fn vectors_equal_different_values() {
+        let a = vec![0.1_f32, 0.2, 0.3, 0.4];
+        let b = vec![0.1_f32, 0.2, 0.3, 0.40001];
+        assert!(!vectors_equal(&a, &b));
+    }
+
+    #[test]
+    fn vectors_equal_different_lengths() {
+        let a = vec![0.1_f32, 0.2, 0.3];
+        let b = vec![0.1_f32, 0.2, 0.3, 0.4];
+        assert!(!vectors_equal(&a, &b));
+    }
+
+    #[test]
+    fn vectors_equal_empty() {
+        let a: Vec<f32> = vec![];
+        let b: Vec<f32> = vec![];
+        assert!(vectors_equal(&a, &b));
+    }
+
+    #[test]
+    fn vectors_equal_one_bit_difference() {
+        // Even a single LSB difference must return false (exact equality).
+        let a = vec![1.0_f32];
+        let b = vec![f32::from_bits(1.0_f32.to_bits() + 1)];
+        assert!(!vectors_equal(&a, &b));
     }
 
     #[test]

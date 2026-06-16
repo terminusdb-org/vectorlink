@@ -212,6 +212,11 @@ paths:
         sets, OR within each. Results paginate with `start` (default 0) and
         `count` (default 50). Staleness is reported via the `TerminusDB-Data-Version`
         response header.
+
+
+        **Identical documents:** when a result's content is literally identical to
+        the query text, the reported distance is 0; any difference yields a
+        non-zero distance.
       parameters:
         - $ref: '#/components/parameters/Domain'
         - $ref: '#/components/parameters/Commit'
@@ -257,6 +262,11 @@ paths:
         0) and `count` (default 50). Staleness is reported via the
         `TerminusDB-Data-Version` response header — the response body stays the
         bare array.
+
+
+        **Identical documents:** when a result's content is literally identical to
+        the query text, the reported distance is 0; any difference yields a
+        non-zero distance.
 
 
         Every query parameter below is optional at the query layer on POST,
@@ -317,6 +327,11 @@ paths:
         response shape and staleness header as `/search`; paginates with `start`
         and `count`. Supports `doc_type` and `doc_id` filters to scope the
         candidate pool (e.g. "similar within these specific documents").
+
+
+        **Identical documents:** when a neighbour's content is literally identical
+        to the source document, the reported distance is 0; any difference yields
+        a non-zero distance.
       parameters:
         - $ref: '#/components/parameters/Domain'
         - $ref: '#/components/parameters/Commit'
@@ -357,6 +372,11 @@ paths:
         Preferred when `doc_id` candidate pools are large (dozens+) and would
         overflow a GET URL. Body values override same-named query parameters
         (same precedence as POST /search).
+
+
+        **Identical documents:** when a neighbour's content is literally identical
+        to the source document, the reported distance is 0; any difference yields
+        a non-zero distance.
       parameters:
         - $ref: '#/components/parameters/Domain'
         - $ref: '#/components/parameters/Commit'
@@ -431,6 +451,11 @@ paths:
         rejected rather than partially scanned), and `start`/`count` pagination
         over the nearest-first group list. When `snippet=true`, each group member
         carries its matched chunk text.
+
+
+        **Identical documents:** when two documents contain literally identical
+        content, the distance between them is 0; any difference yields a non-zero
+        distance.
       parameters:
         - $ref: '#/components/parameters/Domain'
         - $ref: '#/components/parameters/Commit'
@@ -513,6 +538,11 @@ paths:
         set (within-set dedup). The threshold is the GATHER cap (max distance
         for a candidate NN to be considered); the three tau are independent
         MATCHING thresholds applied after gathering.
+
+
+        **Identical documents:** when two documents contain literally identical
+        content, the distance between them is 0; any difference yields a non-zero
+        distance.
       requestBody:
         required: true
         content:

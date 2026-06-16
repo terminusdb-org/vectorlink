@@ -52,12 +52,17 @@ pub struct ChunkHit {
     pub chunk_token_start: i32,
     pub doc_token_len: i32,
     pub content: String,
-    /// The L2-normalised embedding vector as STORED at insert time. Populated only
-    /// by the plain doc-chunk lookup path (`io_lookup_doc_chunks`), where it is
-    /// projected from the snapshot so `/similar` can reuse the stored vector
-    /// directly instead of re-embedding the source text. Ranked search/FTS paths
-    /// leave this empty (they rank by `_distance`/`_score`, not the raw vector).
+    /// The L2-normalised DOCUMENT-role embedding vector as STORED at insert time.
+    /// Populated only by the plain doc-chunk lookup path (`io_lookup_doc_chunks`),
+    /// where it is projected from the snapshot so `/similar` can reuse the stored
+    /// vector directly instead of re-embedding the source text. Ranked search/FTS
+    /// paths leave this empty (they rank by `_distance`/`_score`, not the raw vector).
     pub embedding: Vec<f32>,
+    /// The L2-normalised QUERY-role embedding vector as STORED at insert time.
+    /// Populated only by the plain doc-chunk lookup path (`io_lookup_doc_chunks`),
+    /// so `/similar` can use the asymmetric query→document probe signal. Ranked
+    /// search/FTS paths leave this empty.
+    pub query_embedding: Vec<f32>,
 }
 
 /// Default Lance branch name. Layout (A) maps TerminusDB's `main` branch to

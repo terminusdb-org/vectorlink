@@ -319,6 +319,110 @@ impl LanceStore {
     }
 }
 
+impl LanceStore {
+    /// Fetch the best (chunk_index=0 preferred) stored embedding for each doc_id
+    /// in a result set. Used by the same-role exact-duplicate distance override.
+    ///
+    /// `column` is the embedding column name: `"embedding"` (doc-role) or
+    /// `"query_embedding"` (query-role).
+    ///
+    /// Returns a map from doc_id → Vec<f32>. Documents not found in the snapshot
+    /// (deleted between search and this lookup — edge case) are silently absent
+    /// from the map (the override simply does not fire for them).
+    ///
+    /// FAIL-LOUD: a schema corruption (null embedding, non-Float32 values) is a
+    /// real error — never silently skipped.
+    pub async fn io_fetch_result_embeddings(
+        &self,
+        domain: &str,
+        branch: &str,
+        commit: &str,
+        doc_ids: &[String],
+        column: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<f32>>, StoreError> {
+        if doc_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let snapshot = self.io_snapshot_from_cache(domain, branch, commit).await?;
+
+        // Build an IN-list filter for the requested doc_ids.
+        let filter = build_filter_expression(&[], doc_ids);
+
+        let mut scanner = snapshot.scan();
+        scanner
+            .project(&["doc_id", "chunk_index", column])
+            .map_err(|e| StoreError::Internal(format!(
+                "result embedding projection failed: {}", e
+            )))?;
+        scanner
+            .filter(&filter)
+            .map_err(|e| StoreError::Internal(format!(
+                "result embedding filter failed: {}", e
+            )))?;
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .map_err(|e| StoreError::Internal(format!(
+                "result embedding stream failed: {}", e
+            )))?
+            .try_collect()
+            .await
+            .map_err(|e| StoreError::Internal(format!(
+                "result embedding collect failed: {}", e
+            )))?;
+
+        // For each doc_id, keep only the chunk_index=0 embedding (best representative).
+        // If chunk_index=0 is not present (edge case: partial data), keep the lowest.
+        let mut best_per_doc: std::collections::HashMap<String, (i32, Vec<f32>)> =
+            std::collections::HashMap::new();
+
+        for batch in &batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let ids = batch
+                .column_by_name("doc_id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| StoreError::Internal(
+                    "result embedding scan: missing `doc_id` column".to_owned(),
+                ))?;
+            let chunk_indexes = batch
+                .column_by_name("chunk_index")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                .ok_or_else(|| StoreError::Internal(
+                    "result embedding scan: missing `chunk_index` column".to_owned(),
+                ))?;
+            let embeddings = batch
+                .column_by_name(column)
+                .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
+                .ok_or_else(|| StoreError::Internal(format!(
+                    "result embedding scan: missing `{}` column", column
+                )))?;
+
+            for i in 0..batch.num_rows() {
+                let doc_id = ids.value(i);
+                let ci = chunk_indexes.value(i);
+                let embedding = extract_embedding_row(embeddings, i, doc_id)?;
+
+                let should_update = match best_per_doc.get(doc_id) {
+                    None => true,
+                    Some((existing_ci, _)) => ci < *existing_ci,
+                };
+                if should_update {
+                    best_per_doc.insert(doc_id.to_owned(), (ci, embedding));
+                }
+            }
+        }
+
+        Ok(best_per_doc
+            .into_iter()
+            .map(|(id, (_, emb))| (id, emb))
+            .collect())
+    }
+}
+
 /// Build a Lance SQL filter combining doc_type and doc_id IN-lists.
 /// Used by search (vector/fts filters) and resolve (set/target population filters).
 pub(super) fn build_filter_expression(doc_types: &[String], doc_ids: &[String]) -> String {
@@ -414,11 +518,14 @@ pub(super) fn batches_to_vector_hits(
         let distances = batch
             .column_by_name("_distance")
             .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
-        // The stored embedding is present only on the plain doc-chunk lookup scan
-        // (which selects all columns); ranked vector search projects it away. When
-        // present, `/similar` reuses it directly instead of re-embedding.
+        // The stored embeddings are present only on the plain doc-chunk lookup scan
+        // (which selects all columns); ranked vector search projects them away. When
+        // present, `/similar` reuses them directly instead of re-embedding.
         let embeddings = batch
             .column_by_name("embedding")
+            .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>());
+        let query_embeddings = batch
+            .column_by_name("query_embedding")
             .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>());
 
         // FAIL LOUD (#E): a ranked vector search with no usable `_distance`
@@ -442,6 +549,10 @@ pub(super) fn batches_to_vector_hits(
                     Some(arr) => extract_embedding_row(arr, i, ids.value(i))?,
                     None => Vec::new(),
                 };
+                let query_embedding = match query_embeddings {
+                    Some(arr) => extract_embedding_row(arr, i, ids.value(i))?,
+                    None => Vec::new(),
+                };
                 hits.push(ChunkHit {
                     doc_id: ids.value(i).to_owned(),
                     distance,
@@ -452,6 +563,7 @@ pub(super) fn batches_to_vector_hits(
                     doc_token_len: dtl.value(i),
                     content: cnt.value(i).to_owned(),
                     embedding,
+                    query_embedding,
                 });
             }
         }
@@ -506,8 +618,9 @@ fn batches_to_fts_hits(batches: &[RecordBatch]) -> Vec<ChunkHit> {
                     chunk_token_start: cts.value(i),
                     doc_token_len: dtl.value(i),
                     content: cnt.value(i).to_owned(),
-                    // FTS path ranks by `_score`; the raw vector is not projected.
+                    // FTS path ranks by `_score`; the raw vectors are not projected.
                     embedding: Vec::new(),
+                    query_embedding: Vec::new(),
                 });
             }
         }
