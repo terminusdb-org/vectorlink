@@ -24,19 +24,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Copy manifests and full source.
+# Copy manifests and the service source. The `benches/` directory holds
+# throwaway measurement bins (scale-evidence, crossover-measurement) that are
+# NOT part of the shipped service, so the production image neither copies nor
+# builds them — the build is scoped to the service binary below.
 COPY Cargo.toml Cargo.lock* ./
 COPY src/ src/
-COPY benches/ benches/
 COPY assets/tokenizer.json.bz2 /build/tokenizer.json.bz2
 
 # Build with BuildKit cache mounts for persistent cargo registry + target dir.
 # The cache survives across builds so incremental recompilation is fast (~seconds
 # for a source-only change vs ~10 min cold). The binary is copied OUT of the
 # cache mount in the same RUN (cache mounts are not part of the image layer).
+# --bin tdb-search builds ONLY the shipped service binary, not the benches/*
+# measurement bins (which would otherwise require the benches/ source).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release && \
+    cargo build --release --bin tdb-search && \
     cp /build/target/release/tdb-search /build/tdb-search
 
 # ──────────────────────────── Runtime stage ────────────────────────────────
