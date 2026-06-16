@@ -574,6 +574,80 @@ paths:
         '404': { $ref: '#/components/responses/NoIndexedLineage' }
         '500': { $ref: '#/components/responses/UpstreamError' }
 
+  # ───────────────────────────── compare ───────────────────────────────────
+  /compare:
+    post:
+      tags: [search]
+      operationId: compare
+      summary: Stateless semantic distance between two texts.
+      description: >
+        Embeds `source` (Query role) and `target` (Document role), L2-normalises
+        both vectors, and returns the normalized cosine distance on the same
+        [0, 1] reference scale as `/search`, `/similar`, `/duplicates`, and
+        `/resolve` (0 = identical, ~0.5 = unrelated, 1 = opposite).
+
+
+        Stateless: no dataset, no ANN index, no domain. Pure convenience function
+        for a UI to compare two records without provisioning an index. The only
+        requirement is that the embedding backend is warm (search-ready).
+
+
+        Extensibility: the `method` query parameter is required. Currently the only
+        supported value is `embedding`. Unknown or missing values give 400 — this
+        gate allows future methods (e.g. `method=lexical`) without a breaking change.
+      parameters:
+        - name: method
+          in: query
+          required: true
+          description: >
+            The comparison method to use. Must be `embedding` (the only currently
+            supported value). Unknown values give 400 (extensible for future methods).
+          schema:
+            type: string
+            enum: [embedding]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompareRequest' }
+            examples:
+              basic:
+                summary: Compare two product descriptions
+                value:
+                  source: "Sony 5-disc CD changer with carousel"
+                  target: "Sony 5 disc CD player carousel mechanism"
+      responses:
+        '200':
+          description: >
+            The semantic distance between the two texts on the [0, 1] reference
+            scale (same as all other endpoints). Includes which embedding role
+            was applied to each side, for transparency.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CompareResult' }
+              examples:
+                similar:
+                  summary: Two similar texts
+                  value:
+                    distance: 0.034
+                    source_role: query
+                    target_role: document
+                unrelated:
+                  summary: Two unrelated texts
+                  value:
+                    distance: 0.48
+                    source_role: query
+                    target_role: document
+        '400':
+          description: >
+            Missing or unsupported `method`, or missing `source`/`target` in body.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/EmbeddingBackendUnavailable' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
+
   # ───────────────────────────── ops ───────────────────────────────────────
   /statistics:
     get:
@@ -1210,6 +1284,50 @@ components:
             description: >
               The [0, 1] cosine distance of the group's best matching chunks
               (0 = identical, 0.5 = unrelated, 1 = opposite).
+
+    CompareRequest:
+      type: object
+      required: [source, target]
+      description: >
+        Request body for POST /compare. Both fields are plain text strings
+        to be embedded and compared.
+      properties:
+        source:
+          type: string
+          description: >
+            The source text. Embedded with the Query role prefix (asymmetric
+            embedding — the query-side of the model's trained signal).
+          example: "Sony 5-disc CD changer with carousel"
+        target:
+          type: string
+          description: >
+            The target text. Embedded with the Document role prefix (asymmetric
+            embedding — the document-side of the model's trained signal).
+          example: "Sony 5 disc CD player carousel mechanism"
+
+    CompareResult:
+      type: object
+      required: [distance, source_role, target_role]
+      properties:
+        distance:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: >
+            Normalized cosine distance on the [0, 1] reference scale — the SAME
+            scale as `/search`, `/similar`, `/duplicates`, and `/resolve`.
+            0 = identical, ~0.5 = unrelated/orthogonal, 1 = opposite.
+        source_role:
+          type: string
+          description: >
+            The embedding role applied to the source text. Currently always "query".
+          example: query
+        target_role:
+          type: string
+          description: >
+            The embedding role applied to the target text. Currently always "document".
+          example: document
 
     ResolveRequest:
       type: object

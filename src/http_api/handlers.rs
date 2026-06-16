@@ -95,7 +95,21 @@ pub struct DuplicatesParams {
     // cannot deserialize repeated keys into a Vec).
 }
 
+// ─────────────────────────── Compare query params ────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CompareParams {
+    pub method: Option<String>,
+}
+
 // ─────────────────────────── Request body structs ─────────────────────────
+
+/// Request body for POST /compare (stateless text distance).
+#[derive(Debug, Deserialize)]
+pub struct CompareRequestBody {
+    pub source: Option<String>,
+    pub target: Option<String>,
+}
 
 /// Request body for POST /resolve (entity resolution).
 #[derive(Debug, Deserialize)]
@@ -1018,6 +1032,73 @@ async fn handle_health_ready(State(state): State<AppState>) -> Response {
     }
 }
 
+// ─────────────────────────── Compare ────────────────────────────────────
+
+/// POST /compare?method=embedding — stateless semantic distance between two texts.
+/// NO dataset, NO ANN index, NO domain. Pure convenience function: embed source
+/// (Query role) and target (Document role), L2-normalise, compute cosine distance.
+///
+/// Extensibility: requires `method=embedding` (the only supported method). Unknown
+/// or missing method values fail loud with 400 — this gate allows future methods
+/// (e.g. `method=lexical`) without a breaking change.
+async fn handle_compare(
+    State(state): State<AppState>,
+    Query(params): Query<CompareParams>,
+    Json(body): Json<CompareRequestBody>,
+) -> Response {
+    // Validate method query param — must be present and "embedding".
+    match params.method.as_deref() {
+        Some("embedding") => { /* valid — proceed */ }
+        Some(unknown) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unsupported compare method: '{}' (supported: embedding)",
+                    unknown
+                ),
+            );
+        }
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing required query parameter: method (supported: embedding)".to_owned(),
+            );
+        }
+    }
+
+    // Validate body fields.
+    let source = match body.source {
+        Some(ref s) if !s.is_empty() => s.clone(),
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing required body field: source".to_owned(),
+            );
+        }
+    };
+    let target = match body.target {
+        Some(ref t) if !t.is_empty() => t.clone(),
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing required body field: target".to_owned(),
+            );
+        }
+    };
+
+    match state.service.compare(&source, &target).await {
+        Ok(result) => {
+            let body = serde_json::json!({
+                "distance": result.distance,
+                "source_role": result.source_role,
+                "target_role": result.target_role,
+            });
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(e) => service_error_to_response(e),
+    }
+}
+
 // ─────────────────────────── Compact ────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -1065,6 +1146,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/duplicates", get(handle_duplicates))
         .route("/resolve", post(handle_resolve))
         .route("/compact", post(handle_compact))
+        .route("/compare", post(handle_compare))
         .route("/statistics", get(handle_statistics))
         .route("/domain", delete(handle_delete_domain))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));

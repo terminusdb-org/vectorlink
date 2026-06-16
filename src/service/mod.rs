@@ -67,6 +67,18 @@ pub struct SimilarOutcome {
     pub served_commit: String,
 }
 
+/// Result of a `/compare` request — stateless distance between two texts.
+#[derive(Debug, Clone)]
+pub struct CompareResult {
+    /// Normalized cosine distance on the [0, 1] reference scale.
+    /// 0 = identical, ~0.5 = unrelated, 1 = opposite.
+    pub distance: f32,
+    /// Which embedding role was applied to the source text.
+    pub source_role: String,
+    /// Which embedding role was applied to the target text.
+    pub target_role: String,
+}
+
 impl std::fmt::Debug for SearchService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SearchService")
@@ -1054,6 +1066,71 @@ impl SearchService {
         }))
     }
 
+    /// Compare two texts by embedding them and computing their normalized cosine distance.
+    /// Stateless: NO dataset, NO ANN index, NO domain required.
+    ///
+    /// `source` is embedded with `EmbeddingRole::Query`, `target` with `EmbeddingRole::Document`.
+    /// Both vectors are L2-normalized, then the normalized cosine distance is computed on
+    /// the same [0, 1] reference scale that `/search`, `/similar`, `/duplicates`, and
+    /// `/resolve` return (0 = identical, ~0.5 = unrelated, 1 = opposite).
+    pub async fn compare(
+        &self,
+        source: &str,
+        target: &str,
+    ) -> Result<CompareResult, ServiceError> {
+        if !self.is_search_ready() {
+            return Err(ServiceError::Unavailable(
+                "search capability not ready (embedding backend cold)".to_owned(),
+            ));
+        }
+
+        // Embed both texts in a single batch of 2 for efficiency.
+        // Source uses Query role, Target uses Document role (asymmetric embedding).
+        let source_texts = vec![source.to_owned()];
+        let target_texts = vec![target.to_owned()];
+
+        let source_embeddings = embed::io_embed(
+            &self.config.embed_provider,
+            &source_texts,
+            EmbeddingRole::Query,
+            &self.http_client,
+        )
+        .await
+        .map_err(|e| ServiceError::Internal(format!("embedding source failed: {}", e)))?;
+
+        let target_embeddings = embed::io_embed(
+            &self.config.embed_provider,
+            &target_texts,
+            EmbeddingRole::Document,
+            &self.http_client,
+        )
+        .await
+        .map_err(|e| ServiceError::Internal(format!("embedding target failed: {}", e)))?;
+
+        let mut source_vec = source_embeddings
+            .into_iter()
+            .next()
+            .ok_or_else(|| ServiceError::Internal("no embedding returned for source".to_owned()))?;
+        let mut target_vec = target_embeddings
+            .into_iter()
+            .next()
+            .ok_or_else(|| ServiceError::Internal("no embedding returned for target".to_owned()))?;
+
+        // L2-normalize both vectors.
+        l2_normalize(&mut source_vec);
+        l2_normalize(&mut target_vec);
+
+        // Compute the normalized cosine distance on the [0, 1] reference scale.
+        let distance =
+            crate::kernel::distance::cosine_distance_normalized(&source_vec, &target_vec);
+
+        Ok(CompareResult {
+            distance,
+            source_role: "query".to_owned(),
+            target_role: "document".to_owned(),
+        })
+    }
+
     /// Validate a domain string without side effects.
     pub fn validate_domain(&self, domain_raw: &str) -> Result<(), ServiceError> {
         parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
@@ -1365,15 +1442,21 @@ async fn io_run_index_pipeline(
     }
 
     // ─── WRITE phase (batched, under pipeline lock) ─────────────────────────
-    // Only proceed if there is actual work (rows to insert/update or docs to delete).
+    // Only proceed with data writes if there is actual work (rows to insert/update
+    // or docs to delete). HOWEVER: every commit — including no-op/all-error commits
+    // — MUST be tagged and last_indexed advanced. Skipping the tag for a no-op
+    // commit causes catch-up stalls (RISK-26): the engine never progresses past
+    // the empty commit and subsequent normal commits cannot be reached.
     let has_work = !all_rows.is_empty() || !delete_ids.is_empty();
 
-    if has_work {
-        // Acquire the per-branch lock. Held for the entire write→optimize→tag sequence.
-        // This ensures at most one unindexed commit per branch and prevents snapshot
-        // isolation violations (a later commit's data cannot leak into an earlier tag).
-        let _guard = ctx.store.acquire_pipeline_lock(ctx.domain, ctx.branch).await;
+    // Acquire the per-branch lock. Held for the entire write→optimize→tag sequence.
+    // This ensures at most one unindexed commit per branch and prevents snapshot
+    // isolation violations (a later commit's data cannot leak into an earlier tag).
+    // Acquired unconditionally: even a no-op commit must be tagged under the lock
+    // to maintain ordering (a concurrent push must not interleave tags).
+    let _guard = ctx.store.acquire_pipeline_lock(ctx.domain, ctx.branch).await;
 
+    if has_work {
         // Batched write (Option B): two-version delete-then-append under pipeline lock.
         //   1. Delete: all Changed + Deleted doc_ids (removes old chunks, handles shrinking).
         //   2. Append: all new rows for Insert + Changed docs (one fragment).
@@ -1403,6 +1486,40 @@ async fn io_run_index_pipeline(
         // Update last-indexed tracking.
         ctx.store
             .update_last_indexed(ctx.domain, ctx.branch, commit, tag_version)
+            .await;
+    } else {
+        // ─── NO-OP path (RISK-26 fix): tag + advance without writing data ──────
+        // The commit contains no indexable content (all Operation::Error, empty ops,
+        // or all docs skipped). We MUST still tag it and advance last_indexed so
+        // catch-up progresses past this commit. The tag points to the current/prior
+        // latest data version — there is nothing new to search, but the commit is
+        // marked as "processed" and will not block subsequent commits.
+        //
+        // Ensure the dataset exists (auto-creates an empty one for a fresh domain).
+        // This is needed before we can read the branch head version or tag.
+        ctx.store
+            .io_open_dataset(ctx.domain, ctx.branch)
+            .await
+            .map_err(|e| format!("no-op tag: failed to ensure dataset: {}", e))?;
+
+        // Get the current head version for the BRANCH (not main). For non-main
+        // branches, the version space is branch-scoped — using main's version would
+        // fail because that version may not exist in the branch's lineage.
+        let current_version = ctx
+            .store
+            .io_branch_head_version(ctx.domain, ctx.branch)
+            .await
+            .map_err(|e| format!("no-op tag: failed to get branch head version: {}", e))?;
+
+        // Tag the empty commit to the existing version (no new data).
+        ctx.store
+            .io_tag_commit(ctx.domain, ctx.branch, commit, current_version)
+            .await
+            .map_err(|e| format!("no-op tag: failed to tag commit: {}", e))?;
+
+        // Advance last-indexed past this commit.
+        ctx.store
+            .update_last_indexed(ctx.domain, ctx.branch, commit, current_version)
             .await;
     }
 
