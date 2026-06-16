@@ -29,6 +29,7 @@ help:
 	@echo "  make dev              Incremental DEBUG build (fast iteration)"
 	@echo "  make dev-image        Assemble dev container from debug binary (seconds)"
 	@echo "  make dev-up           dev + dev-image + docker compose up (full edit-run)"
+	@echo "  make dev-up-release   RELEASE build + compose up (80x faster runtime)"
 	@echo "  make build-release    Production RELEASE build (lto=thin, slow)"
 	@echo "  make lint             Run ALL component linters (must pass before commit)"
 	@echo "  make lint-openapi     Strict OpenAPI 3.1 lint (Redocly $(REDOCLY_VERSION))"
@@ -160,8 +161,21 @@ dev-image:
 # the compose stack. The compose override (docker-compose.override.yml) points
 # tdb-search at Dockerfile.dev so `docker compose up --build` also works after
 # `make dev` has produced the binary.
+#
+# WARNING: debug builds are ~80x SLOWER for compute-heavy paths (flat-KNN in
+# /resolve, /duplicates) due to missing SIMD optimisation. For ANY performance
+# testing or benchmarking, use `make dev-up-release` instead.
 .PHONY: dev-up
 dev-up: dev dev-image
+	docker compose up -d tdb-search
+
+# dev-up-release: same as dev-up but uses the RELEASE binary (optimised SIMD).
+# Slower to build (~45s incremental vs ~5s) but 80x faster at runtime for
+# vector compute paths. Use for: benchmarking, /resolve testing, E2E timing.
+.PHONY: dev-up-release
+dev-up-release: build-release
+	@cp target/release/tdb-search target/debug/tdb-search-stripped
+	docker build -f Dockerfile.dev -t tdb-search:dev .
 	docker compose up -d tdb-search
 
 # build-release: RELEASE build (no LTO). Fast enough for `make pr` gate

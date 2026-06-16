@@ -2,9 +2,16 @@
 
 //! Vector ANN index management for LanceDB datasets.
 //!
-//! Creates and maintains a vector index (IVF_PQ) on the `embedding` column.
+//! Creates and maintains a vector index (IVF_HNSW_SQ) on the `embedding` column.
 //! The index uses cosine distance (vectors are L2-normalised before insert,
 //! so Lance's DistanceType::Cosine gives the correct metric).
+//!
+//! Index type: IVF_HNSW_SQ (Inverted File + HNSW graph + Scalar Quantisation).
+//! - IVF partitions the space for coarse search (scalability).
+//! - HNSW graph provides high-recall traversal within each partition.
+//! - Scalar Quantisation (SQ) preserves per-dimension precision (8-bit per dim),
+//!   far less lossy than the previous PQ (Product Quantisation) which compressed
+//!   sub-vector groups into codebook centroids.
 //!
 //! Index lifecycle:
 //! - Created once when first needed (`io_ensure_vector_index`).
@@ -29,7 +36,7 @@ pub const VECTOR_INDEX_NAME: &str = "embedding_ann";
 
 /// Ensure a vector ANN index exists on the `embedding` column.
 ///
-/// On first call: creates the IVF_PQ index with the configured parameters.
+/// On first call: creates the IVF_HNSW_SQ index with the configured parameters.
 /// On subsequent calls: incrementally indexes only new (unindexed) fragments
 /// via `optimize_indices(OptimizeOptions::append())` — O(new_data), not O(corpus).
 ///
@@ -50,12 +57,13 @@ pub async fn io_ensure_vector_index(
     let has_vector_idx = indices.iter().any(|idx| idx.name == VECTOR_INDEX_NAME);
 
     if !has_vector_idx {
-        // IVF_PQ minimum training requirement:
+        // IVF_HNSW_SQ minimum training requirement:
         // - IVF KMeans needs at least `num_partitions` vectors (one per centroid).
-        // - PQ codebook KMeans needs at least 2^num_bits (256 for num_bits=8)
-        //   training vectors for each sub-vector's codebook.
-        // The binding constraint is PQ: 256 vectors minimum.
-        // Without enough data, `create_index` fails with a KMeans training error.
+        // - SQ (Scalar Quantisation) uses sample_rate * 256 training vectors
+        //   (default sample_rate=256 → 65536 samples, but it can subsample from
+        //   fewer rows). The binding constraint is IVF: num_partitions centroids.
+        // - HNSW graph construction has no minimum; it works with any count > 0.
+        // Without enough data for IVF KMeans, `create_index` fails with a training error.
         // Lance flat-searches unindexed fragments correctly, so search stays correct
         // during this window. The index will be created on a future call once enough
         // data accumulates.
@@ -64,10 +72,12 @@ pub async fn io_ensure_vector_index(
             .await
             .map_err(|e| StoreError::Internal(format!("count rows failed: {}", e)))?;
 
-        // PQ with num_bits=8 needs 2^8=256 training vectors minimum.
-        // IVF needs num_partitions centroids. Take the max as the safe floor.
-        let pq_min_training_vectors: usize = 256; // 2^num_bits for PQ codebook
-        let min_rows_for_index = config.num_partitions.max(pq_min_training_vectors);
+        // IVF needs num_partitions centroids. SQ's sample_rate is adaptive
+        // (works with fewer rows by subsampling). The safe floor is the IVF
+        // partitions requirement, with a practical minimum of 256 for stable
+        // centroid training (KMeans needs reasonable cluster diversity).
+        let ivf_min_training_vectors: usize = 256;
+        let min_rows_for_index = config.num_partitions.max(ivf_min_training_vectors);
         if row_count < min_rows_for_index {
             // Not enough data to train the index yet — return current version.
             // Search uses flat-scan (correct, higher latency on small corpus is acceptable).
@@ -148,22 +158,27 @@ pub async fn count_unindexed_fragments(ds: &Dataset) -> Result<u64, StoreError> 
 }
 
 /// Build VectorIndexParams from config.
-/// Uses IVF_PQ with cosine distance metric.
+/// Uses IVF_HNSW_SQ with cosine distance metric.
+///
+/// IVF_HNSW_SQ combines:
+/// - IVF (num_partitions) for coarse partitioning
+/// - HNSW (M, ef_construction) for graph-based traversal within partitions
+/// - SQ (8-bit scalar quantisation) for per-dimension precision preservation
 fn build_vector_index_params(
     config: &VectorIndexConfig,
 ) -> lance::index::vector::VectorIndexParams {
     use lance::index::vector::VectorIndexParams;
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
-    use lance_index::vector::pq::PQBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
 
     let ivf = IvfBuildParams::new(config.num_partitions);
-    let pq = PQBuildParams {
-        num_sub_vectors: config.num_sub_vectors,
-        num_bits: 8,
-        ..Default::default()
-    };
+    let hnsw = HnswBuildParams::default()
+        .num_edges(config.m)
+        .ef_construction(config.ef_construction);
+    let sq = SQBuildParams::default(); // 8-bit scalar quantisation, sample_rate=256
 
-    VectorIndexParams::with_ivf_pq_params(DistanceType::Cosine, ivf, pq)
+    VectorIndexParams::with_ivf_hnsw_sq_params(DistanceType::Cosine, ivf, hnsw, sq)
 }
 
 #[cfg(test)]
@@ -301,8 +316,8 @@ mod tests {
     /// This is the key correctness test: approximate results must be close to exact.
     ///
     /// Uses nprobes = num_partitions (scan all partitions) + refine_factor to
-    /// maximise recall. With PQ quantization on random data, 90% recall@10 is
-    /// a reasonable lower bound. If this fails, the index or distance metric is broken.
+    /// maximise recall. With SQ (less lossy than PQ), recall should be higher;
+    /// 90% recall@10 is a conservative lower bound for correctness.
     #[tokio::test]
     async fn ann_recall_within_tolerance() {
         let dim = 128;
@@ -314,7 +329,8 @@ mod tests {
         // Use high nprobes = num_partitions for the recall test (scan all partitions).
         let config = VectorIndexConfig {
             num_partitions: 4, // Few partitions for small corpus.
-            num_sub_vectors: 16,
+            m: 30,             // High connectivity for recall.
+            ef_construction: 200,
             nprobes: 4,        // Scan ALL partitions — no approximation in partition selection.
             refine_factor: Some(20), // Re-rank top 20x candidates with full vectors.
         };

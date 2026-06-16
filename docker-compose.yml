@@ -47,6 +47,11 @@ services:
   embeddings:
     image: ollama/ollama:latest
     pull_policy: missing
+    environment:
+      # Keep the model resident indefinitely (never unload on idle). Eliminates
+      # the cold-load penalty on every push/bench after an idle gap. Trade-off:
+      # the model stays in RAM (~0.7-1.5 GiB for nomic-embed-v2 Q8_0) at all times.
+      - OLLAMA_KEEP_ALIVE=-1
     ports:
       - "127.0.0.1:11434:11434"
     volumes:

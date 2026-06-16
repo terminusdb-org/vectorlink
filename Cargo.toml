@@ -51,6 +51,10 @@ path = "src/bin/load.rs"
 name = "scale-evidence"
 path = "benches/scale_evidence.rs"
 
+[[bin]]
+name = "crossover-measurement"
+path = "benches/crossover_measurement.rs"
+
 # `make pr` profile — fast incremental relinks (no LTO). Used by the pre-commit gate.
 # A one-line change should relink in seconds, not minutes.
 [profile.release]

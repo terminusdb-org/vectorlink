@@ -1,5 +1,4 @@
 use super::*;
-use super::config::largest_divisor_leq;
 use super::search::{batches_to_vector_hits, rrf_merge};
 use crate::kernel::model::{BranchName, Domain, DuplicateGroup, SearchMode};
 
@@ -1673,53 +1672,28 @@ fn rrf_merge_combines_ranked_lists() {
     assert_eq!(ids.len(), 4);
 }
 
-// Fix #4: VectorIndexConfig dimension validation and divisor guarantee.
+// VectorIndexConfig dimension validation.
 
 #[test]
-fn largest_divisor_leq_standard_dims() {
-    // 768-d (nomic-embed-v2): target = 768/16 = 48, 768%48 = 0 → 48
-    assert_eq!(largest_divisor_leq(768, 48), 48);
-    // 128-d: target = 128/8 = 16, 128%16 = 0 → 16
-    assert_eq!(largest_divisor_leq(128, 16), 16);
-    // 384-d: target = 384/16 = 24, 384%24 = 0 → 24
-    assert_eq!(largest_divisor_leq(384, 24), 24);
-    // 1536-d: target = 1536/16 = 96, 1536%96 = 0 → 96
-    assert_eq!(largest_divisor_leq(1536, 96), 96);
-}
-
-#[test]
-fn largest_divisor_leq_non_standard_dims() {
-    // 500-d: target = 500/16 = 31. 500%31 = 500-31*16 = 500-496 = 4 ≠ 0.
-    // Largest divisor of 500 <= 31: 500 = 2^2 * 5^3. Divisors: 1,2,4,5,10,20,25,50,100...
-    // 25 <= 31 and 500%25 = 0.
-    assert_eq!(largest_divisor_leq(500, 31), 25);
-    // 130-d: target = 130/8 = 16. 130%16 = 2 ≠ 0.
-    // Divisors of 130: 1,2,5,10,13,26,65,130. Largest <= 16: 13.
-    assert_eq!(largest_divisor_leq(130, 16), 13);
-}
-
-#[test]
-fn largest_divisor_leq_prime_dim() {
-    // 127 is prime. Target = 127/8 = 15. Only divisors: 1, 127.
-    // Largest <= 15: 1.
-    assert_eq!(largest_divisor_leq(127, 15), 1);
-}
-
-#[test]
-fn vector_index_config_guarantees_divisibility() {
-    // Test various dimensions — all must produce num_sub_vectors that divides dim.
+fn vector_index_config_default_for_dim_produces_valid_config() {
+    // Test various dimensions — all must produce a valid IVF_HNSW_SQ config.
     let test_dims = [128, 256, 384, 500, 512, 768, 1024, 1536, 130, 127, 100, 200];
     for dim in test_dims {
         let config = VectorIndexConfig::default_for_dim(dim);
-        assert_eq!(
-            dim % config.num_sub_vectors, 0,
-            "dim={} must be divisible by num_sub_vectors={} (got remainder {})",
-            dim, config.num_sub_vectors, dim % config.num_sub_vectors
+        assert!(
+            config.num_partitions >= 1,
+            "num_partitions must be >= 1 for dim={}",
+            dim
         );
         assert!(
-            config.num_sub_vectors >= 1,
-            "num_sub_vectors must be at least 1 for dim={}",
+            config.m >= 2,
+            "HNSW M must be >= 2 for dim={}",
             dim
+        );
+        assert!(
+            config.ef_construction >= 2 * config.m,
+            "ef_construction must be >= 2*M for quality HNSW graph (dim={}): got ef={}, m={}",
+            dim, config.ef_construction, config.m
         );
     }
 }
@@ -2106,10 +2080,11 @@ fn open_fd_count() -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn search_does_not_leak_file_descriptors_under_load() {
     let dim = 16;
-    // IVF_PQ needs >= 256 training vectors; a few partitions for a small corpus.
+    // IVF_HNSW_SQ needs >= 256 training vectors; a few partitions for a small corpus.
     let config = VectorIndexConfig {
         num_partitions: 4,
-        num_sub_vectors: 8,
+        m: 16,
+        ef_construction: 100,
         nprobes: 4,
         refine_factor: Some(10),
     };
@@ -2261,7 +2236,8 @@ async fn similar_lookup_on_feature_branch_does_not_leak_file_descriptors_under_l
     let dim = 16;
     let config = VectorIndexConfig {
         num_partitions: 4,
-        num_sub_vectors: 8,
+        m: 16,
+        ef_construction: 100,
         nprobes: 4,
         refine_factor: Some(10),
     };
@@ -2270,7 +2246,7 @@ async fn similar_lookup_on_feature_branch_does_not_leak_file_descriptors_under_l
     let domain = "admin/fdbranch";
     let branch = "feature";
 
-    // Seed main with one 300-chunk doc (above the 256 IVF_PQ training floor),
+    // Seed main with one 300-chunk doc (above the 256 IVF_HNSW_SQ training floor),
     // then fork a feature branch from that version and add the same doc on the
     // branch so the feature-branch lookup has chunks to return.
     let corpus = 300usize;
@@ -2411,7 +2387,8 @@ async fn build_duplicate_corpus(
 ) -> (LanceStore, &'static str, String) {
     let config = VectorIndexConfig {
         num_partitions: 4,
-        num_sub_vectors: 8,
+        m: 16,
+        ef_construction: 100,
         nprobes: 8,
         refine_factor: Some(20),
     };

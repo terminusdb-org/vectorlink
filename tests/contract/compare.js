@@ -18,7 +18,7 @@ const { agent, authHeader, wrongAuthHeader } = require("../lib/agent")
 describe("POST /compare — stateless semantic distance", function () {
   this.timeout(30000)
 
-  it("identical texts → distance ≈ 0", async function () {
+  it("identical texts → distance = 0 (same-string shortcircuit)", async function () {
     const text = "Sony 5-disc CD changer with carousel mechanism"
     const res = await agent()
       .post("/compare")
@@ -29,9 +29,27 @@ describe("POST /compare — stateless semantic distance", function () {
 
     expect(res.body).to.have.property("distance")
     expect(res.body.distance).to.be.a("number")
-    // Identical text embedded with different roles (query vs document) may not
-    // be exactly 0 due to asymmetric prefixes, but should be very close.
-    expect(res.body.distance).to.be.below(0.05)
+    // FIX 3 (#48): Identical input strings return distance 0 without embedding.
+    // The engine short-circuits on exact string equality BEFORE embedding,
+    // avoiding the asymmetric-prefix artefact (~0.16 for identical content).
+    expect(res.body.distance).to.equal(0)
+  })
+
+  it("near-identical texts (minor variation) → distance < 0.20", async function () {
+    const source = "Sony 5-disc CD changer with carousel mechanism"
+    const target = "Sony 5 disc CD player carousel mechanism"
+    const res = await agent()
+      .post("/compare")
+      .query({ method: "embedding" })
+      .set("Authorization", authHeader())
+      .send({ source, target })
+      .expect(200)
+
+    expect(res.body).to.have.property("distance")
+    expect(res.body.distance).to.be.a("number")
+    // Near-identical texts have asymmetric-prefix distance floor of ~0.16;
+    // bound at 0.20 to allow for minor embedding variance.
+    expect(res.body.distance).to.be.below(0.20)
   })
 
   it("unrelated texts → distance ≈ 0.3–0.6", async function () {

@@ -1078,6 +1078,19 @@ impl SearchService {
         source: &str,
         target: &str,
     ) -> Result<CompareResult, ServiceError> {
+        // FIX 3 (#48): If source and target are identical strings, return distance 0
+        // without embedding. This avoids the asymmetric-prefix artefact where identical
+        // text embeds to different vectors (search_query: vs search_document: prefixes)
+        // producing ~0.16 distance for genuinely identical content.
+        // Checked BEFORE embedding — input-string equality, NOT vector equality.
+        if source == target {
+            return Ok(CompareResult {
+                distance: 0.0,
+                source_role: "query".to_owned(),
+                target_role: "document".to_owned(),
+            });
+        }
+
         if !self.is_search_ready() {
             return Err(ServiceError::Unavailable(
                 "search capability not ready (embedding backend cold)".to_owned(),

@@ -1,12 +1,14 @@
 //! Resolution/duplicates: near-duplicate grouping and cross-neighbour resolution.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray,
 };
 use futures::TryStreamExt;
 use lance::dataset::Dataset;
+use lance::deps::datafusion::logical_expr::{col, in_list, lit, Expr};
 use lance_linalg::distance::DistanceType;
 
 use crate::kernel::distance::normalized_cosine_from_lance;
@@ -19,6 +21,35 @@ use super::{
 };
 use super::dedup::pairs_from_neighbours;
 use super::search::{build_filter_expression, extract_embedding_row};
+
+// ────────────────────────────────────────────────────────────────────────────
+// Performance markers — cheap Instant::now() timing for pipeline diagnosis.
+// Left in production code; guarded by RESOLVE_PERF env var (zero cost when off).
+// Enable: `TDB_SEARCH_RESOLVE_PERF=1`
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Returns true when resolve performance markers are enabled.
+/// Checked once per call (branch-predicted constant after first check).
+fn perf_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TDB_SEARCH_RESOLVE_PERF").is_ok())
+}
+
+/// Emit a performance marker to stderr (cheap, no allocation when disabled).
+macro_rules! perf_mark {
+    ($start:expr, $label:expr) => {
+        if perf_enabled() {
+            let elapsed = $start.elapsed();
+            eprintln!("[resolve-perf] {}: {:.1}ms", $label, elapsed.as_secs_f64() * 1000.0);
+        }
+    };
+    ($start:expr, $label:expr, $($arg:tt)*) => {
+        if perf_enabled() {
+            let elapsed = $start.elapsed();
+            eprintln!("[resolve-perf] {} ({}): {:.1}ms", $label, format!($($arg)*), elapsed.as_secs_f64() * 1000.0);
+        }
+    };
+}
 
 impl LanceStore {
     /// Scoped near-duplicate document groups at a commit's snapshot.
@@ -120,7 +151,9 @@ impl LanceStore {
         threshold: f32,
         max_points: usize,
     ) -> Result<ResolveNeighbourMaps, StoreError> {
+        let t0 = Instant::now();
         let snapshot = self.io_open_snapshot(domain, branch, commit).await?;
+        perf_mark!(t0, "snapshot_open");
 
         // Build filters for set and target populations.
         let set_filter = build_filter_expression(&scope.set_doc_types, &scope.set_doc_ids);
@@ -131,15 +164,19 @@ impl LanceStore {
         let target_filter_opt =
             if target_filter.is_empty() { None } else { Some(target_filter) };
 
-        // Scan set points (embeddings, no snippets).
+        // Scan set points (query_embedding + doc_id, no snippets).
+        let t1 = Instant::now();
         let set_points = io_scan_points(&snapshot, set_filter_opt.as_deref(), false).await?;
+        perf_mark!(t1, "scan_set_points", "n={}", set_points.len());
 
         // Scan target points. If no explicit target, target = set (within-set dedup).
+        let t2 = Instant::now();
         let target_points = if scope.has_target() {
             io_scan_points(&snapshot, target_filter_opt.as_deref(), false).await?
         } else {
             set_points.clone()
         };
+        perf_mark!(t2, "scan_target_points", "n={}", target_points.len());
 
         // Bounded check: combined population must be <= max_points.
         let total_points = set_points.len() + target_points.len();
@@ -169,13 +206,19 @@ impl LanceStore {
             .into_iter()
             .collect();
 
-        // For each set point: ANN top-K filtered to target doc_ids.
+        // For each set point: top-K filtered to target doc_ids.
+        let t3 = Instant::now();
         let set_to_target =
             io_collect_top_k_cross(&snapshot, &set_points, &target_doc_ids, k, threshold).await?;
+        perf_mark!(t3, "cross_set_to_target", "probes={}, candidates={}", set_points.len(), target_doc_ids.len());
 
-        // For each target point: ANN top-K filtered to set doc_ids.
+        // For each target point: top-K filtered to set doc_ids.
+        let t4 = Instant::now();
         let target_to_set =
             io_collect_top_k_cross(&snapshot, &target_points, &set_doc_ids, k, threshold).await?;
+        perf_mark!(t4, "cross_target_to_set", "probes={}, candidates={}", target_points.len(), set_doc_ids.len());
+
+        perf_mark!(t0, "resolve_total", "set={}, target={}", set_points.len(), target_points.len());
 
         Ok(ResolveNeighbourMaps {
             set_to_target,
@@ -184,24 +227,282 @@ impl LanceStore {
     }
 }
 
-/// For each point in `points`, run a filtered top-K ANN query against `snapshot`
-/// restricted to the `candidate_doc_ids` population. Returns a map from each
-/// point's doc_id to its top-K neighbours (doc_id + normalised distance), sorted
-/// nearest-first. Doc-level dedup: the best (nearest) chunk per candidate doc is
-/// kept. The point's own doc_id is excluded from results.
+/// Adaptive candidate-set size threshold for choosing between flat-KNN and ANN.
 ///
-/// This is the resolve-specific generalisation of `io_collect_neighbours` — it
-/// returns ALL k neighbours per point (not just the nearest 1), which the
-/// resolve algorithm needs for reciprocal top-K grounding.
+/// Below this threshold: materialised flat-KNN (exact, fast for small N).
+/// Above this threshold: HNSW ANN + pre-parsed filter_expr (scales to large N).
 ///
-/// BOUNDED CONCURRENCY: queries run through
-/// `buffer_unordered(RESOLVE_ANN_CONCURRENCY)` so at most N scans are in-flight
-/// simultaneously. Completed scans' IVF fragment FDs drain while new ones start,
-/// keeping the peak FD count well under the default nofile=1024 limit even for
-/// large populations (~2000+ points). Sequential processing caused ~1107 FDs to
-/// accumulate before draining (exceeding default nofile); bounded concurrency
-/// caps the working set to ~N × per-query FDs.
+/// VALUE: 30,000 candidates. Empirically measured (2026-06-16, resolve-crossover-
+/// measurement.md): flat-KNN is faster than ANN at ALL sizes from 250 to 10,000
+/// (3.7x faster even at 10k). The lines diverge — ANN never catches flat in
+/// the measured range. Extrapolated crossover is 25,000-50,000 where flat's
+/// linear O(N) memory pressure (exceeds L3 cache) finally gives ANN's O(log N)
+/// index traversal the advantage.
+///
+/// At 30,000 candidates with 768-d embeddings, the materialised set is ~88MB
+/// (4 * 768 * 30000 bytes). This may spill from L3 to RAM on some CPUs, but
+/// flat-KNN's sequential access pattern and SIMD compute still outperform ANN's
+/// random-access index navigation up to this scale. Beyond 30k, the ANN path
+/// with its indexed O(log N) lookups becomes necessary.
+///
+/// RISK-24: brute force is BOUNDED at this threshold (max ~88MB memory, max
+/// 30000 * dim float ops per probe). Above it, HNSW ANN provides O(log N) scaling.
+const ADAPTIVE_ANN_CANDIDATE_THRESHOLD: usize = 30_000;
+
+/// For each point in `points`, find its top-K nearest neighbours among the
+/// `candidate_doc_ids` population. Returns a map from each point's doc_id to
+/// its top-K neighbours (doc_id + normalised distance), sorted nearest-first.
+/// Doc-level dedup: the best (nearest) chunk per candidate doc is kept. The
+/// point's own doc_id is excluded from results.
+///
+/// ADAPTIVE STRATEGY: chooses the query path based on candidate-set size:
+///
+/// - SMALL sets (<= ADAPTIVE_ANN_CANDIDATE_THRESHOLD): materialised flat-KNN.
+///   Scan candidate embeddings ONCE, compute exact cosine distances in-memory.
+///   O(N*P*d) compute but zero disk I/O per probe and EXACT precision (no ANN
+///   approximation). Optimal for Abt-Buy scale (~1092 candidates, ~6MB memory).
+///
+/// - LARGE sets (> ADAPTIVE_ANN_CANDIDATE_THRESHOLD): HNSW ANN + filter_expr.
+///   Build the candidate IN-list as a pre-parsed DataFusion `Expr` ONCE, then
+///   per-probe compose with self-exclusion and pass to `scanner.filter_expr()`.
+///   Bypasses Lance's SQL parser entirely (eliminates O(N*P) parse cost).
+///   O(P * log N) via the IVF_HNSW_SQ index. Scales to 100k+ candidates.
 async fn io_collect_top_k_cross(
+    snapshot: &Dataset,
+    points: &[IndexedPoint],
+    candidate_doc_ids: &[String],
+    k: usize,
+    threshold: f32,
+) -> Result<std::collections::HashMap<String, Vec<crate::resolve::Neighbour>>, StoreError> {
+    if candidate_doc_ids.len() <= ADAPTIVE_ANN_CANDIDATE_THRESHOLD {
+        io_collect_top_k_cross_flat(snapshot, points, candidate_doc_ids, k, threshold).await
+    } else {
+        io_collect_top_k_cross_ann(snapshot, points, candidate_doc_ids, k, threshold).await
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Path A: Materialised flat-KNN (small candidate sets)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Materialised flat-KNN path for small candidate sets.
+///
+/// ALGORITHM:
+///  1. SCAN the candidate population's `embedding` + `doc_id` columns ONCE from
+///     the snapshot (single I/O pass with the IN-list filter).
+///  2. For each probe point, compute flat cosine distance against ALL materialised
+///     candidate embeddings in-memory. O(set_size * candidate_count * dim) pure
+///     compute — no per-probe filter re-parse, no per-probe disk I/O.
+///
+/// PRECISION: flat KNN is EXACT (no ANN approximation loss). Provides strictly
+/// better precision than the ANN path for the same population.
+///
+/// BOUNDED: candidate count <= ADAPTIVE_ANN_CANDIDATE_THRESHOLD ensures memory
+/// is bounded (4 * dim * threshold bytes at maximum).
+///
+/// FD-SAFE: only ONE scan is issued (the materialisation scan); no per-probe
+/// scanner FDs accumulate.
+async fn io_collect_top_k_cross_flat(
+    snapshot: &Dataset,
+    points: &[IndexedPoint],
+    candidate_doc_ids: &[String],
+    k: usize,
+    threshold: f32,
+) -> Result<std::collections::HashMap<String, Vec<crate::resolve::Neighbour>>, StoreError> {
+    use crate::resolve::Neighbour;
+
+    let t_mat = Instant::now();
+    let candidates = io_materialise_candidate_embeddings(snapshot, candidate_doc_ids).await?;
+    perf_mark!(t_mat, "materialise_candidates", "n={}", candidates.len());
+
+    if candidates.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    // Process in batches with yield between each batch — allows the tokio runtime
+    // to service other tasks (health checks, concurrent /search) during long
+    // compute runs. Without yielding, 2000+ probes * 5000 candidates * 768 dims
+    // monopolises a worker thread for seconds.
+    const COMPUTE_BATCH_SIZE: usize = 64;
+
+    let t_compute = Instant::now();
+    let mut result: std::collections::HashMap<String, Vec<Neighbour>> =
+        std::collections::HashMap::new();
+
+    for batch in points.chunks(COMPUTE_BATCH_SIZE) {
+        for point in batch {
+            let neighbours =
+                flat_knn_top_k(&point.query_embedding, &point.doc_id, &candidates, k, threshold);
+
+            if !neighbours.is_empty() {
+                result
+                    .entry(point.doc_id.clone())
+                    .and_modify(|existing| {
+                        merge_neighbours(existing, &neighbours);
+                    })
+                    .or_insert(neighbours);
+            }
+        }
+
+        // Yield between batches — allows the tokio runtime to poll other futures
+        // (health checks, concurrent requests) between CPU-bound compute bursts.
+        tokio::task::yield_now().await;
+    }
+    perf_mark!(t_compute, "flat_knn_compute", "probes={}, candidates={}", points.len(), candidates.len());
+
+    Ok(result)
+}
+
+/// A materialised candidate point: doc_id + embedding vector.
+/// Held in memory for flat-KNN computation during resolve (small-set path only).
+struct MaterialisedCandidate {
+    doc_id: String,
+    embedding: Vec<f32>,
+}
+
+/// Scan the candidate population's embeddings from the snapshot in a SINGLE I/O pass.
+/// Applies the candidate doc_id IN-list filter ONCE (not per-probe).
+///
+/// FAIL-LOUD: missing columns or null embeddings are schema/corruption errors —
+/// never silently skipped (would yield quietly-incomplete resolve results).
+async fn io_materialise_candidate_embeddings(
+    snapshot: &Dataset,
+    candidate_doc_ids: &[String],
+) -> Result<Vec<MaterialisedCandidate>, StoreError> {
+    if candidate_doc_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Reuse the shared filter builder (same escaping as /search, /duplicates paths).
+    let t_filter = Instant::now();
+    let filter = build_filter_expression(&[], candidate_doc_ids);
+    perf_mark!(t_filter, "materialise_build_filter", "ids={}", candidate_doc_ids.len());
+
+    let t_scan_setup = Instant::now();
+    let mut scanner = snapshot.scan();
+    scanner
+        .project(&["doc_id", "embedding"])
+        .map_err(|e| StoreError::Internal(format!("candidate scan projection failed: {}", e)))?;
+    scanner
+        .filter(&filter)
+        .map_err(|e| StoreError::Internal(format!("candidate scan filter failed: {}", e)))?;
+    perf_mark!(t_scan_setup, "materialise_scanner_setup");
+
+    let t_stream = Instant::now();
+    let stream = scanner
+        .try_into_stream()
+        .await
+        .map_err(|e| StoreError::Internal(format!("candidate scan stream failed: {}", e)))?;
+    perf_mark!(t_stream, "materialise_try_into_stream");
+
+    let t_collect = Instant::now();
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .map_err(|e| StoreError::Internal(format!("candidate scan collect failed: {}", e)))?;
+    perf_mark!(t_collect, "materialise_collect_batches", "batches={}", batches.len());
+
+    let t_extract = Instant::now();
+    let mut candidates = Vec::new();
+    for batch in &batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let doc_ids = batch
+            .column_by_name("doc_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                StoreError::Internal("candidate scan: missing `doc_id` column".to_owned())
+            })?;
+        let embeddings = batch
+            .column_by_name("embedding")
+            .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
+            .ok_or_else(|| {
+                StoreError::Internal("candidate scan: missing `embedding` column".to_owned())
+            })?;
+
+        for i in 0..batch.num_rows() {
+            let embedding = extract_embedding_row(embeddings, i, doc_ids.value(i))?;
+            candidates.push(MaterialisedCandidate {
+                doc_id: doc_ids.value(i).to_owned(),
+                embedding,
+            });
+        }
+    }
+    perf_mark!(t_extract, "materialise_extract_vectors", "rows={}", candidates.len());
+
+    Ok(candidates)
+}
+
+/// Pure flat-KNN: compute cosine distance from `probe` to all candidates,
+/// exclude self-document, take top-k within threshold. Doc-level dedup: keeps
+/// the best (nearest) chunk per candidate doc_id.
+///
+/// Returns neighbours sorted nearest-first, capped at k.
+fn flat_knn_top_k(
+    probe: &[f32],
+    self_doc_id: &str,
+    candidates: &[MaterialisedCandidate],
+    k: usize,
+    threshold: f32,
+) -> Vec<crate::resolve::Neighbour> {
+    use crate::kernel::distance::cosine_distance_normalized;
+    use crate::resolve::Neighbour;
+
+    let mut best_per_doc: HashMap<&str, f32> = HashMap::new();
+
+    for candidate in candidates {
+        if candidate.doc_id == self_doc_id {
+            continue;
+        }
+
+        let dist = cosine_distance_normalized(probe, &candidate.embedding);
+
+        if dist > threshold {
+            continue;
+        }
+
+        best_per_doc
+            .entry(candidate.doc_id.as_str())
+            .and_modify(|best| {
+                if dist < *best {
+                    *best = dist;
+                }
+            })
+            .or_insert(dist);
+    }
+
+    let mut sorted: Vec<(&str, f32)> = best_per_doc.into_iter().collect();
+    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.truncate(k);
+
+    sorted
+        .into_iter()
+        .map(|(id, distance)| Neighbour {
+            id: id.to_owned(),
+            distance,
+        })
+        .collect()
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Path B: HNSW ANN + pre-parsed filter_expr (large candidate sets)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// HNSW ANN path for large candidate sets, using pre-parsed DataFusion `Expr`.
+///
+/// FILTER STRATEGY: builds the candidate IN-list as a DataFusion `Expr` ONCE
+/// (pre-parsed, no SQL string), then per-probe composes it with the self-exclusion
+/// clause via `Expr::and()` and passes to `scanner.filter_expr()`. This bypasses
+/// Lance's SQL parser entirely — eliminates the O(N*P) parse cost that made the
+/// old string-based `scanner.filter(&str)` approach a bottleneck for large
+/// candidate populations.
+///
+/// BOUNDED CONCURRENCY: queries are processed in sequential batches of
+/// RESOLVE_BATCH_SIZE; between batches the runtime yields, allowing completed
+/// scans' IVF fragment FDs to drain. Each scan opens ~8-12 fragment files;
+/// a batch of 16 peaks at ~128-192 working FDs — well under nofile=1024.
+async fn io_collect_top_k_cross_ann(
     snapshot: &Dataset,
     points: &[IndexedPoint],
     candidate_doc_ids: &[String],
@@ -212,39 +513,38 @@ async fn io_collect_top_k_cross(
 
     /// Batch size for sequential ANN query processing. Points are processed in
     /// chunks of this size; between chunks the runtime yields, allowing completed
-    /// scans' IVF fragment FDs to drain. Each scan opens ~8-12 fragment files;
-    /// a batch of 16 peaks at ~128-192 working FDs — well under nofile=1024 with
-    /// baseline overhead (~14 FDs). Swapping the probe vector (dual-vector recall
-    /// fix) is a one-line change at the `point.embedding.clone()` site below.
+    /// scans' IVF fragment FDs to drain.
     const RESOLVE_BATCH_SIZE: usize = 16;
 
     // Over-fetch factor: ANN recall can miss, so fetch more and take the best k.
     let fetch_k = k * 2;
 
-    // Build the IN-list filter for candidates ONCE (shared across all queries).
-    // This avoids O(points × candidates) string allocation; only the per-point
-    // `doc_id != '...'` suffix varies.
-    let candidate_in_list: String = candidate_doc_ids
-        .iter()
-        .map(|id| format!("'{}'", id.replace('\'', "''")))
-        .collect::<Vec<_>>()
-        .join(", ");
+    // Build the candidate IN-list as a pre-parsed DataFusion Expr ONCE.
+    // This eliminates the O(N*P) SQL re-parse cost: the old approach called
+    // scanner.filter(&str) per probe, which parsed the large IN-list SQL string
+    // on EVERY try_into_stream() call. Now we build the Expr tree once (O(N))
+    // and clone it per probe (tree-copy, no parsing).
+    let candidate_in_expr: Expr = in_list(
+        col("doc_id"),
+        candidate_doc_ids
+            .iter()
+            .map(|id| lit(id.as_str()))
+            .collect(),
+        false, // not negated — IN (positive match)
+    );
 
     let mut result: std::collections::HashMap<String, Vec<Neighbour>> =
         std::collections::HashMap::new();
 
-    // Process in sequential batches with yield between each batch.
-    // The yield allows the tokio runtime to reclaim resources (including FDs
-    // from completed I/O scheduler flushes in Lance 7.0) before the next batch
-    // opens new fragment files.
     for batch in points.chunks(RESOLVE_BATCH_SIZE) {
         for point in batch {
-            // Filter: restrict to candidate population AND exclude own doc.
-            let filter = format!(
-                "doc_id IN ({}) AND doc_id != '{}'",
-                candidate_in_list,
-                point.doc_id.replace('\'', "''")
-            );
+            // Compose the full filter: candidate IN-list AND exclude own doc.
+            // Expr::clone() is a tree-clone of already-parsed AST nodes — O(N)
+            // allocation but NO SQL parsing. The .and() and .not_eq() are
+            // single-node constructions (O(1)).
+            let expr = candidate_in_expr
+                .clone()
+                .and(col("doc_id").not_eq(lit(point.doc_id.as_str())));
 
             let mut scanner = snapshot.scan();
             scanner
@@ -264,9 +564,8 @@ async fn io_collect_top_k_cross(
             scanner.project(&["doc_id"]).map_err(|e| {
                 StoreError::Internal(format!("resolve nearest projection failed: {}", e))
             })?;
-            scanner.filter(&filter).map_err(|e| {
-                StoreError::Internal(format!("resolve nearest filter failed: {}", e))
-            })?;
+            // filter_expr: pre-parsed DataFusion Expr — NO SQL string parsing.
+            scanner.filter_expr(expr);
 
             let batches: Vec<RecordBatch> = scanner
                 .try_into_stream()
@@ -280,7 +579,7 @@ async fn io_collect_top_k_cross(
                     StoreError::Internal(format!("resolve nearest collect failed: {}", e))
                 })?;
 
-            let neighbours = extract_top_k_neighbours(&batches, k, threshold);
+            let neighbours = extract_top_k_neighbours(&batches, k, threshold)?;
             result
                 .entry(point.doc_id.clone())
                 .and_modify(|existing| {
@@ -301,34 +600,38 @@ async fn io_collect_top_k_cross(
 /// Extract doc-level top-K neighbours from ANN result batches.
 /// Deduplicates by doc_id (keeps best distance), caps at k, filters by threshold.
 /// Distances are normalised from Lance [0,2] to reference [0,1] scale.
+///
+/// FAIL-LOUD: missing `doc_id` or `_distance` columns are schema/corruption errors
+/// that indicate a broken ANN result contract — never silently skipped.
 fn extract_top_k_neighbours(
     batches: &[RecordBatch],
     k: usize,
     threshold: f32,
-) -> Vec<crate::resolve::Neighbour> {
+) -> Result<Vec<crate::resolve::Neighbour>, StoreError> {
     use crate::resolve::Neighbour;
 
-    // Collect all (doc_id, distance) pairs, dedup by doc_id (min distance).
     let mut best_per_doc: HashMap<String, f32> = HashMap::new();
 
     for batch in batches {
         if batch.num_rows() == 0 {
             continue;
         }
-        let doc_ids = match batch
+        let doc_ids = batch
             .column_by_name("doc_id")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        {
-            Some(ids) => ids,
-            None => continue,
-        };
-        let distances = match batch
+            .ok_or_else(|| {
+                StoreError::Internal(
+                    "ANN result batch missing `doc_id` column — Lance contract violated".to_owned(),
+                )
+            })?;
+        let distances = batch
             .column_by_name("_distance")
             .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
-        {
-            Some(d) => d,
-            None => continue,
-        };
+            .ok_or_else(|| {
+                StoreError::Internal(
+                    "ANN result batch missing `_distance` column — Lance nearest() contract violated".to_owned(),
+                )
+            })?;
 
         for i in 0..batch.num_rows() {
             let doc_id = doc_ids.value(i).to_owned();
@@ -348,15 +651,14 @@ fn extract_top_k_neighbours(
         }
     }
 
-    // Sort by distance (nearest first), take top k.
     let mut sorted: Vec<(String, f32)> = best_per_doc.into_iter().collect();
     sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     sorted.truncate(k);
 
-    sorted
+    Ok(sorted
         .into_iter()
         .map(|(id, distance)| Neighbour { id, distance })
-        .collect()
+        .collect())
 }
 
 /// Merge new neighbours into an existing list, keeping the best distance per doc.
@@ -397,6 +699,7 @@ async fn io_scan_points(
     set_filter: Option<&str>,
     snippet: bool,
 ) -> Result<Vec<IndexedPoint>, StoreError> {
+    let t_setup = Instant::now();
     let mut scanner = snapshot.scan();
     let projection: &[&str] = if snippet {
         &["doc_id", "query_embedding", "content"]
@@ -411,16 +714,27 @@ async fn io_scan_points(
             .filter(filter)
             .map_err(|e| StoreError::Internal(format!("duplicates set filter failed: {}", e)))?;
     }
+    perf_mark!(t_setup, "scan_points_setup");
 
-    let batches: Vec<RecordBatch> = scanner
+    let t_stream = Instant::now();
+    let stream = scanner
         .try_into_stream()
         .await
-        .map_err(|e| StoreError::Internal(format!("duplicates scan stream failed: {}", e)))?
+        .map_err(|e| StoreError::Internal(format!("duplicates scan stream failed: {}", e)))?;
+    perf_mark!(t_stream, "scan_points_try_into_stream");
+
+    let t_collect = Instant::now();
+    let batches: Vec<RecordBatch> = stream
         .try_collect()
         .await
         .map_err(|e| StoreError::Internal(format!("duplicates scan collect failed: {}", e)))?;
+    perf_mark!(t_collect, "scan_points_collect", "batches={}", batches.len());
 
-    batches_to_points(&batches, snippet)
+    let t_extract = Instant::now();
+    let result = batches_to_points(&batches, snippet)?;
+    perf_mark!(t_extract, "scan_points_extract", "points={}", result.len());
+
+    Ok(result)
 }
 
 /// Extract `IndexedPoint`s from projected RecordBatches (doc_id +

@@ -587,9 +587,18 @@ paths:
         `/resolve` (0 = identical, ~0.5 = unrelated, 1 = opposite).
 
 
+        **Identical-input shortcircuit**: if `source` and `target` are the exact
+        same string (byte-for-byte), distance 0.0 is returned immediately without
+        embedding. This avoids the asymmetric-prefix artefact where identical
+        content would otherwise produce ~0.16 distance due to the search_query:/
+        search_document: prefixes used by the embedding model. For near-identical
+        but non-equal texts, expect a distance floor of approximately 0.16.
+
+
         Stateless: no dataset, no ANN index, no domain. Pure convenience function
         for a UI to compare two records without provisioning an index. The only
-        requirement is that the embedding backend is warm (search-ready).
+        requirement is that the embedding backend is warm (search-ready), unless
+        the identical-input shortcircuit applies.
 
 
         Extensibility: the `method` query parameter is required. Currently the only
