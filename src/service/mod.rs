@@ -1590,3 +1590,328 @@ async fn io_optimize_on_uncached_handle(
     Ok(Some(final_version))
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// RISK-26 regression tests: no-op/empty commits must tag + advance last_indexed.
+// ═══════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod tests_risk26 {
+    use super::*;
+    use crate::kernel::model::BranchName;
+    use std::path::Path;
+
+    /// Build a test tokenizer from the checked-in fixture.
+    fn test_tokenizer() -> Tokenizer {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("spikes")
+            .join("tokenizer")
+            .join("tokenizer.json");
+        crate::chunk::io_load_tokenizer(&path).expect("test tokenizer must load")
+    }
+
+    /// A dummy provider that will never be called (no texts to embed in no-op commits).
+    fn dummy_provider() -> Provider {
+        Provider::OpenAiCompatible {
+            base_url: "http://127.0.0.1:0/never-called".to_owned(),
+            model: "test-noop".to_owned(),
+            dim: 8,
+        }
+    }
+
+    /// Helper: build a PipelineCtx for test use.
+    fn make_ctx<'a>(
+        store: &'a LanceStore,
+        tokenizer: &'a Tokenizer,
+        chunk_params: &'a ChunkParams,
+        provider: &'a Provider,
+        http_client: &'a reqwest::Client,
+        domain: &'a str,
+        branch: &'a str,
+    ) -> PipelineCtx<'a> {
+        PipelineCtx {
+            store,
+            tokenizer,
+            chunk_params,
+            provider,
+            http_client,
+            domain,
+            branch,
+            embed_batch_size: 32,
+        }
+    }
+
+    /// regression (a): a commit of ONLY Operation::Error must tag + advance last_indexed.
+    #[tokio::test]
+    async fn all_error_commit_tags_and_advances_last_indexed() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8);
+        let tokenizer = test_tokenizer();
+        let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
+        let provider = dummy_provider();
+        let http_client = reqwest::Client::new();
+        let domain = "admin/risk26_error";
+        let branch = "main";
+
+        // Pre-condition: seed the domain with one real doc so a prior version exists.
+        let seed_row = ChunkRow {
+            doc_id: "doc/seed".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: vec![0.1; 8],
+            query_embedding: vec![0.1; 8],
+            content: "seed".to_owned(),
+        };
+        let v_seed = store
+            .io_upsert_chunks(domain, branch, "doc/seed", std::slice::from_ref(&seed_row))
+            .await
+            .expect("seed upsert");
+        store.io_tag_commit(domain, branch, "c0_seed", v_seed).await.expect("tag seed");
+        store.update_last_indexed(domain, branch, "c0_seed", v_seed).await;
+
+        // ACT: push a commit with ONLY Operation::Error entries.
+        let operations = vec![
+            Operation::Error { message: "render failed: doc/broken1".to_owned() },
+            Operation::Error { message: "render failed: doc/broken2".to_owned() },
+        ];
+        let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
+        let (indexed, skipped) = io_run_index_pipeline(&ctx, "c1_all_error", operations)
+            .await
+            .expect("pipeline must succeed for all-error commit");
+
+        // ASSERT: zero indexed, errors recorded as skipped.
+        assert_eq!(indexed, 0, "no docs should be indexed for all-error commit");
+        assert_eq!(skipped.len(), 2, "both errors should be in skipped");
+
+        // ASSERT: last_indexed advanced to c1_all_error.
+        let li = store
+            .last_indexed(
+                &Domain::from_resource_path(&parse_domain(domain).unwrap()),
+                &BranchName::new(branch.to_owned()),
+            )
+            .await
+            .expect("last_indexed read");
+        assert_eq!(
+            li.commit.as_deref(),
+            Some("c1_all_error"),
+            "last_indexed MUST advance past the all-error commit"
+        );
+
+        // ASSERT: the commit is tagged (resolvable).
+        let resolved = store.io_resolve_commit(domain, branch, "c1_all_error").await.expect("resolve");
+        assert!(
+            resolved.is_some(),
+            "all-error commit MUST be tagged and resolvable"
+        );
+        // The tag version should be the seed version (no new data written).
+        assert_eq!(resolved.unwrap(), v_seed, "tag must point to the prior data version");
+    }
+
+    /// regression (b): an empty-operations commit must tag + advance last_indexed.
+    #[tokio::test]
+    async fn empty_operations_commit_tags_and_advances_last_indexed() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8);
+        let tokenizer = test_tokenizer();
+        let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
+        let provider = dummy_provider();
+        let http_client = reqwest::Client::new();
+        let domain = "admin/risk26_empty";
+        let branch = "main";
+
+        // Seed with one real doc.
+        let seed_row = ChunkRow {
+            doc_id: "doc/seed".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: vec![0.1; 8],
+            query_embedding: vec![0.1; 8],
+            content: "seed".to_owned(),
+        };
+        let v_seed = store
+            .io_upsert_chunks(domain, branch, "doc/seed", std::slice::from_ref(&seed_row))
+            .await
+            .expect("seed upsert");
+        store.io_tag_commit(domain, branch, "c0_seed", v_seed).await.expect("tag seed");
+        store.update_last_indexed(domain, branch, "c0_seed", v_seed).await;
+
+        // ACT: push a commit with ZERO operations.
+        let operations: Vec<Operation> = vec![];
+        let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
+        let (indexed, skipped) = io_run_index_pipeline(&ctx, "c1_empty", operations)
+            .await
+            .expect("pipeline must succeed for empty commit");
+
+        // ASSERT: zero indexed, zero skipped.
+        assert_eq!(indexed, 0);
+        assert_eq!(skipped.len(), 0);
+
+        // ASSERT: last_indexed advanced to c1_empty.
+        let li = store
+            .last_indexed(
+                &Domain::from_resource_path(&parse_domain(domain).unwrap()),
+                &BranchName::new(branch.to_owned()),
+            )
+            .await
+            .expect("last_indexed read");
+        assert_eq!(
+            li.commit.as_deref(),
+            Some("c1_empty"),
+            "last_indexed MUST advance past the empty commit"
+        );
+
+        // ASSERT: the commit is tagged.
+        let resolved = store.io_resolve_commit(domain, branch, "c1_empty").await.expect("resolve");
+        assert!(resolved.is_some(), "empty commit MUST be tagged");
+        assert_eq!(resolved.unwrap(), v_seed, "tag must point to the prior data version");
+    }
+
+    /// regression (c): a NORMAL commit after a no-op commit must still index correctly.
+    /// This proves catch-up is not stalled — the engine progresses past the empty commit.
+    #[tokio::test]
+    async fn normal_commit_after_noop_indexes_correctly() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8);
+        let tokenizer = test_tokenizer();
+        let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
+        let provider = dummy_provider();
+        let http_client = reqwest::Client::new();
+        let domain = "admin/risk26_resume";
+        let branch = "main";
+
+        // Seed with one doc.
+        let seed_row = ChunkRow {
+            doc_id: "doc/seed".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: vec![0.1; 8],
+            query_embedding: vec![0.1; 8],
+            content: "seed".to_owned(),
+        };
+        let v_seed = store
+            .io_upsert_chunks(domain, branch, "doc/seed", std::slice::from_ref(&seed_row))
+            .await
+            .expect("seed upsert");
+        store.io_tag_commit(domain, branch, "c0_seed", v_seed).await.expect("tag seed");
+        store.update_last_indexed(domain, branch, "c0_seed", v_seed).await;
+
+        // Push an all-error commit (no-op).
+        let error_ops = vec![
+            Operation::Error { message: "transient failure".to_owned() },
+        ];
+        let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
+        io_run_index_pipeline(&ctx, "c1_noop", error_ops)
+            .await
+            .expect("noop commit must succeed");
+
+        // Verify catch-up is unblocked: last_indexed is c1_noop.
+        let li_after_noop = store
+            .last_indexed(
+                &Domain::from_resource_path(&parse_domain(domain).unwrap()),
+                &BranchName::new(branch.to_owned()),
+            )
+            .await
+            .expect("last_indexed read");
+        assert_eq!(li_after_noop.commit.as_deref(), Some("c1_noop"));
+
+        // Now push a NORMAL commit with a real Insert (simulated: directly upsert
+        // rows and tag, mirroring what the pipeline would do with a working embedder).
+        // This proves the engine can advance PAST the empty commit.
+        let normal_row = ChunkRow {
+            doc_id: "doc/new".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: vec![0.2; 8],
+            query_embedding: vec![0.2; 8],
+            content: "new document".to_owned(),
+        };
+        let v_normal = store
+            .io_upsert_chunks(domain, branch, "doc/new", std::slice::from_ref(&normal_row))
+            .await
+            .expect("normal upsert");
+        store.io_tag_commit(domain, branch, "c2_normal", v_normal).await.expect("tag normal");
+        store.update_last_indexed(domain, branch, "c2_normal", v_normal).await;
+
+        // ASSERT: last_indexed advanced to c2_normal (past the no-op).
+        let li_final = store
+            .last_indexed(
+                &Domain::from_resource_path(&parse_domain(domain).unwrap()),
+                &BranchName::new(branch.to_owned()),
+            )
+            .await
+            .expect("last_indexed read");
+        assert_eq!(
+            li_final.commit.as_deref(),
+            Some("c2_normal"),
+            "last_indexed MUST advance past the no-op to the normal commit"
+        );
+        assert!(
+            li_final.version > v_seed,
+            "version must have advanced beyond the seed"
+        );
+
+        // ASSERT: both the no-op commit AND the normal commit are resolvable.
+        let r_noop = store.io_resolve_commit(domain, branch, "c1_noop").await.expect("resolve noop");
+        let r_normal = store.io_resolve_commit(domain, branch, "c2_normal").await.expect("resolve normal");
+        assert!(r_noop.is_some(), "no-op commit must remain resolvable");
+        assert!(r_normal.is_some(), "normal commit must be resolvable");
+        assert!(
+            r_normal.unwrap() > r_noop.unwrap(),
+            "normal commit version must be newer than the no-op tag version"
+        );
+    }
+
+    /// edge case: no-op commit on a never-before-indexed domain (first commit is empty).
+    /// The dataset auto-creates and the commit gets tagged to version 1.
+    #[tokio::test]
+    async fn noop_commit_on_fresh_domain_creates_dataset_and_tags() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8);
+        let tokenizer = test_tokenizer();
+        let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
+        let provider = dummy_provider();
+        let http_client = reqwest::Client::new();
+        let domain = "admin/risk26_fresh";
+        let branch = "main";
+
+        // NO SEED — domain has never been indexed.
+        // Push an empty commit.
+        let operations: Vec<Operation> = vec![];
+        let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
+        let (indexed, skipped) = io_run_index_pipeline(&ctx, "c0_first_empty", operations)
+            .await
+            .expect("pipeline must succeed for first-ever empty commit");
+
+        assert_eq!(indexed, 0);
+        assert_eq!(skipped.len(), 0);
+
+        // ASSERT: last_indexed is set (commit is known).
+        let li = store
+            .last_indexed(
+                &Domain::from_resource_path(&parse_domain(domain).unwrap()),
+                &BranchName::new(branch.to_owned()),
+            )
+            .await
+            .expect("last_indexed read");
+        assert_eq!(
+            li.commit.as_deref(),
+            Some("c0_first_empty"),
+            "first-ever empty commit must still advance last_indexed"
+        );
+
+        // ASSERT: the commit is tagged.
+        let resolved = store.io_resolve_commit(domain, branch, "c0_first_empty").await.expect("resolve");
+        assert!(resolved.is_some(), "first-ever empty commit must be tagged");
+    }
+}
+

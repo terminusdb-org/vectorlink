@@ -377,6 +377,34 @@ impl LanceStore {
         })
     }
 
+    /// Get the current head version for a (domain, branch) pair.
+    ///
+    /// For main: returns the cached handle's version (same as `io_open_dataset`).
+    /// For non-main: opens a fresh branch-bound handle and reads its version.
+    ///
+    /// PRECONDITION: the dataset and branch must already exist — this never
+    /// auto-creates. Use `io_open_dataset` first if auto-creation is needed.
+    ///
+    /// Used by the no-op pipeline path to determine the version to tag
+    /// an empty commit to. The version must be from the BRANCH's lineage — using
+    /// the main handle's version for a non-main branch would produce a tag pointing
+    /// to a version that doesn't exist in the branch's lineage (Lance rejects it).
+    pub async fn io_branch_head_version(
+        &self,
+        domain: &str,
+        branch: &str,
+    ) -> Result<u64, StoreError> {
+        if branch == MAIN_BRANCH {
+            let ds_arc = self.io_open_dataset(domain, branch).await?;
+            let ds = ds_arc.read().await;
+            return Ok(ds.version().version);
+        }
+
+        // Non-main: open a fresh branch-bound handle to read its head version.
+        let ds = self.io_open_branch_for_write(domain, branch).await?;
+        Ok(ds.version().version)
+    }
+
     /// List the Lance branch names that currently exist in the domain dataset.
     /// Returns an empty list if the dataset doesn't exist yet.
     pub async fn io_list_branches(&self, domain: &str) -> Result<Vec<String>, StoreError> {
