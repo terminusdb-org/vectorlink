@@ -47,13 +47,11 @@ path = "src/main.rs"
 name = "tdb-search-load"
 path = "src/bin/load.rs"
 
-[[bin]]
-name = "scale-evidence"
-path = "benches/scale_evidence.rs"
-
-[[bin]]
-name = "crossover-measurement"
-path = "benches/crossover_measurement.rs"
+# Note: throwaway measurement tools (scale_evidence, crossover_measurement)
+# live under benches/ and are NOT declared as [[bin]] targets here — they are
+# run ad hoc during perf investigation, not shipped or built by `cargo build`
+# / the production image / CI. Declaring them would force their (untracked)
+# source to exist on every clean checkout (CI fails target resolution otherwise).
 
 # `make pr` profile — fast incremental relinks (no LTO). Used by the pre-commit gate.
 # A one-line change should relink in seconds, not minutes.
