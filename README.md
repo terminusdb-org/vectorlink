@@ -56,6 +56,80 @@ using the `--key` command line option.
 terminusdb-semantic-indexer serve --directory /path/to/storage/dir
 ```
 
+## Using with Ollama (Local Embeddings)
+
+Instead of OpenAI, you can use [Ollama](https://ollama.ai) to generate
+embeddings locally. This is useful for development, testing, or when you
+want to be self-sovereign, keeping all data on your own infrastructure.
+
+### Prerequisites
+
+1. Install Ollama following the [official instructions](https://ollama.ai)
+2. Pull the Qwen3 embedding model:
+
+```shell
+ollama pull qwen3-embedding:4b
+```
+
+### Running the server with Ollama
+
+Start the vectorlink server without an OpenAI key. When indexing, pass the
+Ollama configuration via HTTP headers on the `/index` request:
+
+```shell
+terminusdb-semantic-indexer serve \
+  --directory /path/to/storage/dir \
+  --content-endpoint http://localhost:6363/api/index \
+  --port 8080
+```
+
+Then kick off indexing with the Ollama headers:
+
+```shell
+curl 'localhost:8080/index?commit=YOUR_COMMIT&domain=admin/my_db' \
+  -H 'VECTORLINK_OLLAMA_URL: http://localhost:11434' \
+  -H 'VECTORLINK_OLLAMA_MODEL: qwen3-embedding:4b' \
+  -H 'VECTORLINK_OLLAMA_DIMENSIONS: 1536'
+```
+
+The headers are:
+
+| Header | Default | Description |
+|---|---|---|
+| `VECTORLINK_OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
+| `VECTORLINK_OLLAMA_MODEL` | `qwen3-embedding:4b` | Ollama embedding model |
+| `VECTORLINK_OLLAMA_DIMENSIONS` | `1536` | Embedding vector dimensions |
+
+Searches against an Ollama-indexed commit use the same endpoints, but you
+must pass the same Ollama headers so the query text is embedded with the
+same model:
+
+```shell
+curl 'localhost:8080/search?commit=YOUR_COMMIT&domain=admin/my_db' \
+  -H 'VECTORLINK_OLLAMA_URL: http://localhost:11434' \
+  -H 'VECTORLINK_OLLAMA_MODEL: qwen3-embedding:4b' \
+  -H 'VECTORLINK_OLLAMA_DIMENSIONS: 1536' \
+  -d "Wise old man"
+```
+
+### Using with TerminusDB
+
+To use Ollama embeddings with TerminusDB's `http_vectorlink` indexer
+backend, set the following environment variables on the TerminusDB side:
+
+```shell
+TERMINUSDB_INDEXER_BACKEND=http_vectorlink \
+TERMINUSDB_SEMANTIC_INDEXER_ENDPOINT=http://localhost:8080 \
+TERMINUSDB_INSECURE_USER_HEADER_ENABLED=true \
+TERMINUSDB_INSECURE_USER_HEADER=x-terminusdb-user \
+terminusdb serve -m root
+```
+
+TerminusDB will forward indexing requests to the vectorlink server, which
+in turn calls Ollama for embeddings. The Ollama headers can be configured
+in the TerminusDB schema's `@metadata` embedding configuration or passed
+through by the vectorlink plugin.
+
 ## Indexing
 
 If you wan to index documents, you can any of these methods:
