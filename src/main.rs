@@ -3,6 +3,7 @@ use std::path::Path;
 
 use clap::CommandFactory;
 use clap::{Parser, Subcommand, ValueEnum};
+use embedding::EmbeddingProvider;
 use hnsw::Hnsw;
 use indexer::serialize_index;
 use indexer::start_indexing_from_operations;
@@ -17,7 +18,9 @@ use {
     vecmath::empty_embedding,
     vectors::VectorStore,
 };
+mod embedding;
 mod indexer;
+mod ollama;
 mod openai;
 mod server;
 mod vecmath;
@@ -48,6 +51,14 @@ enum Commands {
     Load {
         #[arg(short, long)]
         key: Option<String>,
+        #[arg(long)]
+        ollama: bool,
+        #[arg(long, default_value = "http://localhost:11434")]
+        ollama_url: String,
+        #[arg(long, default_value = "qwen3-embedding:4b")]
+        ollama_model: String,
+        #[arg(long, default_value_t = 1536)]
+        ollama_dimensions: usize,
         #[arg(short, long)]
         commit: String,
         #[arg(long)]
@@ -62,12 +73,28 @@ enum Commands {
     Embed {
         #[arg(short, long)]
         key: Option<String>,
+        #[arg(long)]
+        ollama: bool,
+        #[arg(long, default_value = "http://localhost:11434")]
+        ollama_url: String,
+        #[arg(long, default_value = "qwen3-embedding:4b")]
+        ollama_model: String,
+        #[arg(long, default_value_t = 1536)]
+        ollama_dimensions: usize,
         #[arg(short, long)]
         string: String,
     },
     Compare {
         #[arg(short, long)]
         key: Option<String>,
+        #[arg(long)]
+        ollama: bool,
+        #[arg(long, default_value = "http://localhost:11434")]
+        ollama_url: String,
+        #[arg(long, default_value = "qwen3-embedding:4b")]
+        ollama_model: String,
+        #[arg(long, default_value_t = 1536)]
+        ollama_dimensions: usize,
         #[arg(long)]
         s1: String,
         #[arg(long)]
@@ -76,6 +103,14 @@ enum Commands {
     Compare2 {
         #[arg(short, long)]
         key: Option<String>,
+        #[arg(long)]
+        ollama: bool,
+        #[arg(long, default_value = "http://localhost:11434")]
+        ollama_url: String,
+        #[arg(long, default_value = "qwen3-embedding:4b")]
+        ollama_model: String,
+        #[arg(long, default_value_t = 1536)]
+        ollama_dimensions: usize,
         #[arg(long)]
         s1: String,
         #[arg(long)]
@@ -86,6 +121,14 @@ enum Commands {
     Test {
         #[arg(short, long)]
         key: Option<String>,
+        #[arg(long)]
+        ollama: bool,
+        #[arg(long, default_value = "http://localhost:11434")]
+        ollama_url: String,
+        #[arg(long, default_value = "qwen3-embedding:4b")]
+        ollama_model: String,
+        #[arg(long, default_value_t = 1536)]
+        ollama_dimensions: usize,
     },
 }
 
@@ -106,6 +149,26 @@ fn key_or_env(k: Option<String>) -> String {
     }
 
     result.unwrap()
+}
+
+fn build_provider(
+    key: Option<String>,
+    ollama: bool,
+    ollama_url: &str,
+    ollama_model: &str,
+    ollama_dimensions: usize,
+) -> EmbeddingProvider {
+    if ollama {
+        EmbeddingProvider::Ollama {
+            base_url: ollama_url.to_string(),
+            model: ollama_model.to_string(),
+            dimensions: ollama_dimensions,
+        }
+    } else {
+        EmbeddingProvider::OpenAI {
+            api_key: key_or_env(key),
+        }
+    }
 }
 
 fn content_endpoint_or_env(c: Option<String>) -> Option<String> {
@@ -136,12 +199,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
             .await?
         }
-        Commands::Embed { key, string } => {
-            let v: Vec<[f32; 1536]> = openai::embeddings_for(&key_or_env(key), &[string]).await?;
+        Commands::Embed {
+            key,
+            ollama,
+            ollama_url,
+            ollama_model,
+            ollama_dimensions,
+            string,
+        } => {
+            let provider = build_provider(
+                key,
+                ollama,
+                &ollama_url,
+                &ollama_model,
+                ollama_dimensions,
+            );
+            let v: Vec<[f32; 1536]> = provider.embeddings_for(&[string]).await?;
             eprintln!("{:?}", v);
         }
-        Commands::Compare { key, s1, s2 } => {
-            let v = openai::embeddings_for(&key_or_env(key), &[s1, s2]).await?;
+        Commands::Compare {
+            key,
+            ollama,
+            ollama_url,
+            ollama_model,
+            ollama_dimensions,
+            s1,
+            s2,
+        } => {
+            let provider = build_provider(
+                key,
+                ollama,
+                &ollama_url,
+                &ollama_model,
+                ollama_dimensions,
+            );
+            let v = provider.embeddings_for(&[s1, s2]).await?;
             let p1 = Point::Mem {
                 vec: Box::new(v[0]),
             };
@@ -156,11 +248,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Commands::Compare2 {
             key,
+            ollama,
+            ollama_url,
+            ollama_model,
+            ollama_dimensions,
             s1,
             s2,
             variant,
         } => {
-            let v = openai::embeddings_for(&key_or_env(key), &[s1, s2]).await?;
+            let provider = build_provider(
+                key,
+                ollama,
+                &ollama_url,
+                &ollama_model,
+                ollama_dimensions,
+            );
+            let v = provider.embeddings_for(&[s1, s2]).await?;
             let p1 = &v[0];
             let p2 = &v[1];
             let distance = match variant {
@@ -170,17 +273,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             };
             println!("distance: {}", distance);
         }
-        Commands::Test { key } => {
-            let v = openai::embeddings_for(
-                &key_or_env(key),
-                &[
+        Commands::Test {
+            key,
+            ollama,
+            ollama_url,
+            ollama_model,
+            ollama_dimensions,
+        } => {
+            let provider = build_provider(
+                key,
+                ollama,
+                &ollama_url,
+                &ollama_model,
+                ollama_dimensions,
+            );
+            let v = provider
+                .embeddings_for(&[
                     "king".to_string(),
                     "man".to_string(),
                     "woman".to_string(),
                     "queen".to_string(),
-                ],
-            )
-            .await?;
+                ])
+                .await?;
             let mut calculated = empty_embedding();
             for (i, calculated) in calculated.iter_mut().enumerate() {
                 *calculated = v[0][i] - v[1][i] + v[2][i];
@@ -190,12 +304,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Commands::Load {
             key,
+            ollama,
+            ollama_url,
+            ollama_model,
+            ollama_dimensions,
             domain,
             commit,
             directory,
             input,
             size,
         } => {
+            let provider = build_provider(
+                key,
+                ollama,
+                &ollama_url,
+                &ollama_model,
+                ollama_dimensions,
+            );
             let path = Path::new(&input);
             let dirpath = Path::new(&directory);
             let mut hnsw: HnswIndex = Hnsw::new(OpenAI);
@@ -213,11 +338,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 })
                 .chunks(100);
 
-            let key = key_or_env(key);
             for structs in opstream {
                 let structs: Vec<_> = structs.collect();
                 let new_ops =
-                    operations_to_point_operations(&resolved_domain, &store, structs, &key).await?;
+                    operations_to_point_operations(&resolved_domain, &store, structs, &provider)
+                        .await?;
                 hnsw = start_indexing_from_operations(hnsw, new_ops).unwrap();
             }
             let index_id = create_index_name(&domain, &commit);
