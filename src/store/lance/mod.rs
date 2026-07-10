@@ -111,6 +111,11 @@ pub struct LanceStore {
     /// in-flight; a 5% roll that hits while a compaction is already running is
     /// a no-op. Guards are removed on task completion (success or failure).
     pub(super) compaction_in_progress: RwLock<std::collections::HashSet<BranchKey>>,
+    /// Whether probabilistic auto-compaction is enabled. When `false`,
+    /// `maybe_trigger_background_compaction` is a no-op (early-returns).
+    /// Explicit `/compact` still works regardless. Controlled by
+    /// `TDB_SEARCH_DISABLE_AUTO_COMPACTION=1` at boot.
+    auto_compaction_enabled: std::sync::atomic::AtomicBool,
 }
 
 impl LanceStore {
@@ -130,7 +135,15 @@ impl LanceStore {
             reservation_lock: tokio::sync::Mutex::new(()),
             fresh_open_count: std::sync::atomic::AtomicU64::new(0),
             compaction_in_progress: RwLock::new(std::collections::HashSet::new()),
+            auto_compaction_enabled: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// Disable probabilistic auto-compaction. Explicit `/compact` still works.
+    /// Used by integration tests for deterministic compaction control.
+    pub fn set_auto_compaction_enabled(&self, enabled: bool) {
+        self.auto_compaction_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Open the domain dataset FRESH from disk, tracking the open for FD/perf

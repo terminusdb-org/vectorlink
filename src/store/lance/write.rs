@@ -148,9 +148,8 @@ impl LanceStore {
     /// already in-flight for this (domain, branch). The spawned task:
     ///   1. Opens the dataset uncached (no write-lock contention with reads)
     ///   2. Calls io_compact_data (no-op if fragments <= threshold)
-    ///   3. Retags all stale commits to the compacted version
-    ///   4. Refreshes the cached handle
-    ///   5. Clears the in-progress guard
+    ///   3. Refreshes the cached handle
+    ///   4. Clears the in-progress guard
     ///
     /// Fail-loud: compaction errors are logged to stderr (visible via container
     /// logs). The guard is always cleared so subsequent rolls can retry.
@@ -162,6 +161,11 @@ impl LanceStore {
         branch: String,
     ) {
         use rand::Rng;
+
+        // Early-exit when auto-compaction is disabled (deterministic test mode).
+        if !store.auto_compaction_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
 
         /// Probability of triggering compaction on each fragment write (5%).
         const COMPACTION_PROBABILITY: f64 = 0.05;
@@ -242,9 +246,21 @@ impl LanceStore {
     }
 }
 
-/// Background compaction: open dataset uncached, compact, retag stale commits,
-/// refresh cache. Called by the 5%-probability trigger from the write path.
+/// Background compaction: open dataset uncached, compact, refresh cache.
+/// Called by the 5%-probability trigger from the write path.
 /// Runs on an uncached handle so it does NOT block concurrent reads.
+///
+/// INVARIANT (snapshot isolation): historical commit tags are NEVER repointed.
+/// Each commit tag points to the version created by its own push — that version
+/// has a bounded fragment count (typically 1-2 fragments from its single write
+/// cycle), so searches at historical versions open a bounded number of FDs
+/// regardless of how many total pushes the dataset has received. Compaction
+/// benefits only HEAD (which accumulates fragments across many pushes); there is
+/// no FD pressure on historical tags that would justify repointing them.
+///
+/// The retag-all-stale-tags loop was removed because it violated snapshot
+/// isolation: repointing iso_c0's tag to the post-iso_c1 compacted version
+/// caused `checkout_version(iso_c0)` to return data from iso_c1.
 async fn io_background_compact(
     store: &LanceStore,
     domain: &str,
@@ -260,29 +276,21 @@ async fn io_background_compact(
         None => return Ok(()), // Dataset gone (deleted concurrently) — no-op.
     };
 
+    let fragments_before = ds.get_fragments().len();
+    let version_before = ds.version().version;
+
     // Compact (threshold-gated: no-op if fragments <= 16).
     io_compact_data(&mut ds)
         .await
         .map_err(|e| format!("compaction failed: {}", e))?;
 
-    let compacted_version = ds.version().version;
+    let fragments_after = ds.get_fragments().len();
+    let version_after = ds.version().version;
 
-    // Retag stale commits to the compacted version so tag-resolved snapshots
-    // see the fewer-fragment layout.
-    let all_tags = ds
-        .tags()
-        .list()
-        .await
-        .map_err(|e| format!("tag list for retag failed: {}", e))?;
-
-    for (tag_name, tag_contents) in &all_tags {
-        if tag_contents.version != compacted_version {
-            ds.tags()
-                .update(tag_name, compacted_version)
-                .await
-                .map_err(|e| format!("retag '{}' to v{} failed: {}", tag_name, compacted_version, e))?;
-        }
-    }
+    eprintln!(
+        "[compaction] domain={} branch={} version {}→{} fragments {}→{}",
+        domain, branch, version_before, version_after, fragments_before, fragments_after
+    );
 
     // Refresh the cached handle so subsequent reads use compacted fragments.
     store

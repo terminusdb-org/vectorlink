@@ -2815,3 +2815,640 @@ async fn duplicate_scan_does_not_leak_file_descriptors_at_scale() {
         slack
     );
 }
+
+// --- POST-COMPACTION SNAPSHOT ISOLATION (regression guard) ---
+//
+// Proves that compaction does NOT break snapshot isolation. The bug: compaction
+// formerly retagged ALL historical commit tags to the compacted version, so
+// checkout_version(c0) returned the compacted (post-c1) data.
+//
+// Setup: insert doc/A → tag c0, insert doc/B → tag c1, push 16 more fragments
+// (above the 16-fragment compaction threshold), compact, assert search@c0
+// excludes doc/B. FAILS on the old retag code, PASSES after fix.
+#[tokio::test]
+async fn post_compaction_snapshot_isolation_regression_guard() {
+    let (store, _tmp) = make_test_store(8);
+    let domain = "admin/compact_iso";
+
+    // Insert doc/A, tag as commit "c0".
+    let emb_a = fake_embedding(8, 1.0);
+    let rows_a = vec![ChunkRow {
+        doc_id: "doc/A".to_owned(),
+        doc_type: "T".to_owned(),
+        chunk_index: 0,
+        chunk_count: 1,
+        chunk_token_start: 0,
+        doc_token_len: 5,
+        embedding: emb_a.clone(),
+        query_embedding: emb_a.clone(),
+        content: "document alpha".to_owned(),
+    }];
+    let v0 = store
+        .io_upsert_chunks(domain, "main", "doc/A", &rows_a)
+        .await
+        .expect("upsert A");
+    store
+        .io_tag_commit(domain, "main", "c0", v0)
+        .await
+        .expect("tag c0");
+
+    // Insert doc/B, tag as commit "c1".
+    let emb_b = fake_embedding(8, 2.0);
+    let rows_b = vec![ChunkRow {
+        doc_id: "doc/B".to_owned(),
+        doc_type: "T".to_owned(),
+        chunk_index: 0,
+        chunk_count: 1,
+        chunk_token_start: 0,
+        doc_token_len: 5,
+        embedding: emb_b.clone(),
+        query_embedding: emb_b.clone(),
+        content: "document beta".to_owned(),
+    }];
+    let v1 = store
+        .io_upsert_chunks(domain, "main", "doc/B", &rows_b)
+        .await
+        .expect("upsert B");
+    store
+        .io_tag_commit(domain, "main", "c1", v1)
+        .await
+        .expect("tag c1");
+
+    // Push 16 more fragments (one per upsert) to exceed the compaction threshold
+    // (COMPACT_FRAGMENT_THRESHOLD = 16). Each push is a different doc_id so it
+    // creates a new fragment (not a delete+append cycle on an existing doc).
+    for i in 0..16 {
+        let emb = fake_embedding(8, 10.0 + i as f32);
+        let rows = vec![ChunkRow {
+            doc_id: format!("doc/filler_{}", i),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: emb.clone(),
+            query_embedding: emb,
+            content: format!("filler document {}", i),
+        }];
+        store
+            .io_upsert_chunks(domain, "main", &format!("doc/filler_{}", i), &rows)
+            .await
+            .expect("upsert filler");
+    }
+
+    // Trigger compaction (mirrors io_background_compact: uncached open, compact,
+    // refresh). Total fragments = 2 (A, B) + 16 (fillers) = 18 > threshold of 16.
+    {
+        let ds = store
+            .io_open_dataset_uncached(domain, "main")
+            .await
+            .expect("uncached open for compact")
+            .expect("dataset must exist");
+        let fragment_count = ds.get_fragments().len();
+        assert!(
+            fragment_count > 16,
+            "pre-compaction fragment count must exceed threshold (got {})",
+            fragment_count
+        );
+        let mut ds = ds;
+        io_compact_data(&mut ds)
+            .await
+            .expect("compact_data");
+        let fragments_after = ds.get_fragments().len();
+        eprintln!(
+            "[compact_iso] fragments: {} -> {} (compacted version={})",
+            fragment_count,
+            fragments_after,
+            ds.version().version
+        );
+    }
+    // Refresh the cached handle (as io_background_compact does after compaction).
+    store
+        .io_refresh_cached_dataset(domain, "main")
+        .await
+        .expect("refresh after compaction");
+
+    // CRITICAL ASSERTION: search at c0 must still return ONLY doc/A.
+    // The old retag code repointed c0's tag to the compacted version (which
+    // contains A + B + fillers), breaking isolation. The fix preserves the
+    // original tag → original version mapping.
+    let query = SearchQuery {
+        query_embedding: emb_a.clone(),
+        query_text: "document".to_owned(),
+        mode: SearchMode::Vector,
+        start: 0,
+        count: 50,
+        doc_type_filter: Vec::new(),
+        doc_id_filter: Vec::new(),
+        snippet: false,
+    };
+    let hits_c0 = store
+        .io_search(domain, "main", "c0", &query)
+        .await
+        .expect("search at c0 after compaction");
+
+    let doc_ids_c0: Vec<&str> = hits_c0.iter().map(|h| h.doc_id.as_str()).collect();
+    assert!(
+        doc_ids_c0.contains(&"doc/A"),
+        "c0 snapshot must contain doc/A after compaction"
+    );
+    assert!(
+        !doc_ids_c0.contains(&"doc/B"),
+        "POST-COMPACTION ISOLATION VIOLATED: c0 snapshot must NOT contain doc/B \
+         (added at c1). If this fails, compaction is retagging historical commit \
+         tags to the compacted version — the snapshot isolation regression."
+    );
+
+    // Sanity: search at c1 must find both A and B.
+    let hits_c1 = store
+        .io_search(domain, "main", "c1", &query)
+        .await
+        .expect("search at c1 after compaction");
+
+    let doc_ids_c1: Vec<&str> = hits_c1.iter().map(|h| h.doc_id.as_str()).collect();
+    assert!(
+        doc_ids_c1.contains(&"doc/A"),
+        "c1 snapshot must contain doc/A"
+    );
+    assert!(
+        doc_ids_c1.contains(&"doc/B"),
+        "c1 snapshot must contain doc/B"
+    );
+}
+
+// --- ANN-PATH SNAPSHOT ISOLATION ---
+//
+// Proves that the IVF_HNSW_SQ (ANN) search path is also version-isolated.
+// With 300+ rows the vector index is active (above the 256 training-vector
+// floor), and searches go through the nearest() ANN path instead of flat scan.
+// After creating a vector index at c1, a search at c0 must still exclude c1
+// data — the ANN index must respect the checkout_version boundary.
+#[tokio::test]
+async fn ann_path_snapshot_isolation_with_vector_index() {
+    let dim = 16;
+    let config = VectorIndexConfig {
+        num_partitions: 4,
+        m: 16,
+        ef_construction: 100,
+        nprobes: 4,
+        refine_factor: Some(10),
+    };
+    let (mut store, _tmp) = make_test_store(dim);
+    store.set_vector_index_config(config.clone());
+    let domain = "admin/ann_iso";
+
+    // Commit c0: 300 rows from a single doc (above the 256 IVF_HNSW_SQ floor).
+    let corpus_c0 = 300usize;
+    let rows_c0: Vec<ChunkRow> = (0..corpus_c0)
+        .map(|i| ChunkRow {
+            doc_id: "doc/alpha".to_owned(),
+            doc_type: "Doc".to_owned(),
+            chunk_index: i as i32,
+            chunk_count: corpus_c0 as i32,
+            chunk_token_start: i as i32,
+            doc_token_len: corpus_c0 as i32,
+            embedding: fake_embedding(dim, 1.0 + i as f32),
+            query_embedding: fake_embedding(dim, 1.0 + i as f32),
+            content: format!("alpha chunk number {}", i),
+        })
+        .collect();
+    let v0 = store
+        .io_upsert_chunks(domain, "main", "doc/alpha", &rows_c0)
+        .await
+        .expect("upsert alpha corpus");
+    store
+        .io_tag_commit(domain, "main", "c0", v0)
+        .await
+        .expect("tag c0");
+
+    // Commit c1: add 50 rows from a new doc (doc/beta). Total rows = 350, well
+    // above the 256 training floor.
+    let corpus_c1 = 50usize;
+    let rows_c1: Vec<ChunkRow> = (0..corpus_c1)
+        .map(|i| ChunkRow {
+            doc_id: "doc/beta".to_owned(),
+            doc_type: "Doc".to_owned(),
+            chunk_index: i as i32,
+            chunk_count: corpus_c1 as i32,
+            chunk_token_start: i as i32,
+            doc_token_len: corpus_c1 as i32,
+            // Use a distinctly different seed range so beta vectors are far from alpha.
+            embedding: fake_embedding(dim, 5000.0 + i as f32),
+            query_embedding: fake_embedding(dim, 5000.0 + i as f32),
+            content: format!("beta chunk number {}", i),
+        })
+        .collect();
+    let v1 = store
+        .io_upsert_chunks(domain, "main", "doc/beta", &rows_c1)
+        .await
+        .expect("upsert beta corpus");
+    store
+        .io_tag_commit(domain, "main", "c1", v1)
+        .await
+        .expect("tag c1");
+
+    // Build the ANN (IVF_HNSW_SQ) vector index. This indexes ALL rows (c0 + c1)
+    // into the HNSW structure. The isolation contract says: even though the index
+    // covers all versions, checkout_version(c0) must filter to only c0's rows.
+    {
+        let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+        let mut ds = ds_arc.write().await;
+        crate::store::vector_index::io_ensure_vector_index(&mut ds, &config)
+            .await
+            .expect("ensure ANN vector index");
+    }
+    store
+        .io_refresh_cached_dataset(domain, "main")
+        .await
+        .expect("refresh after index build");
+
+    // Also run optimize_indices (append) to be thorough — this is what the
+    // production optimize worker does after building the index.
+    {
+        let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+        let mut ds = ds_arc.write().await;
+        crate::store::vector_index::io_ensure_vector_index(&mut ds, &config)
+            .await
+            .expect("optimize indices append");
+    }
+    store
+        .io_refresh_cached_dataset(domain, "main")
+        .await
+        .expect("refresh after optimize");
+
+    // Search at c0 via the ANN path (mode=Vector, the nearest() codepath).
+    // Query vector is close to alpha's seed range (seed=1.0 area).
+    let query_c0 = SearchQuery {
+        query_embedding: fake_embedding(dim, 1.5),
+        query_text: String::new(),
+        mode: SearchMode::Vector,
+        start: 0,
+        count: 50,
+        doc_type_filter: Vec::new(),
+        doc_id_filter: Vec::new(),
+        snippet: false,
+    };
+    let hits_c0 = store
+        .io_search(domain, "main", "c0", &query_c0)
+        .await
+        .expect("ANN search at c0");
+
+    let doc_ids_c0: Vec<&str> = hits_c0.iter().map(|h| h.doc_id.as_str()).collect();
+    assert!(
+        doc_ids_c0.contains(&"doc/alpha"),
+        "ANN search at c0 must find doc/alpha"
+    );
+    assert!(
+        !doc_ids_c0.contains(&"doc/beta"),
+        "ANN-PATH ISOLATION VIOLATED: search at c0 must NOT find doc/beta \
+         (added at c1). The IVF_HNSW_SQ index is leaking cross-version rows \
+         through the nearest() path — checkout_version is not filtering correctly."
+    );
+
+    // Sanity: search at c1 must find both alpha and beta.
+    let query_c1 = SearchQuery {
+        query_embedding: fake_embedding(dim, 5000.5),
+        query_text: String::new(),
+        mode: SearchMode::Vector,
+        start: 0,
+        count: 50,
+        doc_type_filter: Vec::new(),
+        doc_id_filter: Vec::new(),
+        snippet: false,
+    };
+    let hits_c1 = store
+        .io_search(domain, "main", "c1", &query_c1)
+        .await
+        .expect("ANN search at c1");
+
+    let doc_ids_c1: Vec<&str> = hits_c1.iter().map(|h| h.doc_id.as_str()).collect();
+    assert!(
+        doc_ids_c1.contains(&"doc/beta"),
+        "ANN search at c1 must find doc/beta"
+    );
+    // Alpha should also be in c1 (append-only) if the query is close enough.
+    // We use a beta-range query here so alpha may or may not appear (vector distance).
+    // The critical assertion is: beta IS in c1 and NOT in c0.
+}
+
+// --- FD-MEASUREMENT: historical-version search after compaction (task-59) ---
+//
+// HYPOTHESIS UNDER TEST (#58 assumption): after compaction, searching an OLD
+// tag (c0, whose version predates the compacted version) opens ONLY the
+// fragments relevant to ITS version — NOT the accumulated full fragment set.
+// This is the FD-safety assumption that underpins #58's removal of the
+// compaction retag.
+//
+// SETUP:
+//   1. Tag c0 early (1 fragment — 1 doc).
+//   2. Push MANY more commits (c1..cN), each adding a new fragment.
+//   3. Tag c_mid at the midpoint, tag c_head at HEAD (accumulated fragments).
+//   4. Compact → HEAD fragments collapse to O(1); c0/c_mid still reference
+//      their ORIGINAL pre-compaction version (old manifests with old fragments).
+//   5. Measure open_fd_count delta + fresh_open delta for:
+//      a) search at c0 (old version, few fragments)
+//      b) search at c_mid (old version, many fragments)
+//      c) search at c_head (latest — post-compaction, few fragments)
+//
+// BOUNDED outcome → #58's assumption holds. BLOWS UP → real FD-vs-isolation
+// tradeoff requiring smart compaction (#60).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fd_measurement_historical_version_search_after_compaction() {
+    let dim = 8;
+    let (store, _tmp) = make_test_store(dim);
+    let domain = "admin/fd_historical";
+
+    // --- Phase 1: Tag c0 early (1 fragment = 1 doc). ---
+    let emb_c0 = fake_embedding(dim, 1.0);
+    let rows_c0 = vec![ChunkRow {
+        doc_id: "doc/genesis".to_owned(),
+        doc_type: "T".to_owned(),
+        chunk_index: 0,
+        chunk_count: 1,
+        chunk_token_start: 0,
+        doc_token_len: 5,
+        embedding: emb_c0.clone(),
+        query_embedding: emb_c0.clone(),
+        content: "genesis document".to_owned(),
+    }];
+    let v0 = store
+        .io_upsert_chunks(domain, "main", "doc/genesis", &rows_c0)
+        .await
+        .expect("upsert genesis");
+    store
+        .io_tag_commit(domain, "main", "c0", v0)
+        .await
+        .expect("tag c0");
+
+    // --- Phase 2: Push many commits (c1..c39), each a new doc = new fragment. ---
+    // 40 total fragments (c0 + 39 more) well above the COMPACT_FRAGMENT_THRESHOLD=16.
+    let total_pushes = 39usize;
+    let mid_point = 20usize;
+    let mut v_mid: u64 = 0;
+    let mut v_head: u64 = 0;
+
+    for i in 1..=total_pushes {
+        let emb = fake_embedding(dim, 10.0 + i as f32);
+        let rows = vec![ChunkRow {
+            doc_id: format!("doc/push_{}", i),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: emb.clone(),
+            query_embedding: emb,
+            content: format!("push document {}", i),
+        }];
+        let v = store
+            .io_upsert_chunks(domain, "main", &format!("doc/push_{}", i), &rows)
+            .await
+            .expect("upsert push");
+
+        if i == mid_point {
+            store
+                .io_tag_commit(domain, "main", "c_mid", v)
+                .await
+                .expect("tag c_mid");
+            v_mid = v;
+        }
+        if i == total_pushes {
+            store
+                .io_tag_commit(domain, "main", "c_head", v)
+                .await
+                .expect("tag c_head");
+            v_head = v;
+        }
+    }
+    assert!(v_mid > 0, "v_mid must be tagged");
+    assert!(v_head > v_mid, "v_head must be after v_mid");
+
+    // --- Phase 3: Verify fragment count before compaction, then compact. ---
+    let fragments_before_compaction;
+    {
+        let ds = store
+            .io_open_dataset_uncached(domain, "main")
+            .await
+            .expect("uncached open for compact")
+            .expect("dataset must exist");
+        fragments_before_compaction = ds.get_fragments().len();
+        assert!(
+            fragments_before_compaction > 16,
+            "pre-compaction fragment count must exceed threshold (got {})",
+            fragments_before_compaction
+        );
+        let mut ds = ds;
+        io_compact_data(&mut ds)
+            .await
+            .expect("compact_data");
+        let fragments_after = ds.get_fragments().len();
+        eprintln!(
+            "[fd-historical] compaction: {} -> {} fragments (compacted version={})",
+            fragments_before_compaction,
+            fragments_after,
+            ds.version().version
+        );
+    }
+    // Refresh the cached handle after compaction (as io_background_compact does).
+    store
+        .io_refresh_cached_dataset(domain, "main")
+        .await
+        .expect("refresh after compaction");
+
+    // --- Phase 4: Measure fragment count visible at each version. ---
+    // Checkout each version and count its fragments to understand what Lance
+    // exposes at each historical point.
+    let snapshot_c0 = store
+        .io_snapshot_from_cache(domain, "main", "c0")
+        .await
+        .expect("snapshot c0");
+    let frags_c0 = snapshot_c0.get_fragments().len();
+
+    let snapshot_mid = store
+        .io_snapshot_from_cache(domain, "main", "c_mid")
+        .await
+        .expect("snapshot c_mid");
+    let frags_mid = snapshot_mid.get_fragments().len();
+
+    let snapshot_head = store
+        .io_snapshot_from_cache(domain, "main", "c_head")
+        .await
+        .expect("snapshot c_head");
+    let frags_head = snapshot_head.get_fragments().len();
+
+    eprintln!(
+        "[fd-historical] fragments per version: c0={}, c_mid={}, c_head={} (pre-compact total={})",
+        frags_c0, frags_mid, frags_head, fragments_before_compaction
+    );
+
+    // --- Phase 5: FD measurement — search at each version and measure delta. ---
+    let query = SearchQuery {
+        query_embedding: emb_c0.clone(),
+        query_text: "document".to_owned(),
+        mode: SearchMode::Vector,
+        start: 0,
+        count: 50,
+        doc_type_filter: Vec::new(),
+        doc_id_filter: Vec::new(),
+        snippet: false,
+    };
+
+    // Warm up all paths once.
+    store.io_search(domain, "main", "c0", &query).await.expect("warmup c0");
+    store.io_search(domain, "main", "c_mid", &query).await.expect("warmup c_mid");
+    store.io_search(domain, "main", "c_head", &query).await.expect("warmup c_head");
+
+    // Measure c0 search FDs (multiple iterations for stability).
+    let iterations = 50usize;
+
+    let fd_before_c0 = open_fd_count();
+    let opens_before_c0 = store.fresh_open_count();
+    for _ in 0..iterations {
+        store
+            .io_search(domain, "main", "c0", &query)
+            .await
+            .expect("search c0 must not exhaust FDs");
+    }
+    let fd_after_c0 = open_fd_count();
+    let opens_c0 = store.fresh_open_count() - opens_before_c0;
+    let fd_delta_c0 = fd_after_c0 as i64 - fd_before_c0 as i64;
+
+    // Measure c_mid search FDs.
+    let fd_before_mid = open_fd_count();
+    let opens_before_mid = store.fresh_open_count();
+    for _ in 0..iterations {
+        store
+            .io_search(domain, "main", "c_mid", &query)
+            .await
+            .expect("search c_mid must not exhaust FDs");
+    }
+    let fd_after_mid = open_fd_count();
+    let opens_mid = store.fresh_open_count() - opens_before_mid;
+    let fd_delta_mid = fd_after_mid as i64 - fd_before_mid as i64;
+
+    // Measure c_head search FDs (post-compaction — should be minimal).
+    let fd_before_head = open_fd_count();
+    let opens_before_head = store.fresh_open_count();
+    for _ in 0..iterations {
+        store
+            .io_search(domain, "main", "c_head", &query)
+            .await
+            .expect("search c_head must not exhaust FDs");
+    }
+    let fd_after_head = open_fd_count();
+    let opens_head = store.fresh_open_count() - opens_before_head;
+    let fd_delta_head = fd_after_head as i64 - fd_before_head as i64;
+
+    // --- Phase 6: Report measured numbers. ---
+    eprintln!(
+        "[fd-historical] MEASUREMENT REPORT (iterations={}):",
+        iterations
+    );
+    eprintln!(
+        "[fd-historical] tag=c0      fragments={:>3}  fds_delta={:>4}  fresh_opens={}",
+        frags_c0, fd_delta_c0, opens_c0
+    );
+    eprintln!(
+        "[fd-historical] tag=c_mid   fragments={:>3}  fds_delta={:>4}  fresh_opens={}",
+        frags_mid, fd_delta_mid, opens_mid
+    );
+    eprintln!(
+        "[fd-historical] tag=c_head  fragments={:>3}  fds_delta={:>4}  fresh_opens={}",
+        frags_head, fd_delta_head, opens_head
+    );
+
+    // --- Phase 7: Assertions — FD behaviour must be BOUNDED. ---
+
+    // A) No fresh opens per search (reuses cached handle).
+    assert_eq!(
+        opens_c0, 0,
+        "historical c0 search opened {} fresh dataset(s) — must reuse cached handle",
+        opens_c0
+    );
+    assert_eq!(
+        opens_mid, 0,
+        "historical c_mid search opened {} fresh dataset(s) — must reuse cached handle",
+        opens_mid
+    );
+    assert_eq!(
+        opens_head, 0,
+        "c_head search opened {} fresh dataset(s) — must reuse cached handle",
+        opens_head
+    );
+
+    // B) FD delta stays bounded (not scaling with iterations or fragment count).
+    // Slack: a few FDs for runtime churn is acceptable; growth proportional to
+    // iterations or the fragment count of the historical version is NOT.
+    let slack: i64 = 64;
+    assert!(
+        fd_delta_c0 < slack,
+        "c0 historical search FD delta ({}) exceeds slack ({}) — \
+         old-version search is leaking FDs per call (fragments at c0={}). \
+         The #58 assumption (bounded fragment cost) may be violated.",
+        fd_delta_c0, slack, frags_c0
+    );
+    assert!(
+        fd_delta_mid < slack,
+        "c_mid historical search FD delta ({}) exceeds slack ({}) — \
+         mid-history search is leaking FDs per call (fragments at c_mid={}). \
+         The #58 assumption (bounded fragment cost) may be violated.",
+        fd_delta_mid, slack, frags_mid
+    );
+    assert!(
+        fd_delta_head < slack,
+        "c_head (post-compaction HEAD) search FD delta ({}) exceeds slack ({}) — \
+         HEAD search is leaking FDs per call.",
+        fd_delta_head, slack
+    );
+
+    // C) Historical-version search must NOT open dramatically more FDs than HEAD.
+    // If c0 or c_mid's fragment set at their version is bounded, the FD cost is
+    // bounded. We allow c_mid to use more FDs than HEAD (it has more fragments
+    // from its pre-compaction era) but it must stay well under nofile=1024.
+    let max_historical_fd_budget: i64 = 200;
+    assert!(
+        fd_delta_c0 < max_historical_fd_budget,
+        "c0 historical search FD delta ({}) exceeds the safety budget ({}) — \
+         old-version fragment layout is opening too many descriptors. \
+         Historical-version search may blow up FDs at scale.",
+        fd_delta_c0, max_historical_fd_budget
+    );
+    assert!(
+        fd_delta_mid < max_historical_fd_budget,
+        "c_mid historical search FD delta ({}) exceeds the safety budget ({}) — \
+         mid-history fragment layout is opening too many descriptors. \
+         Historical-version search may blow up FDs at scale.",
+        fd_delta_mid, max_historical_fd_budget
+    );
+
+    // D) The VERSION's fragment count is bounded by its own era's accumulation,
+    //    NOT by the total fragments ever created. After compaction, c0's version
+    //    has its original manifest (1 fragment), c_mid has ~21, c_head references
+    //    the compacted set. The key property: c0 does NOT inherit the full 40
+    //    accumulated fragments.
+    assert!(
+        frags_c0 <= 2,
+        "c0 version exposes {} fragments — expected <= 2 (just the genesis doc's fragment). \
+         If c0 exposes the full accumulated set, snapshot isolation's fragment \
+         budget is unbounded and the #58 assumption is FALSE.",
+        frags_c0
+    );
+    // c_mid's version may have up to mid_point+1 fragments (one per push).
+    // That is bounded by design — the historical version references only ITS era.
+    assert!(
+        frags_mid <= mid_point + 2,
+        "c_mid version exposes {} fragments — expected <= {} (its era). \
+         If c_mid exposes more than its era's fragments, something is wrong.",
+        frags_mid, mid_point + 2
+    );
+
+    eprintln!(
+        "[fd-historical] CONCLUSION: historical-version search is BOUNDED. \
+         c0 (1 fragment) costs {} FD delta, c_mid ({} fragments) costs {} FD delta, \
+         c_head (compacted) costs {} FD delta. All well under nofile=1024. \
+         #58's assumption (post-compaction old-tag search opens only relevant \
+         fragments) is CONFIRMED.",
+        fd_delta_c0, frags_mid, fd_delta_mid, fd_delta_head
+    );
+}

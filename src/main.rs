@@ -32,6 +32,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = Path::new(&config.data_dir);
     let lance_store = Arc::new(LanceStore::new(data_dir, dim));
 
+    // Disable probabilistic auto-compaction when opted out (deterministic test mode).
+    // Explicit POST /compact still works regardless.
+    if std::env::var("TDB_SEARCH_DISABLE_AUTO_COMPACTION").unwrap_or_default() == "1" {
+        lance_store.set_auto_compaction_enabled(false);
+        eprintln!("[config] auto-compaction DISABLED (TDB_SEARCH_DISABLE_AUTO_COMPACTION=1)");
+    }
+
     let service = SearchService::new(lance_store, config.clone(), tokenizer);
     let app = http_api::router(service, config);
 

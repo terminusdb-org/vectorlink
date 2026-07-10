@@ -1140,12 +1140,15 @@ impl SearchService {
 
     /// Trigger data compaction for a domain's dataset on a given branch.
     /// Merges small fragments (one per push) into fewer large fragments, reducing
-    /// the FD count for full-table scans. Returns before/after fragment counts.
+    /// the FD count for full-table scans at HEAD. Returns before/after fragment
+    /// counts.
     ///
-    /// After compaction, all existing commit tags are re-pointed to the new
-    /// (compacted) version so that tag-resolved snapshots use the fewer-fragment
-    /// layout. Without re-tagging, old tags reference the pre-compaction version
-    /// which still has N fragments per original push.
+    /// INVARIANT (snapshot isolation): historical commit tags are NEVER repointed.
+    /// Each commit tag points to the version created by its own push — that
+    /// version has a bounded fragment count (typically 1-2 fragments from its
+    /// single write cycle), so searches at historical versions open a bounded
+    /// number of FDs regardless of total push count. Compaction benefits HEAD
+    /// only; historical tags do not suffer FD pressure.
     ///
     /// Admin-only, idempotent: re-running on an already-compacted dataset is fast
     /// (the threshold check short-circuits if fragments <= 16).
@@ -1176,6 +1179,7 @@ impl SearchService {
         };
 
         let fragments_before = ds.get_fragments().len();
+        let version_before = ds.version().version;
 
         crate::store::lance::io_compact_data(&mut ds)
             .await
@@ -1184,34 +1188,10 @@ impl SearchService {
         let fragments_after = ds.get_fragments().len();
         let compacted_version = ds.version().version;
 
-        // Re-tag all commits pointing to older versions so that tag-resolved
-        // snapshots (io_snapshot_from_cache → checkout_version) read from the
-        // latest (fewest-fragment) layout. Without this, old tags reference
-        // pre-compaction versions that still open N fragment files per scan.
-        // Always retag stale tags — even if this invocation didn't compact
-        // (fragments already low), tags may be stale from a prior compaction.
-        let all_tags = ds
-            .tags()
-            .list()
-            .await
-            .map_err(|e| {
-                ServiceError::Internal(format!("tag list for retag failed: {}", e))
-            })?;
-        let mut tags_repointed = 0u64;
-        for (tag_name, tag_contents) in &all_tags {
-            if tag_contents.version != compacted_version {
-                ds.tags()
-                    .update(tag_name, compacted_version)
-                    .await
-                    .map_err(|e| {
-                        ServiceError::Internal(format!(
-                            "retag '{}' to v{} failed: {}",
-                            tag_name, compacted_version, e
-                        ))
-                    })?;
-                tags_repointed += 1;
-            }
-        }
+        eprintln!(
+            "[compaction] domain={} branch={} version {}→{} fragments {}→{}",
+            domain_raw, branch, version_before, compacted_version, fragments_before, fragments_after
+        );
 
         // Refresh the cached handle so subsequent reads use the compacted data.
         self.store
@@ -1225,8 +1205,7 @@ impl SearchService {
             "fragments_before": fragments_before,
             "fragments_after": fragments_after,
             "compacted": fragments_before != fragments_after,
-            "compacted_version": compacted_version,
-            "tags_repointed": tags_repointed
+            "compacted_version": compacted_version
         }))
     }
 
