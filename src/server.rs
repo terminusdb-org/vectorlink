@@ -36,6 +36,7 @@ use tokio::{io::AsyncBufReadExt, sync::RwLock};
 use tokio_stream::{wrappers::LinesStream, Stream};
 use tokio_util::io::StreamReader;
 
+use crate::embedding::EmbeddingProvider;
 use crate::indexer::create_index_name;
 use crate::indexer::deserialize_index;
 use crate::indexer::operations_to_point_operations;
@@ -46,7 +47,6 @@ use crate::indexer::Point;
 use crate::indexer::PointOperation;
 use crate::indexer::SearchError;
 use crate::indexer::{start_indexing_from_operations, HnswIndex, IndexIdentifier, OpenAI};
-use crate::openai::{embeddings_for, EmbeddingError};
 use crate::vectors::VectorStore;
 
 #[derive(Clone, Deserialize, Debug)]
@@ -139,6 +139,29 @@ fn get_header_value(header: &HeaderMap, key: &str) -> Result<String, HeaderError
             }
         }
         None => Err(HeaderError::MissingKey(key.to_string())),
+    }
+}
+
+fn get_optional_header_value(header: &HeaderMap, key: &str) -> Option<String> {
+    get_header_value(header, key).ok()
+}
+
+fn build_provider_from_headers(headers: &HeaderMap) -> Result<EmbeddingProvider, HeaderError> {
+    let ollama_url = get_optional_header_value(headers, "VECTORLINK_OLLAMA_URL");
+    if let Some(base_url) = ollama_url {
+        let model = get_optional_header_value(headers, "VECTORLINK_OLLAMA_MODEL")
+            .unwrap_or_else(|| "qwen3-embedding:4b".to_string());
+        let dimensions = get_optional_header_value(headers, "VECTORLINK_OLLAMA_DIMENSIONS")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1536);
+        Ok(EmbeddingProvider::Ollama {
+            base_url,
+            model,
+            dimensions,
+        })
+    } else {
+        let api_key = get_header_value(headers, "VECTORLINK_EMBEDDING_API_KEY")?;
+        Ok(EmbeddingProvider::OpenAI { api_key })
     }
 }
 
@@ -286,6 +309,7 @@ enum TerminusIndexOperationError {}
 async fn get_operations_from_content_endpoint(
     content_endpoint: String,
     user_forward_header: String,
+    authorization_header: Option<String>,
     domain: String,
     commit: String,
     previous: Option<String>,
@@ -297,9 +321,13 @@ async fn get_operations_from_content_endpoint(
     let endpoint = format!("{}/{}", content_endpoint, &domain);
     let url = reqwest::Url::parse_with_params(&endpoint, &params).unwrap();
     let client = reqwest::Client::new();
-    let res = client
+    let mut req = client
         .get(url)
-        .header(user_forward_header, "admin")
+        .header(user_forward_header, "admin");
+    if let Some(auth) = authorization_header {
+        req = req.header("authorization", auth);
+    }
+    let res = req
         .send()
         .await
         .unwrap();
@@ -347,7 +375,7 @@ enum ResponseError {
     #[error("Missing id in index {0}")]
     IdMissing(String),
     #[error("Embedding error: {0:?}")]
-    EmbeddingError(#[from] EmbeddingError),
+    EmbeddingError(#[from] crate::embedding::EmbeddingError),
 }
 
 fn add_to_duplicates(duplicates: &mut HashMap<usize, usize>, id1: usize, id2: usize) {
@@ -451,14 +479,16 @@ impl Service {
         commit: String,
         previous: Option<String>,
         task_id: &str,
-        api_key: String,
+        provider: EmbeddingProvider,
         index_id: &str,
         content_endpoint: String,
+        authorization_header: Option<String>,
     ) -> Result<(String, HnswIndex), IndexError> {
         let internal_task_id = task_id;
         let opstream = get_operations_from_content_endpoint(
             content_endpoint.to_string(),
             self.user_forward_header.clone(),
+            authorization_header,
             domain.clone(),
             commit.clone(),
             previous.clone(),
@@ -466,7 +496,7 @@ impl Service {
         .await?
         .chunks(100);
         self.process_operation_chunks(
-            opstream, domain, commit, previous, index_id, task_id, &api_key,
+            opstream, domain, commit, previous, index_id, task_id, &provider,
         )
         .await
     }
@@ -477,7 +507,8 @@ impl Service {
         commit: String,
         previous: Option<String>,
         task_id: String,
-        api_key: String,
+        provider: EmbeddingProvider,
+        authorization_header: Option<String>,
     ) -> Result<(), StartIndexError> {
         let content_endpoint = self.content_endpoint.clone();
         let internal_task_id = task_id.clone();
@@ -492,9 +523,10 @@ impl Service {
                             commit,
                             previous,
                             &task_id,
-                            api_key,
+                            provider,
                             &index_id,
                             content_endpoint,
+                            authorization_header,
                         )
                         .await
                     {
@@ -519,6 +551,9 @@ impl Service {
                             self.clear_pending(&index_id).await;
                         }
                     }
+                } else {
+                    self.set_task_status(internal_task_id, TaskStatus::Completed(0))
+                        .await;
                 }
             });
             Ok(())
@@ -557,7 +592,7 @@ impl Service {
         previous: Option<String>,
         index_id: &str,
         task_id: &str,
-        api_key: &str,
+        provider: &EmbeddingProvider,
     ) -> Result<(String, HnswIndex), IndexError> {
         let id = create_index_name(&domain, &commit);
         let mut hnsw = self
@@ -572,7 +607,7 @@ impl Service {
             .await;
         while let Some(structs) = opstream.next().await {
             let new_ops =
-                operations_to_point_operations(&domain, &self.vector_store, structs, api_key)
+                operations_to_point_operations(&domain, &self.vector_store, structs, provider)
                     .await?;
             hnsw = start_indexing_from_operations(hnsw, new_ops)?;
         }
@@ -591,9 +626,10 @@ impl Service {
         previous: Option<String>,
     ) -> Result<String, ResponseError> {
         let task_id = Service::generate_task();
-        let api_key = get_header_value(req.headers(), "VECTORLINK_EMBEDDING_API_KEY")?;
-        self.set_task_status(task_id.clone(), TaskStatus::Pending(0.0));
-        self.start_indexing(domain, commit, previous, task_id.clone(), api_key)?;
+        let provider = build_provider_from_headers(req.headers())?;
+        let authorization_header = get_optional_header_value(req.headers(), "authorization");
+        self.set_task_status(task_id.clone(), TaskStatus::Pending(0.0)).await;
+        self.start_indexing(domain, commit, previous, task_id.clone(), provider, authorization_header)?;
         Ok(task_id)
     }
 
@@ -750,9 +786,9 @@ impl Service {
                 let body = req.into_body();
                 let body_bytes = hyper::body::to_bytes(body).await.unwrap();
                 let q = String::from_utf8(body_bytes.to_vec()).unwrap();
-                let api_key = get_header_value(&headers, "VECTORLINK_EMBEDDING_API_KEY");
+                let provider_result = build_provider_from_headers(&headers);
                 let result: Result<Response<Body>, ResponseError> =
-                    self.index_response(api_key, q, domain, commit, count).await;
+                    self.index_response(provider_result, q, domain, commit, count).await;
                 match result {
                     Ok(body) => Ok(body),
                     Err(e) => Ok(Response::builder()
@@ -771,14 +807,14 @@ impl Service {
 
     async fn index_response(
         &self,
-        api_key: Result<String, HeaderError>,
+        provider_result: Result<EmbeddingProvider, HeaderError>,
         q: String,
         domain: String,
         commit: String,
         count: usize,
     ) -> Result<Response<Body>, ResponseError> {
-        let api_key = api_key?;
-        let vec: Vec<[f32; 1536]> = embeddings_for(&api_key, &[q]).await?;
+        let provider = provider_result?;
+        let vec: Vec<[f32; 1536]> = provider.embeddings_for(&[q]).await?;
         let qp = Point::Mem {
             vec: Box::new(vec[0]),
         };

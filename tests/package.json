@@ -1,0 +1,17 @@
+{
+  "name": "vectorlink-integration-tests",
+  "version": "1.0.0",
+  "description": "Integration tests for vectorlink semantic indexer with TerminusDB",
+  "private": true,
+  "scripts": {
+    "test": "mocha",
+    "test:ollama": "VECTORLINK_EMBEDDING_PROVIDER=ollama mocha"
+  },
+  "dependencies": {
+    "superagent": "^8.1.2"
+  },
+  "devDependencies": {
+    "chai": "^4.4.1",
+    "mocha": "^10.2.0"
+  }
+}

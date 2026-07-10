@@ -1,6 +1,6 @@
 #![allow(unused, dead_code)]
 use crate::{
-    openai::{embeddings_for, EmbeddingError},
+    embedding::{EmbeddingError, EmbeddingProvider},
     server::Operation,
     vecmath::{self, Embedding},
     vectors::{Domain, LoadedVec, VectorStore},
@@ -92,7 +92,7 @@ pub async fn operations_to_point_operations(
     domain: &Domain,
     vector_store: &VectorStore,
     structs: Vec<Result<Operation, std::io::Error>>,
-    key: &str,
+    provider: &EmbeddingProvider,
 ) -> Result<Vec<PointOperation>, IndexError> {
     // Should not unwrap here -
     let ops: Vec<Operation> = structs.into_iter().collect::<Result<Vec<_>, _>>()?;
@@ -112,7 +112,7 @@ pub async fn operations_to_point_operations(
     let vecs: Vec<Embedding> = if strings.is_empty() {
         Vec::new()
     } else {
-        embeddings_for(key, &strings).await?
+        provider.embeddings_for(&strings).await?
     };
     let loaded_vecs: Vec<LoadedVec> = vector_store.add_and_load_vecs(&domain, vecs.iter())?;
     let mut new_ops: Vec<PointOperation> = zip(tuples, loaded_vecs)
