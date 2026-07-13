@@ -265,7 +265,7 @@ impl LanceStore {
                         doc_token_len: dtl.value(i),
                         content: content.to_owned(),
                         embedding: Vec::new(),
-                        query_embedding: Vec::new(),
+                        clustering_embedding: Vec::new(),
                     });
                 }
             }
@@ -556,7 +556,7 @@ impl LanceStore {
     /// in a result set. Used by the same-role exact-duplicate distance override.
     ///
     /// `column` is the embedding column name: `"embedding"` (doc-role) or
-    /// `"query_embedding"` (query-role).
+    /// `"clustering_embedding"` (clustering-role).
     ///
     /// Returns a map from doc_id → Vec<f32>. Documents not found in the snapshot
     /// (deleted between search and this lookup — edge case) are silently absent
@@ -849,8 +849,8 @@ pub(super) fn batches_to_vector_hits(
         let embeddings = batch
             .column_by_name("embedding")
             .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>());
-        let query_embeddings = batch
-            .column_by_name("query_embedding")
+        let clustering_embeddings = batch
+            .column_by_name("clustering_embedding")
             .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>());
 
         // FAIL LOUD (#E): a ranked vector search with no usable `_distance`
@@ -874,7 +874,7 @@ pub(super) fn batches_to_vector_hits(
                     Some(arr) => extract_embedding_row(arr, i, ids.value(i))?,
                     None => Vec::new(),
                 };
-                let query_embedding = match query_embeddings {
+                let clustering_embedding = match clustering_embeddings {
                     Some(arr) => extract_embedding_row(arr, i, ids.value(i))?,
                     None => Vec::new(),
                 };
@@ -888,7 +888,7 @@ pub(super) fn batches_to_vector_hits(
                     doc_token_len: dtl.value(i),
                     content: cnt.value(i).to_owned(),
                     embedding,
-                    query_embedding,
+                    clustering_embedding,
                 });
             }
         }
@@ -945,7 +945,7 @@ pub(super) fn batches_to_fts_hits(batches: &[RecordBatch]) -> Vec<ChunkHit> {
                     content: cnt.value(i).to_owned(),
                     // FTS path ranks by `_score`; the raw vectors are not projected.
                     embedding: Vec::new(),
-                    query_embedding: Vec::new(),
+                    clustering_embedding: Vec::new(),
                 });
             }
         }

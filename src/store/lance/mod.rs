@@ -43,6 +43,7 @@ use arrow_schema::{DataType, Field, Schema};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use tokio::sync::RwLock;
 
+use crate::config::DomainSettingsMap;
 use crate::kernel::error::StoreError;
 use crate::layeridx::BranchIndex;
 
@@ -57,7 +58,7 @@ pub(super) type BranchKey = (String, String);
 #[derive(Debug)]
 pub struct LanceStore {
     base_dir: PathBuf,
-    dim: usize,
+    pub dim: usize,
     /// Vector index configuration (nprobes, refine_factor for search).
     pub(super) vector_index_config: VectorIndexConfig,
     /// Open dataset handles, keyed by DOMAIN (layout A). The cached handle is
@@ -116,11 +117,15 @@ pub struct LanceStore {
     /// Explicit `/compact` still works regardless. Controlled by
     /// `TDB_SEARCH_DISABLE_AUTO_COMPACTION=1` at boot.
     auto_compaction_enabled: std::sync::atomic::AtomicBool,
+    /// Per-domain settings (clustering, etc.). Loaded from
+    /// `domain_settings.json` at startup.
+    pub domain_settings: DomainSettingsMap,
 }
 
 impl LanceStore {
     /// Create a new LanceStore backed by the given directory.
     pub fn new(base_dir: &Path, dim: usize) -> Self {
+        let domain_settings = DomainSettingsMap::load(base_dir);
         let vector_index_config = VectorIndexConfig::default_for_dim(dim);
         Self {
             base_dir: base_dir.to_owned(),
@@ -136,6 +141,7 @@ impl LanceStore {
             fresh_open_count: std::sync::atomic::AtomicU64::new(0),
             compaction_in_progress: RwLock::new(std::collections::HashSet::new()),
             auto_compaction_enabled: std::sync::atomic::AtomicBool::new(true),
+            domain_settings,
         }
     }
 
@@ -211,8 +217,9 @@ impl LanceStore {
     }
 
     /// Get the Arrow schema for chunk rows (embedding dimension from config).
-    /// Includes BOTH `embedding` (document-role, ANN-INDEXED) and `query_embedding`
-    /// (query-role, STORED but NOT INDEXED — Phase 6A Step 5 dual-vector).
+    /// Includes BOTH `embedding` (document-role, ANN-INDEXED) and
+    /// `clustering_embedding` (clustering-role, STORED, optionally ANN-indexed
+    /// when clustering is enabled for the domain).
     pub(super) fn chunk_schema(&self) -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Utf8, false),
@@ -229,12 +236,11 @@ impl LanceStore {
                 ),
                 false,
             ),
-            // Query-role embedding: stored for /resolve and /duplicates to probe
-            // with the asymmetric query→document signal. NOT ANN-indexed — the
-            // only index lives on `embedding`. This column is a pure storage
-            // column read by `io_scan_points` during the resolve/duplicates scan.
+            // Clustering-role embedding: stored for /candidates dual KNN gather.
+            // ANN-indexed when clustering is enabled for the domain; otherwise
+            // stored as zeros and not indexed.
             Field::new(
-                "query_embedding",
+                "clustering_embedding",
                 DataType::FixedSizeList(
                     Arc::new(Field::new("item", DataType::Float32, true)),
                     self.dim as i32,
@@ -247,9 +253,12 @@ impl LanceStore {
 
     /// Get the on-disk path for a domain's Lance dataset (layout A: one dataset
     /// per domain; branches live inside it as Lance branches).
-    pub(super) fn dataset_path(&self, domain: &str) -> PathBuf {
-        // Use a safe directory name: domain slashes replaced with double-underscore.
-        let safe_domain = domain.replace('/', "__");
+    ///
+    /// Each segment of the domain (`org`, `team`) is URI-percent-encoded so
+    /// any character is safe in the filesystem path. This is a breaking change
+    /// from the old `replace('/', "__")` encoding — a clean re-index is required.
+    pub fn dataset_path(&self, domain: &str) -> PathBuf {
+        let safe_domain = encode_domain_path(domain);
         self.base_dir.join(format!("{}.lance", safe_domain))
     }
 
@@ -601,7 +610,7 @@ impl LanceStore {
                     Arc::new(Float32Array::from(Vec::<f32>::new())),
                     None,
                 )),
-                // query_embedding (same shape as embedding, stored but NOT indexed).
+                // clustering_embedding (same shape as embedding, stored).
                 Arc::new(FixedSizeListArray::new(
                     Arc::new(Field::new("item", DataType::Float32, true)),
                     dim,
@@ -636,16 +645,16 @@ impl LanceStore {
             None,
         );
 
-        // Build the query_embedding FixedSizeList (query-role, stored NOT indexed).
-        let flat_query_embeddings: Vec<f32> = rows
+        // Build the clustering_embedding FixedSizeList (clustering-role, stored).
+        let flat_clustering_embeddings: Vec<f32> = rows
             .iter()
-            .flat_map(|r| r.query_embedding.iter().copied())
+            .flat_map(|r| r.clustering_embedding.iter().copied())
             .collect();
-        let query_values = Float32Array::from(flat_query_embeddings);
-        let query_embedding_array = FixedSizeListArray::new(
+        let clustering_values = Float32Array::from(flat_clustering_embeddings);
+        let clustering_embedding_array = FixedSizeListArray::new(
             Arc::new(Field::new("item", DataType::Float32, true)),
             self.dim as i32,
-            Arc::new(query_values),
+            Arc::new(clustering_values),
             None,
         );
 
@@ -659,10 +668,30 @@ impl LanceStore {
                 Arc::new(Int32Array::from(chunk_token_starts)),
                 Arc::new(Int32Array::from(doc_token_lens)),
                 Arc::new(embedding_array) as Arc<dyn arrow_array::Array>,
-                Arc::new(query_embedding_array) as Arc<dyn arrow_array::Array>,
+                Arc::new(clustering_embedding_array) as Arc<dyn arrow_array::Array>,
                 Arc::new(StringArray::from(contents)),
             ],
         )
         .map_err(|e| StoreError::Internal(format!("batch construction failed: {}", e)))
     }
+}
+
+/// URI-percent-encode each segment of a domain path (`org/team`) so any
+/// character is safe in a filesystem directory name. The `/` separator is
+/// preserved as the segment boundary.
+///
+/// This replaces the old `domain.replace('/', "__")` encoding. Existing
+/// on-disk datasets using `__` are incompatible — a clean re-index is required.
+fn encode_domain_path(domain: &str) -> String {
+    use form_urlencoded::byte_serialize;
+    domain
+        .split('/')
+        .map(|segment| {
+            // Encode each segment. `byte_serialize` percent-encodes everything
+            // that is not in the unreserved set (alphanumerics + `-._~`).
+            // This is safe for filesystem paths on all platforms.
+            byte_serialize(segment.as_bytes()).collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("__")
 }

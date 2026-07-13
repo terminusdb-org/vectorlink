@@ -105,6 +105,56 @@ pub async fn io_ensure_vector_index(
     Ok(ds.version().version)
 }
 
+/// Index name for the vector ANN index on `clustering_embedding`.
+pub const CLUSTERING_INDEX_NAME: &str = "clustering_embedding_ann";
+
+/// Ensure a vector ANN index exists on the `clustering_embedding` column.
+///
+/// Only called when `store_clustering` is enabled for the domain. Uses the same
+/// IVF_HNSW_SQ index type and cosine distance as the document embedding index.
+/// Returns the dataset version after index creation/optimization.
+pub async fn io_ensure_clustering_vector_index(
+    ds: &mut Dataset,
+    config: &VectorIndexConfig,
+) -> Result<u64, StoreError> {
+    let indices = ds
+        .load_indices()
+        .await
+        .map_err(|e| StoreError::Internal(format!("load indices failed: {}", e)))?;
+
+    let has_clustering_idx = indices.iter().any(|idx| idx.name == CLUSTERING_INDEX_NAME);
+
+    if !has_clustering_idx {
+        let row_count = ds
+            .count_rows(None)
+            .await
+            .map_err(|e| StoreError::Internal(format!("count rows failed: {}", e)))?;
+
+        let ivf_min_training_vectors: usize = 256;
+        let min_rows_for_index = config.num_partitions.max(ivf_min_training_vectors);
+        if row_count < min_rows_for_index {
+            return Ok(ds.version().version);
+        }
+
+        let params = build_vector_index_params(config);
+        ds.create_index(
+            &["clustering_embedding"],
+            IndexType::Vector,
+            Some(CLUSTERING_INDEX_NAME.to_owned()),
+            &params,
+            false,
+        )
+        .await
+        .map_err(|e| StoreError::Internal(format!("clustering vector index creation failed: {}", e)))?;
+    } else {
+        ds.optimize_indices(&OptimizeOptions::append())
+            .await
+            .map_err(|e| StoreError::Internal(format!("clustering vector index optimize failed: {}", e)))?;
+    }
+
+    Ok(ds.version().version)
+}
+
 /// Count the number of unindexed fragments for the vector index.
 /// Returns 0 if no vector index exists (pre-creation state).
 ///
@@ -225,7 +275,7 @@ mod tests {
             chunk_token_start: 0,
             doc_token_len: 100,
             embedding: seeded_normalized_embedding(dim, seed),
-            query_embedding: seeded_normalized_embedding(dim, seed + 10000),
+            clustering_embedding: seeded_normalized_embedding(dim, seed + 10000),
             content: format!("content for {}", doc_id),
         }
     }
@@ -441,7 +491,7 @@ mod tests {
             chunk_token_start: 0,
             doc_token_len: 50,
             embedding: seeded_normalized_embedding(dim, new_doc_seed),
-            query_embedding: seeded_normalized_embedding(dim, new_doc_seed + 10000),
+            clustering_embedding: seeded_normalized_embedding(dim, new_doc_seed + 10000),
             content: "brand new unindexed document".to_owned(),
         };
         store

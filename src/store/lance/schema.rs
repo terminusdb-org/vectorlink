@@ -12,10 +12,11 @@ pub struct ChunkRow {
     pub chunk_token_start: i32,
     pub doc_token_len: i32,
     pub embedding: Vec<f32>,
-    /// Query-role embedding (search_query: prefix). STORED but NOT INDEXED — the
-    /// only ANN index remains on `embedding`. Used by /resolve and /duplicates to
-    /// probe with the asymmetric query→document signal (Phase 6A Step 5).
-    pub query_embedding: Vec<f32>,
+    /// Clustering-role embedding (clustering: prefix). STORED but NOT INDEXED by
+    /// default — the only ANN index remains on `embedding`. When clustering is
+    /// enabled for the domain, an ANN index is also created on this column.
+    /// Populated with zeros when `store_clustering` is disabled.
+    pub clustering_embedding: Vec<f32>,
     pub content: String,
 }
 
@@ -97,11 +98,10 @@ pub struct ChunkHit {
     /// vector directly instead of re-embedding the source text. Ranked search/FTS
     /// paths leave this empty (they rank by `_distance`/`_score`, not the raw vector).
     pub embedding: Vec<f32>,
-    /// The L2-normalised QUERY-role embedding vector as STORED at insert time.
-    /// Populated only by the plain doc-chunk lookup path (`io_lookup_doc_chunks`),
-    /// so `/similar` can use the asymmetric query→document probe signal. Ranked
-    /// search/FTS paths leave this empty.
-    pub query_embedding: Vec<f32>,
+    /// The L2-normalised CLUSTERING-role embedding vector as STORED at insert
+    /// time. Populated only by the plain doc-chunk lookup path
+    /// (`io_lookup_doc_chunks`). Ranked search/FTS paths leave this empty.
+    pub clustering_embedding: Vec<f32>,
 }
 
 /// Default Lance branch name. Layout (A) maps TerminusDB's `main` branch to

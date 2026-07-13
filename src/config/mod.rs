@@ -5,6 +5,104 @@
 
 use crate::embed::Provider;
 
+/// Per-domain settings persisted in `domain_settings.json`.
+///
+/// Controls optional indexing features such as clustering embeddings.
+/// Settings are set on first push for a new domain and are immutable
+/// thereafter — changing a setting requires a full reindex (delete + re-push).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct DomainSettings {
+    /// When `true`, the indexing pipeline generates a second embedding per chunk
+    /// using `EmbeddingRole::Clustering` and stores it in the `clustering_embedding`
+    /// column. The `/candidates` endpoint performs a dual KNN gather to produce
+    /// `clustering_distance`. Defaults to `false` (one embedding call per chunk).
+    #[serde(default)]
+    pub store_clustering: bool,
+}
+
+/// In-memory map of domain → settings, loaded from `domain_settings.json` at
+/// startup and held for the lifetime of the process. Writes are rare (first
+/// push only), so a simple `RwLock<HashMap>` suffices.
+#[derive(Debug, Clone, Default)]
+pub struct DomainSettingsMap {
+    settings: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, DomainSettings>>>,
+    /// Path to the `domain_settings.json` file (for persistence).
+    path: std::path::PathBuf,
+}
+
+impl DomainSettingsMap {
+    /// Load domain settings from `domain_settings.json` in the given data
+    /// directory. If the file does not exist, starts with an empty map (all
+    /// domains default to `store_clustering: false`).
+    pub fn load(data_dir: &std::path::Path) -> Self {
+        let path = data_dir.join("domain_settings.json");
+        let settings = if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(contents) => {
+                    serde_json::from_str::<std::collections::HashMap<String, DomainSettings>>(
+                        &contents,
+                    )
+                    .unwrap_or_default()
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] warning: failed to read {}, starting with empty settings",
+                        path.display()
+                    );
+                    std::collections::HashMap::new()
+                }
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        Self {
+            settings: std::sync::Arc::new(tokio::sync::RwLock::new(settings)),
+            path,
+        }
+    }
+
+    /// Create an empty settings map (for tests).
+    pub fn new_empty() -> Self {
+        Self {
+            settings: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            path: std::path::PathBuf::new(),
+        }
+    }
+
+    /// Get the settings for a domain. Returns `DomainSettings::default()` if
+    /// the domain is not in the map (clustering OFF by default).
+    pub async fn get(&self, domain: &str) -> DomainSettings {
+        let settings = self.settings.read().await;
+        settings
+            .get(domain)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Set settings for a domain. Persists to `domain_settings.json` if a path
+    /// was configured. Should only be called for new domains (first push).
+    pub async fn set(&self, domain: &str, settings: DomainSettings) {
+        let mut map = self.settings.write().await;
+        map.insert(domain.to_owned(), settings.clone());
+        drop(map);
+
+        if !self.path.as_os_str().is_empty() {
+            let map = self.settings.read().await;
+            if let Ok(json) = serde_json::to_string_pretty(&*map) {
+                let _ = std::fs::write(&self.path, json);
+            }
+        }
+    }
+
+    /// Check whether a domain has clustering enabled.
+    pub async fn store_clustering(&self, domain: &str) -> bool {
+        self.get(domain).await.store_clustering
+    }
+}
+
 /// Default batch size for cross-document embedding (PO decision, 2026-06-15).
 /// Past the knee of the latency curve (88.8 ms/embed at bs=32 vs 228.8 at bs=1).
 const DEFAULT_EMBED_BATCH_SIZE: usize = 32;

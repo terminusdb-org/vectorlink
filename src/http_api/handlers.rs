@@ -17,6 +17,7 @@ use super::AppState;
 use crate::embed::EmbeddingRole;
 use crate::kernel::error::ServiceError;
 use crate::kernel::model::{Operation, ProgressUpdate, TaskStatus};
+use crate::kernel::model::{parse_domain, Domain};
 
 // ─────────────────────────── Query param structs ──────────────────────────
 
@@ -33,6 +34,10 @@ pub struct PushParams {
     pub target_commit: Option<String>,
     pub parent_commit: Option<String>,
     pub stream: Option<bool>,
+    /// When `true` and the domain is new (no existing dataset), enables
+    /// clustering embedding generation at index time. Ignored if the domain
+    /// already exists (the existing setting wins). Defaults to `false`.
+    pub store_clustering: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -343,6 +348,35 @@ async fn handle_push(
     };
 
     let is_stream = params.stream.unwrap_or(false);
+
+    // Per-domain clustering setting: only honored for new domains (no existing
+    // dataset). If the domain already exists, the existing setting wins.
+    if let Some(true) = params.store_clustering {
+        let rp = parse_domain(&domain)
+            .map_err(|e| {
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid domain: {}", e),
+                )
+            })
+            .ok();
+        if let Some(rp) = rp {
+            let domain_obj = Domain::from_resource_path(&rp);
+            let domain_str = domain_obj.as_str().to_owned();
+            let dataset_exists = state.service.store.dataset_path(&domain_str).exists();
+            if !dataset_exists {
+                state
+                    .service
+                    .store
+                    .domain_settings
+                    .set(
+                        &domain_str,
+                        crate::config::DomainSettings { store_clustering: true },
+                    )
+                    .await;
+            }
+        }
+    }
 
     // Stream the NDJSON body incrementally, sending each parsed operation
     // through a channel to the indexing pipeline. This enables true
@@ -1111,6 +1145,39 @@ async fn handle_statistics(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct EmbeddingsParams {
+    pub domain: String,
+    /// Comma-separated list of doc IDs to fetch embeddings for.
+    pub doc_ids: String,
+    /// Nearest-first ancestor window (same contract as /search).
+    pub ancestors: Option<Vec<String>>,
+}
+
+async fn handle_embeddings(
+    State(state): State<AppState>,
+    Query(params): Query<EmbeddingsParams>,
+) -> Response {
+    let doc_ids: Vec<String> = params
+        .doc_ids
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if doc_ids.is_empty() {
+        return (StatusCode::BAD_REQUEST, "doc_ids parameter is required and must not be empty")
+            .into_response();
+    }
+
+    let ancestors = params.ancestors.unwrap_or_default();
+
+    match state.service.fetch_embeddings(&params.domain, &doc_ids, &ancestors).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(e) => service_error_to_response(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
 pub struct DeleteDomainParams {
     pub domain: Option<String>,
 }
@@ -1447,6 +1514,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/compact", post(handle_compact))
         .route("/compare", post(handle_compare))
         .route("/statistics", get(handle_statistics))
+        .route("/embeddings", get(handle_embeddings))
         .route("/domain", delete(handle_delete_domain))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 

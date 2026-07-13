@@ -334,7 +334,7 @@ async fn io_index_one(
             .await
             .map_err(|e| format!("embedding (doc) failed: {}", e))?;
     let mut embeddings_query =
-        embed::io_embed(provider, &chunk_texts, EmbeddingRole::Query, http_client)
+        embed::io_embed(provider, &chunk_texts, EmbeddingRole::Clustering, http_client)
             .await
             .map_err(|e| format!("embedding (query) failed: {}", e))?;
 
@@ -365,7 +365,7 @@ async fn io_index_one(
     let rows: Vec<ChunkRow> = chunks
         .iter()
         .zip(embeddings_doc.into_iter().zip(embeddings_query))
-        .map(|(ch, (embedding, query_embedding))| ChunkRow {
+        .map(|(ch, (embedding, clustering_embedding))| ChunkRow {
             doc_id: doc_id.to_owned(),
             doc_type: doc_type.clone(),
             chunk_index: ch.index as i32,
@@ -373,7 +373,7 @@ async fn io_index_one(
             chunk_token_start: ch.token_start as i32,
             doc_token_len: ch.doc_token_len as i32,
             embedding,
-            query_embedding,
+            clustering_embedding,
             content: ch.text.clone(),
         })
         .collect();

@@ -26,11 +26,27 @@ use crate::store::lance::{
 
 use serde::Serialize;
 
+/// Response body for GET /embeddings.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingsResult {
+    /// Document-role embeddings keyed by doc_id.
+    pub doc_embeddings: std::collections::HashMap<String, Vec<f32>>,
+    /// Clustering-role embeddings keyed by doc_id (empty when clustering disabled).
+    pub clustering_embeddings: std::collections::HashMap<String, Vec<f32>>,
+    /// Whether clustering embeddings are stored for this domain.
+    pub store_clustering: bool,
+    /// The commit that was searched.
+    pub served_commit: String,
+}
+
 /// A single candidate neighbour in the /candidates response.
 #[derive(Debug, Clone, Serialize)]
 pub struct CandidateEntry {
     pub id: String,
     pub distance: f32,
+    /// Clustering-role distance (only present when clustering is enabled for the domain).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clustering_distance: Option<f32>,
     /// Embedding of the neighbour doc (only present if requested via `include`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
@@ -47,6 +63,8 @@ pub struct CandidatesStats {
     pub target_points: usize,
     pub set_to_target_edges: usize,
     pub target_to_set_edges: usize,
+    /// Whether clustering_distance is populated for this domain.
+    pub store_clustering: bool,
 }
 
 /// Response body for POST /candidates.
@@ -65,7 +83,7 @@ const HEAVY_SCAN_MAX_CONCURRENT: usize = 4;
 /// The search service — owns the store and config, provides the transport-agnostic API.
 #[derive(Clone)]
 pub struct SearchService {
-    store: Arc<LanceStore>,
+    pub store: Arc<LanceStore>,
     config: Config,
     tokenizer: Arc<Tokenizer>,
     chunk_params: ChunkParams,
@@ -687,45 +705,11 @@ impl SearchService {
         let results = dedup_chunks_to_documents(chunk_hits, snippet);
 
         // Apply pagination.
-        let mut paginated: Vec<SearchHit> = results
+        let paginated: Vec<SearchHit> = results
             .into_iter()
             .skip(start)
             .take(count)
             .collect();
-
-        // SAME-ROLE EXACT-DUPLICATE OVERRIDE (query↔query): for each result,
-        // compare the incoming QUERY embedding (the embedded search text) with the
-        // result's stored query_embedding. If bit-identical (the search text IS the
-        // original document's text embedded in query role) → distance = 0.
-        let result_ids: Vec<String> = paginated.iter().map(|h| h.id.clone()).collect();
-        if !result_ids.is_empty() {
-            let result_query_embeddings = self
-                .store
-                .io_fetch_result_embeddings(
-                    &domain_str,
-                    &branch,
-                    &served_commit,
-                    &result_ids,
-                    "query_embedding",
-                )
-                .await
-                .map_err(|e| ServiceError::Internal(e.to_string()))?;
-
-            for hit in &mut paginated {
-                if let Some(stored_qe) = result_query_embeddings.get(&hit.id) {
-                    if crate::kernel::distance::vectors_equal(&query_embedding, stored_qe) {
-                        hit.distance = 0.0;
-                    }
-                }
-            }
-
-            // Re-sort after override: a hit that moved to 0.0 should sort first.
-            paginated.sort_by(|a, b| {
-                a.distance
-                    .partial_cmp(&b.distance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
 
         Ok(SearchOutcome {
             hits: paginated,
@@ -1398,22 +1382,66 @@ impl SearchService {
             std::collections::HashMap::new()
         };
 
+        // Fetch clustering embeddings if clustering is enabled for the domain.
+        let store_clustering = self.store.domain_settings.store_clustering(&domain_str).await;
+        let clustering_embeddings: std::collections::HashMap<String, Vec<f32>> = if store_clustering {
+            // Fetch clustering embeddings for ALL docs involved (both sources and neighbours).
+            let mut all_ids: std::collections::HashSet<String> = all_doc_ids.iter().cloned().collect();
+            for id in maps.set_to_target.keys() {
+                all_ids.insert(id.clone());
+            }
+            for id in maps.target_to_set.keys() {
+                all_ids.insert(id.clone());
+            }
+            let all_ids_vec: Vec<String> = all_ids.into_iter().collect();
+            self.store
+                .io_fetch_result_embeddings(
+                    &domain_str,
+                    &branch,
+                    &served_commit,
+                    &all_ids_vec,
+                    "clustering_embedding",
+                )
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?
+        } else {
+            std::collections::HashMap::new()
+        };
+
         // Convert Neighbour maps to CandidateEntry maps.
-        let convert = |nbrs: &Vec<crate::resolve::Neighbour>| -> Vec<CandidateEntry> {
+        // When clustering is enabled, compute clustering_distance as the cosine
+        // distance between the source doc's clustering_embedding and the neighbour's
+        // clustering_embedding (both L2-normalised → distance = 1 - dot_product).
+        let convert = |src_id: &str, nbrs: &Vec<crate::resolve::Neighbour>| -> Vec<CandidateEntry> {
+            let src_clustering = clustering_embeddings.get(src_id);
             nbrs.iter()
-                .map(|n| CandidateEntry {
-                    id: n.id.clone(),
-                    distance: n.distance,
-                    embedding: if include_embeddings {
-                        doc_embeddings.get(&n.id).cloned()
+                .map(|n| {
+                    let clustering_distance = if store_clustering {
+                        match (src_clustering, clustering_embeddings.get(&n.id)) {
+                            (Some(src), Some(nbr)) => {
+                                let dot: f32 = src.iter().zip(nbr.iter()).map(|(a, b)| a * b).sum();
+                                Some((1.0 - dot).max(0.0))
+                            }
+                            _ => None,
+                        }
                     } else {
                         None
-                    },
-                    content: if include_content {
-                        doc_contents.get(&n.id).cloned()
-                    } else {
-                        None
-                    },
+                    };
+                    CandidateEntry {
+                        id: n.id.clone(),
+                        distance: n.distance,
+                        clustering_distance,
+                        embedding: if include_embeddings {
+                            doc_embeddings.get(&n.id).cloned()
+                        } else {
+                            None
+                        },
+                        content: if include_content {
+                            doc_contents.get(&n.id).cloned()
+                        } else {
+                            None
+                        },
+                    }
                 })
                 .collect()
         };
@@ -1421,13 +1449,13 @@ impl SearchService {
         let set_to_target: std::collections::HashMap<String, Vec<CandidateEntry>> =
             maps.set_to_target
                 .iter()
-                .map(|(id, nbrs)| (id.clone(), convert(nbrs)))
+                .map(|(id, nbrs)| (id.clone(), convert(id, nbrs)))
                 .collect();
 
         let target_to_set: std::collections::HashMap<String, Vec<CandidateEntry>> =
             maps.target_to_set
                 .iter()
-                .map(|(id, nbrs)| (id.clone(), convert(nbrs)))
+                .map(|(id, nbrs)| (id.clone(), convert(id, nbrs)))
                 .collect();
 
         let set_to_target_edges: usize = set_to_target.values().map(|v| v.len()).sum();
@@ -1444,6 +1472,7 @@ impl SearchService {
                 target_points: maps.target_to_set.len(),
                 set_to_target_edges,
                 target_to_set_edges,
+                store_clustering,
             },
         })
     }
@@ -1462,6 +1491,55 @@ impl SearchService {
         let domain_str = domain.as_str().to_owned();
 
         Ok(self.store.statistics_for_domain(&domain_str).await)
+    }
+
+    /// Fetch stored embeddings for a set of doc IDs.
+    /// Returns both document and clustering embeddings (clustering only when enabled).
+    pub async fn fetch_embeddings(
+        &self,
+        domain_raw: &str,
+        doc_ids: &[String],
+        ancestors: &[String],
+    ) -> Result<EmbeddingsResult, ServiceError> {
+        let rp =
+            parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
+
+        if !self.is_search_ready() {
+            return Err(ServiceError::Unavailable(
+                "search capability not ready (embedding backend cold)".to_owned(),
+            ));
+        }
+
+        let domain = Domain::from_resource_path(&rp);
+        let domain_str = domain.as_str().to_owned();
+        let branch = extract_branch(&rp);
+
+        let served_commit = self
+            .resolve_searchable_commit(&domain, &branch, "", ancestors)
+            .await?;
+
+        let doc_embeddings = self
+            .store
+            .io_fetch_result_embeddings(&domain_str, &branch, &served_commit, doc_ids, "embedding")
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        let store_clustering = self.store.domain_settings.store_clustering(&domain_str).await;
+        let clustering_embeddings = if store_clustering {
+            self.store
+                .io_fetch_result_embeddings(&domain_str, &branch, &served_commit, doc_ids, "clustering_embedding")
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        Ok(EmbeddingsResult {
+            doc_embeddings,
+            clustering_embeddings,
+            store_clustering,
+            served_commit,
+        })
     }
 
     /// Delete a domain's ENTIRE footprint: the `{domain}.lance` dataset (all
@@ -1565,7 +1643,7 @@ impl SearchService {
     /// `source` is embedded with `EmbeddingRole::Document`, `target` with `EmbeddingRole::Document`.
     /// Both vectors are L2-normalized, then the normalized cosine distance is computed on
     /// the same [0, 1] reference scale that `/search`, `/similar`, `/duplicates`, and
-    /// `/resolve` return (0 = identical, ~0.5 = unrelated, 1 = opposite).
+    /// `/candidates` return (0 = identical, ~0.5 = unrelated, 1 = opposite).
     pub async fn compare(
         &self,
         source: &str,
@@ -1838,13 +1916,14 @@ async fn io_run_index_pipeline(
         doc_flat_ranges.push((start, doc.chunks.len()));
     }
 
-    // ─── COLLECT phase C: batch-embed all texts (DUAL — Document + Query) ───
-    // Phase 6A Step 5: embed each chunk TWICE — once with Document role (for the
-    // ANN-indexed `embedding` column) and once with Query role (for the stored
-    // `query_embedding` column used by /resolve and /duplicates to probe with the
-    // asymmetric query→document signal). Embed time ~doubles, mitigated by Step 3
-    // batching (batch_size=32). Index build time does NOT double — only ONE ANN
-    // index exists (on `embedding`).
+    // ─── COLLECT phase C: batch-embed all texts (DUAL — Document + Clustering) ───
+    // Embed each chunk TWICE — once with Document role (for the ANN-indexed
+    // `embedding` column) and once with Clustering role (for the stored
+    // `clustering_embedding` column used by /candidates dual KNN gather).
+    // When clustering is disabled for the domain, the second embedding call is
+    // skipped and zeros are stored instead (saves embed time + bandwidth).
+    let store_clustering = ctx.store.domain_settings.store_clustering(ctx.domain).await;
+
     let embed_results_doc = embed::io_embed_batched(
         ctx.provider,
         &flat_texts,
@@ -1854,14 +1933,22 @@ async fn io_run_index_pipeline(
     )
     .await;
 
-    let embed_results_query = embed::io_embed_batched(
-        ctx.provider,
-        &flat_texts,
-        ctx.embed_batch_size,
-        EmbeddingRole::Query,
-        ctx.http_client,
-    )
-    .await;
+    let embed_results_query = if store_clustering {
+        embed::io_embed_batched(
+            ctx.provider,
+            &flat_texts,
+            ctx.embed_batch_size,
+            EmbeddingRole::Clustering,
+            ctx.http_client,
+        )
+        .await
+    } else {
+        // Clustering disabled — fill with zeros (same dimension, no embed call).
+        flat_texts
+            .iter()
+            .map(|_| EmbedResult::Ok(vec![0.0; ctx.store.dim]))
+            .collect::<Vec<_>>()
+    };
 
     // ─── COLLECT phase D: scatter BOTH embedding sets → build ChunkRows ─────
     // For each doc, check that ALL its chunk embeddings (BOTH roles) succeeded.
@@ -1951,7 +2038,7 @@ async fn io_run_index_pipeline(
             .chunks
             .iter()
             .zip(embeddings_doc.into_iter().zip(embeddings_query))
-            .map(|(chunk, (embedding, query_embedding))| ChunkRow {
+            .map(|(chunk, (embedding, clustering_embedding))| ChunkRow {
                 doc_id: doc.id.clone(),
                 doc_type: doc_type.clone(),
                 chunk_index: chunk.index as i32,
@@ -1959,7 +2046,7 @@ async fn io_run_index_pipeline(
                 chunk_token_start: chunk.token_start as i32,
                 doc_token_len: chunk.doc_token_len as i32,
                 embedding,
-                query_embedding,
+                clustering_embedding,
                 content: chunk.text.clone(),
             })
             .collect();
@@ -2003,7 +2090,7 @@ async fn io_run_index_pipeline(
         // Optimize indices on an UNCACHED handle (Fix #2: doesn't block searches).
         // FTS + vector ANN are built incrementally via optimize_indices(append()) — O(delta).
         // This runs BEFORE tagging so the tagged version has full index coverage (BLOCKER-1 fix).
-        let indexed_version = io_optimize_on_uncached_handle(ctx.store, ctx.domain, ctx.branch)
+        let indexed_version = io_optimize_on_uncached_handle(ctx.store, ctx.domain, ctx.branch, store_clustering)
             .await
             .map_err(|e| format!("index optimization failed: {}", e))?;
 
@@ -2183,6 +2270,11 @@ async fn io_run_index_pipeline_stream(
     // Batch-embed in groups, sending progress after each batch.
     // This gives real-time trickling feedback during the embedding phase
     // rather than a single update after all embeddings are done.
+    //
+    // Clustering embeddings are only generated when store_clustering is enabled
+    // for the domain; otherwise zeros are stored (saves embed time + bandwidth).
+    let store_clustering = ctx.store.domain_settings.store_clustering(ctx.domain).await;
+
     let mut embed_results_doc: Vec<EmbedResult> = Vec::with_capacity(flat_texts.len());
     let mut embed_results_query: Vec<EmbedResult> = Vec::with_capacity(flat_texts.len());
 
@@ -2198,14 +2290,18 @@ async fn io_run_index_pipeline_stream(
             ctx.http_client,
         )
         .await;
-        let batch_query = embed::io_embed_batched(
-            ctx.provider,
-            batch,
-            ctx.embed_batch_size,
-            EmbeddingRole::Query,
-            ctx.http_client,
-        )
-        .await;
+        let batch_query = if store_clustering {
+            embed::io_embed_batched(
+                ctx.provider,
+                batch,
+                ctx.embed_batch_size,
+                EmbeddingRole::Clustering,
+                ctx.http_client,
+            )
+            .await
+        } else {
+            batch.iter().map(|_| EmbedResult::Ok(vec![0.0; ctx.store.dim])).collect::<Vec<_>>()
+        };
 
         embed_results_doc.extend(batch_doc);
         embed_results_query.extend(batch_query);
@@ -2315,7 +2411,7 @@ async fn io_run_index_pipeline_stream(
             .chunks
             .iter()
             .zip(embeddings_doc.into_iter().zip(embeddings_query))
-            .map(|(chunk, (embedding, query_embedding))| ChunkRow {
+            .map(|(chunk, (embedding, clustering_embedding))| ChunkRow {
                 doc_id: doc.id.clone(),
                 doc_type: doc_type.clone(),
                 chunk_index: chunk.index as i32,
@@ -2323,7 +2419,7 @@ async fn io_run_index_pipeline_stream(
                 chunk_token_start: chunk.token_start as i32,
                 doc_token_len: chunk.doc_token_len as i32,
                 embedding,
-                query_embedding,
+                clustering_embedding,
                 content: chunk.text.clone(),
             })
             .collect();
@@ -2357,7 +2453,7 @@ async fn io_run_index_pipeline_stream(
             }
         };
 
-        let indexed_version = match io_optimize_on_uncached_handle(ctx.store, ctx.domain, ctx.branch).await {
+        let indexed_version = match io_optimize_on_uncached_handle(ctx.store, ctx.domain, ctx.branch, store_clustering).await {
             Ok(v) => v,
             Err(e) => {
                 let msg = format!("index optimization failed: {}", e);
@@ -2455,6 +2551,7 @@ async fn io_optimize_on_uncached_handle(
     store: &LanceStore,
     domain: &str,
     branch: &str,
+    store_clustering: bool,
 ) -> Result<Option<u64>, String> {
     let ds = store
         .io_open_dataset_uncached(domain, branch)
@@ -2485,6 +2582,13 @@ async fn io_optimize_on_uncached_handle(
             crate::store::vector_index::io_ensure_vector_index(&mut ds, &vector_config)
                 .await
                 .map_err(|e| format!("vector optimize failed: {}", e))?;
+
+            // Clustering vector ANN: only when clustering is enabled for the domain.
+            if store_clustering {
+                crate::store::vector_index::io_ensure_clustering_vector_index(&mut ds, &vector_config)
+                    .await
+                    .map_err(|e| format!("clustering vector optimize failed: {}", e))?;
+            }
 
             Ok::<u64, String>(ds.version().version)
         })
@@ -2572,7 +2676,7 @@ mod tests_risk26 {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: vec![0.1; 8],
-            query_embedding: vec![0.1; 8],
+            clustering_embedding: vec![0.1; 8],
             content: "seed".to_owned(),
         };
         let v_seed = store
@@ -2641,7 +2745,7 @@ mod tests_risk26 {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: vec![0.1; 8],
-            query_embedding: vec![0.1; 8],
+            clustering_embedding: vec![0.1; 8],
             content: "seed".to_owned(),
         };
         let v_seed = store
@@ -2696,7 +2800,7 @@ mod tests_risk26 {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: vec![0.1; 8],
-            query_embedding: vec![0.1; 8],
+            clustering_embedding: vec![0.1; 8],
             content: "seed".to_owned(),
         };
         let v_seed = store
@@ -2759,7 +2863,7 @@ mod tests_risk26 {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: vec![0.1; 8],
-            query_embedding: vec![0.1; 8],
+            clustering_embedding: vec![0.1; 8],
             content: "seed".to_owned(),
         };
         let v_seed = store
@@ -2799,7 +2903,7 @@ mod tests_risk26 {
             chunk_token_start: 0,
             doc_token_len: 10,
             embedding: vec![0.2; 8],
-            query_embedding: vec![0.2; 8],
+            clustering_embedding: vec![0.2; 8],
             content: "new document".to_owned(),
         };
         let v_normal = store
@@ -2951,7 +3055,7 @@ mod tests_streaming {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: vec![0.1; 8],
-            query_embedding: vec![0.1; 8],
+            clustering_embedding: vec![0.1; 8],
             content: "seed".to_owned(),
         };
         let v_seed = store
@@ -3009,7 +3113,7 @@ mod tests_streaming {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: vec![0.1; 8],
-            query_embedding: vec![0.1; 8],
+            clustering_embedding: vec![0.1; 8],
             content: "seed".to_owned(),
         };
         let v_seed = store
@@ -3068,7 +3172,7 @@ mod tests_streaming {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: vec![0.1; 8],
-            query_embedding: vec![0.1; 8],
+            clustering_embedding: vec![0.1; 8],
             content: "seed".to_owned(),
         };
         let v_seed = store
@@ -3125,7 +3229,7 @@ mod tests_streaming {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: vec![0.1; 8],
-            query_embedding: vec![0.1; 8],
+            clustering_embedding: vec![0.1; 8],
             content: "seed".to_owned(),
         };
         let v_seed = store
@@ -3213,8 +3317,8 @@ mod tests_exact_duplicate_override {
     }
 
     /// Seed a store with two documents:
-    /// - doc_a with embedding `emb_a` and query_embedding `qemb_a`
-    /// - doc_b with embedding `emb_b` and query_embedding `qemb_b`
+    /// - doc_a with embedding `emb_a` and clustering_embedding `qemb_a`
+    /// - doc_b with embedding `emb_b` and clustering_embedding `qemb_b`
     ///
     /// Tags the commit and returns the domain string.
     async fn seed_two_docs(
@@ -3233,7 +3337,7 @@ mod tests_exact_duplicate_override {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: emb_a,
-            query_embedding: qemb_a,
+            clustering_embedding: qemb_a,
             content: "content of doc a".to_owned(),
         };
         let row_b = ChunkRow {
@@ -3244,7 +3348,7 @@ mod tests_exact_duplicate_override {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: emb_b,
-            query_embedding: qemb_b,
+            clustering_embedding: qemb_b,
             content: "content of doc b".to_owned(),
         };
 
@@ -3512,7 +3616,7 @@ mod tests_exact_duplicate_override {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: emb.clone(),
-            query_embedding: qemb_a,
+            clustering_embedding: qemb_a,
             content: "set item content".to_owned(),
         };
         let row_b = ChunkRow {
@@ -3523,7 +3627,7 @@ mod tests_exact_duplicate_override {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: emb.clone(), // IDENTICAL doc embedding.
-            query_embedding: qemb_b,
+            clustering_embedding: qemb_b,
             content: "target item content".to_owned(),
         };
 
@@ -3609,7 +3713,7 @@ mod tests_exact_duplicate_override {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: emb_a,
-            query_embedding: qemb_a,
+            clustering_embedding: qemb_a,
             content: "set item content".to_owned(),
         };
         let row_b = ChunkRow {
@@ -3620,7 +3724,7 @@ mod tests_exact_duplicate_override {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: emb_b, // DIFFERENT doc embedding.
-            query_embedding: qemb_b,
+            clustering_embedding: qemb_b,
             content: "target item content".to_owned(),
         };
 
@@ -3705,7 +3809,7 @@ mod tests_exact_duplicate_override {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: emb_a.clone(),
-            query_embedding: make_embedding(dim, 2.0),
+            clustering_embedding: make_embedding(dim, 2.0),
             content: "x".to_owned(),
         };
         let row_b = ChunkRow {
@@ -3716,7 +3820,7 @@ mod tests_exact_duplicate_override {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: emb_b.clone(),
-            query_embedding: make_embedding(dim, 3.0),
+            clustering_embedding: make_embedding(dim, 3.0),
             content: "y".to_owned(),
         };
 
@@ -3762,9 +3866,9 @@ mod tests_exact_duplicate_override {
         );
     }
 
-    /// io_fetch_result_embeddings with query_embedding column.
+    /// io_fetch_result_embeddings with clustering_embedding column.
     #[tokio::test]
-    async fn fetch_result_query_embeddings_returns_stored_vectors() {
+    async fn fetch_result_clustering_embeddings_returns_stored_vectors() {
         let dim = 8;
         let tmp = tempfile::tempdir().expect("temp dir");
         let store = LanceStore::new(tmp.path(), dim);
@@ -3780,7 +3884,7 @@ mod tests_exact_duplicate_override {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: make_embedding(dim, 1.0),
-            query_embedding: qemb_a.clone(),
+            clustering_embedding: qemb_a.clone(),
             content: "p".to_owned(),
         };
         let row_b = ChunkRow {
@@ -3791,7 +3895,7 @@ mod tests_exact_duplicate_override {
             chunk_token_start: 0,
             doc_token_len: 5,
             embedding: make_embedding(dim, 2.0),
-            query_embedding: qemb_b.clone(),
+            clustering_embedding: qemb_b.clone(),
             content: "q".to_owned(),
         };
 
@@ -3821,7 +3925,7 @@ mod tests_exact_duplicate_override {
                 "main",
                 "c1",
                 &["doc/p".to_owned(), "doc/q".to_owned()],
-                "query_embedding",
+                "clustering_embedding",
             )
             .await
             .expect("fetch must succeed");
@@ -3829,11 +3933,11 @@ mod tests_exact_duplicate_override {
         assert_eq!(result.len(), 2);
         assert!(
             crate::kernel::distance::vectors_equal(result.get("doc/p").unwrap(), &qemb_a),
-            "fetched query_embedding for doc/p must match stored"
+            "fetched clustering_embedding for doc/p must match stored"
         );
         assert!(
             crate::kernel::distance::vectors_equal(result.get("doc/q").unwrap(), &qemb_b),
-            "fetched query_embedding for doc/q must match stored"
+            "fetched clustering_embedding for doc/q must match stored"
         );
     }
 }

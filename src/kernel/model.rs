@@ -255,6 +255,9 @@ pub struct Statistics {
     /// being flat-scanned (correct but slower). Returns to 0 after
     /// `optimize_indices(append())` drains the queue.
     pub pending_index_fragments: u64,
+    /// Whether clustering embeddings are stored for this domain (domain-scoped only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_clustering: Option<bool>,
 }
 
 /// A single member of a near-duplicate group: the document id, and its chunk

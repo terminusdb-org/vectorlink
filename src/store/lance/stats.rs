@@ -78,6 +78,7 @@ impl LanceStore {
             documents: distinct_docs.len() as u64,
             chunks,
             pending_index_fragments,
+            store_clustering: None,
         }
     }
 
@@ -149,6 +150,9 @@ impl LanceStore {
             }
         }
 
+        // Surface clustering flag for this domain.
+        let store_clustering = self.domain_settings.store_clustering(domain).await;
+
         Statistics {
             domains: domains_count,
             branches,
@@ -156,6 +160,7 @@ impl LanceStore {
             documents: distinct_docs.len() as u64,
             chunks,
             pending_index_fragments,
+            store_clustering: Some(store_clustering),
         }
     }
 

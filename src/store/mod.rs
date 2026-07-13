@@ -162,6 +162,7 @@ impl InMemoryStore {
             documents: 0,
             chunks: 0,
             pending_index_fragments: 0,
+            store_clustering: None,
         }
     }
 }
