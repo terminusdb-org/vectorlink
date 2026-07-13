@@ -1422,6 +1422,65 @@ async fn handle_compact(
     }
 }
 
+// ─────────────────────────── Suggest ─────────────────────────────────────
+
+/// GET /suggest?domain=<org/db>&commit=<hash>&q=<partial>&count=11
+///
+/// Typeahead assist: FTS-only (no embedding), returns approximate match count,
+/// completion suggestions, and the first N document IDs for UI typeahead.
+async fn handle_suggest(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(params): Query<SuggestParams>,
+) -> Response {
+    if let Err(r) = validate_data_version_header(&headers) {
+        return r;
+    }
+
+    let domain = match params.domain {
+        Some(d) if !d.is_empty() => d,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing required query parameter: domain".to_owned(),
+            );
+        }
+    };
+    let commit = match params.commit {
+        Some(c) if !c.is_empty() => c,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing required query parameter: commit".to_owned(),
+            );
+        }
+    };
+    let q = match params.q {
+        Some(q) if !q.is_empty() => q,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing required query parameter: q".to_owned(),
+            );
+        }
+    };
+
+    let count = params.count.unwrap_or(11).max(1) as usize;
+    let doc_type_filter = extract_repeated_param(raw_query.as_deref(), "doc_type");
+    let doc_id_filter = extract_repeated_param(raw_query.as_deref(), "doc_id");
+    let ancestors = extract_repeated_param(raw_query.as_deref(), "ancestor");
+
+    match state
+        .service
+        .suggest(&domain, &commit, &q, count, &doc_type_filter, &doc_id_filter, &ancestors)
+        .await
+    {
+        Ok(outcome) => response_with_served_commit(&outcome, &outcome.served_commit),
+        Err(e) => service_error_to_response(e),
+    }
+}
+
 // ─────────────────────────── Router construction ──────────────────────────
 
 pub fn build_router(state: AppState) -> Router {
@@ -1432,6 +1491,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/check", get(handle_check))
         .route("/assign", post(handle_assign))
         .route("/search", get(handle_search_get).post(handle_search_post))
+        .route("/suggest", get(handle_suggest))
         .route("/similar", get(handle_similar).post(handle_similar_post))
         .route("/duplicates", get(handle_duplicates))
         .route("/resolve", post(handle_resolve))

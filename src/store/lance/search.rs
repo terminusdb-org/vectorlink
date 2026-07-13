@@ -11,7 +11,7 @@ use lance_linalg::distance::DistanceType;
 use crate::kernel::error::StoreError;
 use crate::kernel::model::SearchMode;
 
-use super::{ChunkHit, DistanceKind, LanceStore, SearchQuery, MAIN_BRANCH};
+use super::{ChunkHit, DistanceKind, LanceStore, SearchQuery, SuggestQuery, SuggestResult, SuggestHit, MAIN_BRANCH};
 
 impl LanceStore {
     /// Vector/FTS/hybrid search over chunk rows at a given version.
@@ -38,6 +38,238 @@ impl LanceStore {
             SearchMode::Fts => self.fts_search(&snapshot, query).await?,
             SearchMode::Hybrid => self.hybrid_search(&snapshot, query).await?,
         };
+
+        Ok(hits)
+    }
+
+    /// Suggest (typeahead): FTS-only search for partial-query UI assistance.
+    /// No embedding call — uses the existing FTS inverted index directly.
+    /// Returns approximate total match count, completion suggestions extracted
+    /// from matched content, and the first `count` document IDs.
+    pub async fn io_suggest(
+        &self,
+        domain: &str,
+        branch: &str,
+        commit: &str,
+        query: &SuggestQuery,
+    ) -> Result<SuggestResult, StoreError> {
+        let snapshot = self.io_snapshot_from_cache(domain, branch, commit).await?;
+
+        // Over-fetch for dedup (multiple chunks per doc) + completion extraction.
+        // Cap at a reasonable ceiling to bound latency for typeahead.
+        let scan_limit = ((query.count + 1) * 5).min(200) as i64;
+
+        let mut scanner = snapshot.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new(query.query_text.clone()))
+            .map_err(|e| StoreError::Internal(format!("suggest FTS setup failed: {}", e)))?;
+        scanner
+            .limit(Some(scan_limit), None)
+            .map_err(|e| StoreError::Internal(format!("suggest limit failed: {}", e)))?;
+
+        if !query.doc_type_filter.is_empty() || !query.doc_id_filter.is_empty() {
+            let filter = build_filter_expression(&query.doc_type_filter, &query.doc_id_filter);
+            if !filter.is_empty() {
+                scanner
+                    .filter(&filter)
+                    .map_err(|e| StoreError::Internal(format!("suggest filter failed: {}", e)))?;
+            }
+        }
+
+        let stream = match scanner.try_into_stream().await {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("INVERTED index") || msg.contains("full text search") {
+                    // FTS index missing — fall through to substring fallback.
+                    let fallback_hits = self.substring_suggest(&snapshot, query).await.unwrap_or_else(|e2| {
+                        eprintln!("[suggest] substring fallback (stream err) failed: {e2}");
+                        Vec::new()
+                    });
+                    return Ok(self.build_suggest_result(fallback_hits, query));
+                }
+                return Err(StoreError::Internal(format!("suggest stream failed: {}", msg)));
+            }
+        };
+
+        let batches = match stream.try_collect::<Vec<RecordBatch>>().await {
+            Ok(b) => b,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("INVERTED index") || msg.contains("full text search") {
+                    // FTS index missing — fall through to substring fallback.
+                    let fallback_hits = self.substring_suggest(&snapshot, query).await.unwrap_or_else(|e2| {
+                        eprintln!("[suggest] substring fallback (collect err) failed: {e2}");
+                        Vec::new()
+                    });
+                    return Ok(self.build_suggest_result(fallback_hits, query));
+                }
+                return Err(StoreError::Internal(format!("suggest collect failed: {}", msg)));
+            }
+        };
+
+        let chunk_hits = batches_to_fts_hits(&batches);
+
+        // If FTS returned nothing (exact token match failed for a partial query),
+        // fall back to a substring scan. This catches partial-word matches
+        // (e.g. "elect" → "electrical") that the inverted index misses.
+        let chunk_hits = if chunk_hits.is_empty() && !query.query_text.is_empty() {
+            self.substring_suggest(&snapshot, query).await.unwrap_or_else(|e| {
+                eprintln!("[suggest] substring fallback failed: {e}");
+                Vec::new()
+            })
+        } else {
+            chunk_hits
+        };
+
+        Ok(self.build_suggest_result(chunk_hits, query))
+    }
+
+    /// Build the final SuggestResult from chunk hits: dedup to document level,
+    /// sort by distance, extract completions from top snippets, and populate
+    /// each hit with snippet content, match position, and next-words for
+    /// smart compose.
+    fn build_suggest_result(&self, chunk_hits: Vec<ChunkHit>, query: &SuggestQuery) -> SuggestResult {
+        // Dedup to document level (best chunk per doc_id).
+        let mut best_per_doc: std::collections::HashMap<String, ChunkHit> =
+            std::collections::HashMap::new();
+        for hit in chunk_hits {
+            let entry = best_per_doc
+                .entry(hit.doc_id.clone())
+                .or_insert_with(|| hit.clone());
+            if hit.distance < entry.distance {
+                *entry = hit;
+            }
+        }
+
+        let total_approx = best_per_doc.len();
+
+        // Sort by distance (best first) and take count hits.
+        let mut sorted_hits: Vec<(String, f32, String)> = best_per_doc
+            .into_iter()
+            .map(|(id, hit)| (id, hit.distance, hit.content))
+            .collect();
+        sorted_hits.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Build hits with snippet, match position, and next words.
+        let query_lower = query.query_text.to_lowercase();
+        let hits: Vec<SuggestHit> = sorted_hits
+            .iter()
+            .take(query.count)
+            .map(|(id, dist, content)| {
+                let (match_start, match_end, next_words) =
+                    find_match_and_next_words(content, &query_lower);
+                SuggestHit {
+                    id: id.clone(),
+                    distance: *dist,
+                    snippet: Some(content.clone()),
+                    match_start,
+                    match_end,
+                    next_words,
+                }
+            })
+            .collect();
+
+        // Extract completions from the top matched content snippets.
+        let completions = extract_completions(
+            &query.query_text,
+            sorted_hits.iter().take(5).map(|(_, _, content)| content.as_str()).collect(),
+        );
+
+        SuggestResult {
+            total_approx,
+            completions,
+            hits,
+        }
+    }
+
+    /// Substring fallback for suggest: scans the content column with a
+    /// `LIKE '%query%'` filter when the FTS inverted index returns no results.
+    /// This catches partial-word matches (e.g. "elect" → "electrical") that
+    /// the inverted index misses. Uses a linear scan but is bounded by
+    /// `scan_limit` and only triggered when FTS finds nothing.
+    async fn substring_suggest(
+        &self,
+        snapshot: &Dataset,
+        query: &SuggestQuery,
+    ) -> Result<Vec<ChunkHit>, StoreError> {
+        let scan_limit = ((query.count + 1) * 5).min(200) as i64;
+
+        // Scan all rows and filter in Rust — Lance's SQL filter may not
+        // reliably support LIKE for substring matching. This is a fallback
+        // path only triggered when FTS returns nothing, so the linear scan
+        // cost is acceptable.
+        let query_lower = query.query_text.to_lowercase();
+
+        let mut scanner = snapshot.scan();
+        scanner
+            .project(&["doc_id", "chunk_index", "chunk_count", "chunk_token_start", "doc_token_len", "content"])
+            .map_err(|e| StoreError::Internal(format!("substring_suggest project failed: {}", e)))?;
+        scanner
+            .limit(Some(scan_limit), None)
+            .map_err(|e| StoreError::Internal(format!("substring_suggest limit failed: {}", e)))?;
+
+        let stream = scanner
+            .try_into_stream()
+            .await
+            .map_err(|e| StoreError::Internal(format!("substring_suggest stream failed: {}", e)))?;
+
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StoreError::Internal(format!("substring_suggest collect failed: {}", e)))?;
+
+        // Extract hits from non-FTS batches, filtering by substring in Rust.
+        let mut hits = Vec::new();
+        for (batch_idx, batch) in batches.iter().enumerate() {
+            let n = batch.num_rows();
+            let doc_ids = batch
+                .column_by_name("doc_id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let chunk_indexes = batch
+                .column_by_name("chunk_index")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+            let chunk_counts = batch
+                .column_by_name("chunk_count")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+            let chunk_token_starts = batch
+                .column_by_name("chunk_token_start")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+            let doc_token_lens = batch
+                .column_by_name("doc_token_len")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+            let contents = batch
+                .column_by_name("content")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+            if let (Some(ids), Some(ci), Some(cc), Some(cts), Some(dtl), Some(cnt)) =
+                (doc_ids, chunk_indexes, chunk_counts, chunk_token_starts, doc_token_lens, contents)
+            {
+                for i in 0..n {
+                    let content = cnt.value(i);
+                    if !content.to_lowercase().contains(&query_lower) {
+                        continue;
+                    }
+                    // Assign a pseudo-distance based on position — earlier hits rank better.
+                    let distance = 0.5 + (batch_idx as f32 + i as f32 / n as f32) * 0.1;
+                    hits.push(ChunkHit {
+                        doc_id: ids.value(i).to_owned(),
+                        distance: distance.min(1.0),
+                        distance_kind: DistanceKind::Normalised,
+                        chunk_index: ci.value(i),
+                        chunk_count: cc.value(i),
+                        chunk_token_start: cts.value(i),
+                        doc_token_len: dtl.value(i),
+                        content: content.to_owned(),
+                        embedding: Vec::new(),
+                        query_embedding: Vec::new(),
+                    });
+                }
+            }
+        }
 
         Ok(hits)
     }
@@ -575,7 +807,7 @@ pub(super) fn batches_to_vector_hits(
 /// Extract ChunkHit records from RecordBatches (FTS search — reads `_score`).
 /// BM25 scores are converted to distances: `distance = 1/(1+score)` so 0=best.
 /// Results are preserved in stream order (BM25 rank order from Lance).
-fn batches_to_fts_hits(batches: &[RecordBatch]) -> Vec<ChunkHit> {
+pub(super) fn batches_to_fts_hits(batches: &[RecordBatch]) -> Vec<ChunkHit> {
     let mut hits = Vec::new();
 
     for batch in batches {
@@ -629,6 +861,153 @@ fn batches_to_fts_hits(batches: &[RecordBatch]) -> Vec<ChunkHit> {
     hits
 }
 
+/// Find the first occurrence of `query_lower` in `content`, return the byte
+/// offsets of the match and the next few words after it for smart compose.
+///
+/// The match is extended to the full word boundary (e.g. "elect" matching inside
+/// "electrical" extends `match_end` to the end of "electrical"). This ensures
+/// `next_words` starts from the word AFTER the containing word, not from the
+/// partial suffix.
+///
+/// Returns `(match_start, match_end, next_words)`:
+/// - `match_start` / `match_end`: byte offsets of the query match within the
+///   snippet, for UI highlighting (e.g. Lance/React can highlight this range).
+/// - `next_words`: the next words after the match, ordered by proximity. The
+///   first word is the most likely next word. A tab key can cycle through them.
+fn find_match_and_next_words(content: &str, query_lower: &str) -> (Option<usize>, Option<usize>, Vec<String>) {
+    let content_lower = content.to_lowercase();
+    let pos = match content_lower.find(query_lower) {
+        Some(p) => p,
+        None => return (None, None, Vec::new()),
+    };
+
+    // Extend match_end to the end of the containing word (word boundary).
+    let raw_end = pos + query_lower.len();
+    let after_match = &content[raw_end..];
+    let extra = after_match
+        .find(|c: char| c.is_whitespace() || c == '.' || c == ',' || c == ';' || c == ':')
+        .unwrap_or(after_match.len());
+    let match_end = raw_end + extra;
+
+    // Extract up to 5 next words after the full containing word.
+    let mut next_words = Vec::new();
+    let rest = &content[match_end..];
+    let mut cursor = 0usize;
+    for _ in 0..5 {
+        // Skip whitespace AND punctuation.
+        let remaining = &rest[cursor..];
+        let trimmed = remaining.trim_start_matches(|c: char| c.is_whitespace() || c == '.' || c == ',' || c == ';' || c == ':');
+        let skipped = remaining.len() - trimmed.len();
+        let after_ws = cursor + skipped;
+        if after_ws >= rest.len() {
+            break;
+        }
+        // Find the end of the next word.
+        let word_rest = &rest[after_ws..];
+        let word_end_in_rest = word_rest
+            .find(|c: char| c.is_whitespace() || c == '.' || c == ',' || c == ';' || c == ':')
+            .unwrap_or(word_rest.len());
+        if word_end_in_rest == 0 {
+            break;
+        }
+        let word = &rest[after_ws..after_ws + word_end_in_rest];
+        let word_trimmed = word.trim_matches(|c: char| c.is_whitespace() || c == '.' || c == ',' || c == ';' || c == ':');
+        if !word_trimmed.is_empty() {
+            next_words.push(word_trimmed.to_owned());
+        }
+        cursor = after_ws + word_end_in_rest;
+        if cursor >= rest.len() {
+            break;
+        }
+    }
+
+    (Some(pos), Some(match_end), next_words)
+}
+
+/// Extract typeahead completion suggestions from matched content snippets.
+///
+/// Given the user's partial query and a set of matched content strings, produces
+/// a ranked list of completions by finding the query text within each snippet
+/// and extracting multi-word continuations (up to 3 words after the query).
+/// Completions are ranked by frequency across all snippets — the most common
+/// continuation appears first. Returns at most 8 completions.
+pub(super) fn extract_completions(query: &str, snippets: Vec<&str>) -> Vec<String> {
+    let query_lower = query.to_lowercase();
+    // Map: completion (lowercase) → (count, original-cased completion)
+    let mut freq: std::collections::HashMap<String, (usize, String)> =
+        std::collections::HashMap::new();
+
+    for snippet in snippets {
+        let snippet_lower = snippet.to_lowercase();
+        let mut search_from = 0usize;
+        // Find ALL occurrences of the query in this snippet (not just the first).
+        while let Some(pos) = snippet_lower[search_from..].find(&query_lower) {
+            let abs_pos = search_from + pos;
+            let query_end = abs_pos + query_lower.len();
+
+            // Extend to the full word boundary (the containing word).
+            let after_match = &snippet[query_end..];
+            let extra = after_match
+                .find(|c: char| c.is_whitespace() || c == '.' || c == ',' || c == ';' || c == ':')
+                .unwrap_or(after_match.len());
+            let word_end = query_end + extra;
+
+            // Extract up to 3 words after the containing word.
+            let rest = &snippet[word_end..];
+            let words: Vec<&str> = rest
+                .split(|c: char| c.is_whitespace() || c == '.' || c == ',' || c == ';' || c == ':')
+                .filter(|w| !w.is_empty())
+                .take(3)
+                .collect();
+
+            // Build completions of increasing length: containing word, +1word, +2words, +3words.
+            let containing_word = &snippet[abs_pos..word_end];
+            let containing_trimmed = containing_word.trim();
+            if containing_trimmed.len() > query.len() {
+                let completion_lower = containing_trimmed.to_lowercase();
+                let entry = freq
+                    .entry(completion_lower)
+                    .or_insert((0, containing_trimmed.to_owned()));
+                entry.0 += 1;
+            }
+            let mut cumulative = containing_trimmed.to_owned();
+            for w in &words {
+                cumulative.push(' ');
+                cumulative.push_str(w);
+                let completion = cumulative.trim().to_owned();
+                if completion.len() > query.len() {
+                    let completion_lower = completion.to_lowercase();
+                    let entry = freq
+                        .entry(completion_lower)
+                        .or_insert((0, completion.clone()));
+                    entry.0 += 1;
+                    // Keep the first-seen original casing.
+                    if entry.1.is_empty() {
+                        entry.1 = completion;
+                    }
+                }
+            }
+
+            // Move past this match to find the next occurrence.
+            search_from = query_end;
+        }
+    }
+
+    // Sort by frequency (descending), then by completion length (descending —
+    // longer completions are more useful), then alphabetically for determinism.
+    let mut ranked: Vec<(usize, String)> = freq
+        .into_iter()
+        .map(|(_, (count, text))| (count, text))
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.len().cmp(&a.1.len()))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+
+    ranked.into_iter().take(8).map(|(_, text)| text).collect()
+}
+
 /// Reciprocal Rank Fusion: merge two ranked lists into a single list.
 /// RRF score = sum of 1/(k + rank) across all lists where the item appears.
 /// k=60 is the standard constant. Items are keyed by (doc_id, chunk_index).
@@ -669,10 +1048,16 @@ pub(super) fn rrf_merge(vector_hits: Vec<ChunkHit>, fts_hits: Vec<ChunkHit>) -> 
     ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
     // Convert RRF score into a synthetic distance (lower = better).
-    // Normalise: max possible single-list score is 1/(K+1) ≈ 0.0164.
-    // Max combined (rank 1 in both) is 2/(K+1) ≈ 0.0328.
-    // We map to [0, 1] via: distance = 1.0 - (score / max_score).
-    let max_score = 2.0 / (K + 1.0);
+    // Normalise by the ACTUAL max score in this result set so distances
+    // scale smoothly from 0.0. Using the theoretical max (2/(K+1)) creates
+    // a bimodal distribution: items in both lists get ~0.0, items in only
+    // one list jump to ~0.5 — a misleading cliff that doesn't reflect
+    // actual relevance gradation.
+    let max_score = ranked
+        .first()
+        .map(|(s, _)| *s)
+        .filter(|s| *s > 0.0)
+        .unwrap_or(1.0);
     ranked
         .into_iter()
         .map(|(score, mut hit)| {
@@ -681,4 +1066,118 @@ pub(super) fn rrf_merge(vector_hits: Vec<ChunkHit>, fts_hits: Vec<ChunkHit>) -> 
             hit
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_completions, find_match_and_next_words};
+
+    #[test]
+    fn test_find_match_basic() {
+        let content = "The electrical engineering department";
+        let (start, end, words) = find_match_and_next_words(content, "elect");
+        assert_eq!(start, Some(4));
+        assert_eq!(end, Some(14)); // "electrical" (10 chars) ends at byte 14
+        assert_eq!(words, vec!["engineering", "department"]);
+    }
+
+    #[test]
+    fn test_find_match_no_match() {
+        let content = "The mechanical engineering department";
+        let (start, end, words) = find_match_and_next_words(content, "elect");
+        assert_eq!(start, None);
+        assert_eq!(end, None);
+        assert!(words.is_empty());
+    }
+
+    #[test]
+    fn test_find_match_with_punctuation() {
+        let content = "Electrical, engineering and computer science.";
+        let (start, end, words) = find_match_and_next_words(content, "elect");
+        assert_eq!(start, Some(0));
+        assert_eq!(end, Some(10)); // "Electrical" (10 chars) ends at byte 10
+        assert_eq!(words, vec!["engineering", "and", "computer", "science"]);
+    }
+
+    #[test]
+    fn test_find_match_at_end_of_content() {
+        let content = "The department of elect";
+        let (start, end, words) = find_match_and_next_words(content, "elect");
+        assert_eq!(start, Some(18));
+        assert_eq!(end, Some(23)); // "elect" is the full word at end
+        assert!(words.is_empty());
+    }
+
+    #[test]
+    fn test_find_match_case_insensitive() {
+        let content = "ELECTRICAL components are here";
+        let (start, end, words) = find_match_and_next_words(content, "elect");
+        assert_eq!(start, Some(0));
+        assert_eq!(end, Some(10)); // "ELECTRICAL" (10 chars) ends at byte 10
+        assert_eq!(words, vec!["components", "are", "here"]);
+    }
+
+    #[test]
+    fn test_find_match_max_five_words() {
+        let content = "elect one two three four five six seven";
+        let (start, end, words) = find_match_and_next_words(content, "elect");
+        assert_eq!(start, Some(0));
+        assert_eq!(end, Some(5)); // "elect" is the full word
+        assert_eq!(words.len(), 5);
+        assert_eq!(words, vec!["one", "two", "three", "four", "five"]);
+    }
+
+    #[test]
+    fn test_extract_completions_basic() {
+        let snippets = vec!["The electrical engineering department"];
+        let completions = extract_completions("elect", snippets);
+        assert!(!completions.is_empty());
+        // The most frequent completion should contain "electrical" at minimum.
+        assert!(completions[0].to_lowercase().contains("electrical"));
+    }
+
+    #[test]
+    fn test_extract_completions_multi_word() {
+        let snippets = vec!["The electrical engineering department is here"];
+        let completions = extract_completions("elect", snippets);
+        // Should produce completions of increasing length: electrical, electrical engineering, electrical engineering department
+        assert!(completions.iter().any(|c| c.to_lowercase() == "electrical"));
+        assert!(completions.iter().any(|c| c.to_lowercase() == "electrical engineering"));
+        assert!(completions.iter().any(|c| c.to_lowercase() == "electrical engineering department"));
+    }
+
+    #[test]
+    fn test_extract_completions_frequency_ranking() {
+        // "electrical engineering" appears twice, "electrical components" once.
+        let snippets = vec![
+            "The electrical engineering department",
+            "electrical engineering is great",
+            "electrical components are cheap",
+        ];
+        let completions = extract_completions("elect", snippets);
+        // "electrical engineering" (count=2) should rank before "electrical components" (count=1).
+        let eng_idx = completions.iter().position(|c| c.to_lowercase() == "electrical engineering");
+        let comp_idx = completions.iter().position(|c| c.to_lowercase() == "electrical components");
+        assert!(eng_idx.is_some());
+        assert!(comp_idx.is_some());
+        assert!(eng_idx.unwrap() < comp_idx.unwrap());
+    }
+
+    #[test]
+    fn test_extract_completions_no_match() {
+        let snippets = vec!["The mechanical engineering department"];
+        let completions = extract_completions("elect", snippets);
+        assert!(completions.is_empty());
+    }
+
+    #[test]
+    fn test_extract_completions_multiple_occurrences() {
+        let snippets = vec!["electrical power and electrical systems"];
+        let completions = extract_completions("elect", snippets);
+        // "electrical" should appear with count=2 (two occurrences in one snippet).
+        assert!(completions.iter().any(|c| c.to_lowercase() == "electrical"));
+        // "electrical power" and "electrical systems" should both be present.
+        assert!(completions.iter().any(|c| c.to_lowercase().contains("power")));
+        assert!(completions.iter().any(|c| c.to_lowercase().contains("systems")));
+    }
 }

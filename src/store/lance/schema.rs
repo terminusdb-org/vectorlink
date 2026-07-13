@@ -32,6 +32,45 @@ pub struct SearchQuery {
     pub snippet: bool,
 }
 
+/// Suggest (typeahead) query parameters.
+/// FTS-only (no embedding), optimised for sub-100ms partial-query responses.
+#[derive(Debug, Clone)]
+pub struct SuggestQuery {
+    pub query_text: String,
+    pub count: usize,
+    pub doc_type_filter: Vec<String>,
+    pub doc_id_filter: Vec<String>,
+}
+
+/// A document-level suggest hit with snippet and next-words for smart compose.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SuggestHit {
+    pub id: String,
+    pub distance: f32,
+    /// The matched chunk content snippet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    /// Start byte offset of the query match within `snippet` (for UI highlighting).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_start: Option<usize>,
+    /// End byte offset of the query match within `snippet` (for UI highlighting).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_end: Option<usize>,
+    /// Likely next words after the query match, ordered by proximity.
+    /// The first entry is the most likely next word. A tab key can cycle
+    /// through these to advance the cursor word by word.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub next_words: Vec<String>,
+}
+
+/// Result of a suggest (typeahead) operation.
+#[derive(Debug, Clone)]
+pub struct SuggestResult {
+    pub total_approx: usize,
+    pub completions: Vec<String>,
+    pub hits: Vec<SuggestHit>,
+}
+
 /// Whether a ChunkHit's distance is raw (needs transform) or already normalised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistanceKind {
