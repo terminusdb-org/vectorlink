@@ -126,20 +126,20 @@ pub struct CompareRequestBody {
     pub target: Option<String>,
 }
 
-/// Request body for POST /resolve (entity resolution).
+/// Request body for POST /candidates (raw KNN gather).
 #[derive(Debug, Deserialize)]
-pub struct ResolveRequestBody {
+pub struct CandidatesRequestBody {
     pub domain: Option<String>,
     pub commit: Option<String>,
     pub set_doc_types: Option<Vec<String>>,
     pub set_doc_ids: Option<Vec<String>>,
     pub target_doc_types: Option<Vec<String>>,
     pub target_doc_ids: Option<Vec<String>>,
-    pub threshold: Option<f32>,
-    pub tau_one_to_one: Option<f32>,
-    pub tau_one_to_many: Option<f32>,
-    pub tau_many_to_one: Option<f32>,
     pub k: Option<usize>,
+    pub threshold_set: Option<f32>,
+    pub threshold_target: Option<f32>,
+    /// Comma-separated list of extra fields to include: "embeddings", "content".
+    pub include: Option<String>,
     /// Nearest-first ancestor window (same contract as /search POST).
     pub ancestors: Option<Vec<String>>,
 }
@@ -1082,145 +1082,7 @@ async fn handle_duplicates(
     }
 }
 
-async fn handle_resolve(
-    State(state): State<AppState>,
-    Json(body): Json<ResolveRequestBody>,
-) -> Response {
-    let domain = body.domain.unwrap_or_default();
-    let commit = body.commit.unwrap_or_default();
-
-    if domain.is_empty() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "missing required parameter: domain".to_owned(),
-        );
-    }
-    if commit.is_empty() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "missing required parameter: commit".to_owned(),
-        );
-    }
-
-    // Threshold is required.
-    let threshold = match body.threshold {
-        Some(t) => t,
-        None => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "missing required parameter: threshold".to_owned(),
-            );
-        }
-    };
-    if !(0.0..=1.0).contains(&threshold) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "threshold must be in [0, 1]".to_owned(),
-        );
-    }
-
-    // tau_one_to_one is required.
-    let tau_one_to_one = match body.tau_one_to_one {
-        Some(t) => t,
-        None => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "missing required parameter: tau_one_to_one".to_owned(),
-            );
-        }
-    };
-    if !(0.0..=1.0).contains(&tau_one_to_one) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "tau_one_to_one must be in [0, 1]".to_owned(),
-        );
-    }
-    // Fail-loud: tau > threshold is the silent-recall trap.
-    if tau_one_to_one > threshold {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "tau_one_to_one ({}) > threshold ({}) — cannot filter looser than gathered",
-                tau_one_to_one, threshold
-            ),
-        );
-    }
-
-    // tau_one_to_many is optional (null = disabled).
-    let tau_one_to_many = body.tau_one_to_many;
-    if let Some(t) = tau_one_to_many {
-        if !(0.0..=1.0).contains(&t) {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "tau_one_to_many must be in [0, 1]".to_owned(),
-            );
-        }
-        if t > threshold {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "tau_one_to_many ({}) > threshold ({}) — cannot filter looser than gathered",
-                    t, threshold
-                ),
-            );
-        }
-    }
-
-    // tau_many_to_one is optional (null = disabled).
-    let tau_many_to_one = body.tau_many_to_one;
-    if let Some(t) = tau_many_to_one {
-        if !(0.0..=1.0).contains(&t) {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "tau_many_to_one must be in [0, 1]".to_owned(),
-            );
-        }
-        if t > threshold {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "tau_many_to_one ({}) > threshold ({}) — cannot filter looser than gathered",
-                    t, threshold
-                ),
-            );
-        }
-    }
-
-    let k = body.k.unwrap_or(5);
-    if k < 1 {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "k must be >= 1".to_owned(),
-        );
-    }
-
-    let scope = crate::store::lance::DuplicateScope {
-        set_doc_types: body.set_doc_types.unwrap_or_default(),
-        set_doc_ids: body.set_doc_ids.unwrap_or_default(),
-        target_doc_types: body.target_doc_types.unwrap_or_default(),
-        target_doc_ids: body.target_doc_ids.unwrap_or_default(),
-    };
-    let ancestors = body.ancestors.unwrap_or_default();
-
-    match state
-        .service
-        .resolve_with_options(
-            &domain,
-            &commit,
-            &scope,
-            k,
-            threshold,
-            tau_one_to_one,
-            tau_one_to_many,
-            tau_many_to_one,
-            &ancestors,
-        )
-        .await
-    {
-        Ok(result) => Json(result).into_response(),
-        Err(e) => service_error_to_response(e),
-    }
-}
+// handle_resolve removed — replaced by handle_candidates (/candidates endpoint).
 
 #[derive(Debug, Deserialize)]
 pub struct StatisticsParams {
@@ -1481,6 +1343,93 @@ async fn handle_suggest(
     }
 }
 
+async fn handle_candidates(
+    State(state): State<AppState>,
+    Json(body): Json<CandidatesRequestBody>,
+) -> Response {
+    let domain = body.domain.unwrap_or_default();
+    let commit = body.commit.unwrap_or_default();
+
+    if domain.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "missing required parameter: domain".to_owned(),
+        );
+    }
+    if commit.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "missing required parameter: commit".to_owned(),
+        );
+    }
+
+    let threshold_set = match body.threshold_set {
+        Some(t) => t,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing required parameter: threshold_set".to_owned(),
+            );
+        }
+    };
+    if !(0.0..=1.0).contains(&threshold_set) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "threshold_set must be in [0, 1]".to_owned(),
+        );
+    }
+
+    let threshold_target = match body.threshold_target {
+        Some(t) => t,
+        None => threshold_set,
+    };
+    if !(0.0..=1.0).contains(&threshold_target) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "threshold_target must be in [0, 1]".to_owned(),
+        );
+    }
+
+    let k = body.k.unwrap_or(5);
+    if k < 1 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "k must be >= 1".to_owned(),
+        );
+    }
+
+    let include_str = body.include.unwrap_or_default();
+    let include_embeddings = include_str.split(',').any(|s| s.trim() == "embeddings");
+    let include_content = include_str.split(',').any(|s| s.trim() == "content");
+
+    let scope = crate::store::lance::DuplicateScope {
+        set_doc_types: body.set_doc_types.unwrap_or_default(),
+        set_doc_ids: body.set_doc_ids.unwrap_or_default(),
+        target_doc_types: body.target_doc_types.unwrap_or_default(),
+        target_doc_ids: body.target_doc_ids.unwrap_or_default(),
+    };
+    let ancestors = body.ancestors.unwrap_or_default();
+
+    match state
+        .service
+        .candidates_gather(
+            &domain,
+            &commit,
+            &scope,
+            k,
+            threshold_set,
+            threshold_target,
+            include_embeddings,
+            include_content,
+            &ancestors,
+        )
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(e) => service_error_to_response(e),
+    }
+}
+
 // ─────────────────────────── Router construction ──────────────────────────
 
 pub fn build_router(state: AppState) -> Router {
@@ -1494,7 +1443,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/suggest", get(handle_suggest))
         .route("/similar", get(handle_similar).post(handle_similar_post))
         .route("/duplicates", get(handle_duplicates))
-        .route("/resolve", post(handle_resolve))
+        .route("/candidates", post(handle_candidates))
         .route("/compact", post(handle_compact))
         .route("/compare", post(handle_compare))
         .route("/statistics", get(handle_statistics))

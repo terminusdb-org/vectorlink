@@ -653,6 +653,99 @@ impl LanceStore {
             .map(|(id, (_, emb))| (id, emb))
             .collect())
     }
+
+    /// Fetch concatenated chunk content for a set of document IDs.
+    /// Returns a map from doc_id to the full text (all chunks concatenated in order).
+    /// Used by /candidates when include=content is requested.
+    pub async fn io_fetch_doc_contents(
+        &self,
+        domain: &str,
+        branch: &str,
+        commit: &str,
+        doc_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        if doc_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let snapshot = self.io_snapshot_from_cache(domain, branch, commit).await?;
+
+        let filter = build_filter_expression(&[], doc_ids);
+
+        let mut scanner = snapshot.scan();
+        scanner
+            .project(&["doc_id", "chunk_index", "content"])
+            .map_err(|e| StoreError::Internal(format!(
+                "doc content projection failed: {}", e
+            )))?;
+        scanner
+            .filter(&filter)
+            .map_err(|e| StoreError::Internal(format!(
+                "doc content filter failed: {}", e
+            )))?;
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .map_err(|e| StoreError::Internal(format!(
+                "doc content stream failed: {}", e
+            )))?
+            .try_collect()
+            .await
+            .map_err(|e| StoreError::Internal(format!(
+                "doc content collect failed: {}", e
+            )))?;
+
+        let mut per_doc: std::collections::HashMap<String, Vec<(i32, String)>> =
+            std::collections::HashMap::new();
+
+        for batch in &batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let ids = batch
+                .column_by_name("doc_id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| StoreError::Internal(
+                    "doc content scan: missing `doc_id` column".to_owned(),
+                ))?;
+            let chunk_indexes = batch
+                .column_by_name("chunk_index")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                .ok_or_else(|| StoreError::Internal(
+                    "doc content scan: missing `chunk_index` column".to_owned(),
+                ))?;
+            let contents = batch
+                .column_by_name("content")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| StoreError::Internal(
+                    "doc content scan: missing `content` column".to_owned(),
+                ))?;
+
+            for i in 0..batch.num_rows() {
+                let doc_id = ids.value(i);
+                let ci = chunk_indexes.value(i);
+                let content = contents.value(i);
+                per_doc
+                    .entry(doc_id.to_owned())
+                    .or_default()
+                    .push((ci, content.to_owned()));
+            }
+        }
+
+        Ok(per_doc
+            .into_iter()
+            .map(|(id, mut chunks)| {
+                chunks.sort_by_key(|(ci, _)| *ci);
+                let text = chunks
+                    .iter()
+                    .map(|(_, c)| c.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (id, text)
+            })
+            .collect())
+    }
 }
 
 /// Build a Lance SQL filter combining doc_type and doc_id IN-lists.

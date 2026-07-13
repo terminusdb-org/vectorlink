@@ -3,7 +3,7 @@
 // Thin HTTP client for the tdb-search engine. All functions are io* — they talk
 // to the network. They fail loud: a non-2xx response throws with the body.
 
-const ENGINE_URL = process.env.ENGINE_URL || "http://localhost:8081";
+const ENGINE_URL = process.env.ENGINE_URL || "http://localhost:7372";
 const ENGINE_CRED = process.env.ENGINE_CRED || "admin:root";
 
 const authHeader = "Basic " + Buffer.from(ENGINE_CRED).toString("base64");

@@ -24,6 +24,39 @@ use crate::store::lance::{
     ChunkRow, DuplicateScope, LanceStore, SearchQuery, dedup_chunks_to_documents,
 };
 
+use serde::Serialize;
+
+/// A single candidate neighbour in the /candidates response.
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidateEntry {
+    pub id: String,
+    pub distance: f32,
+    /// Embedding of the neighbour doc (only present if requested via `include`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
+    /// Concatenated chunk text of the neighbour doc (only present if requested).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+/// Stats for the /candidates response.
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidatesStats {
+    pub elapsed_ms: u64,
+    pub set_points: usize,
+    pub target_points: usize,
+    pub set_to_target_edges: usize,
+    pub target_to_set_edges: usize,
+}
+
+/// Response body for POST /candidates.
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidatesResult {
+    pub set_to_target: std::collections::HashMap<String, Vec<CandidateEntry>>,
+    pub target_to_set: std::collections::HashMap<String, Vec<CandidateEntry>>,
+    pub stats: CandidatesStats,
+}
+
 /// Max concurrent heavy-scan requests (/resolve, /duplicates). Each such request
 /// may spike ~64-96 working FDs via ANN queries; capping concurrency prevents
 /// stacked spikes from exhausting the default nofile=1024 limit under load.
@@ -883,16 +916,16 @@ impl SearchService {
     /// the transport reports staleness via `TerminusDB-Data-Version`. A branch
     /// with no indexed lineage → 404 (not a raw "commit not indexed" 500).
     ///
-    /// PROBE SIGNAL: uses the source document's stored QUERY-role embedding
-    /// (`query_embedding`) to probe the DOCUMENT-role embedding ANN index. This
-    /// mirrors `/resolve`'s asymmetric query→document signal (Phase 6A Step 5),
-    /// superseding the old doc→doc probe.
+    /// PROBE SIGNAL: uses the source document's stored DOCUMENT-role embedding
+    /// (`embedding`) to probe the DOCUMENT-role embedding ANN index. This is a
+    /// same-role doc→doc comparison — the correct signal for finding similar
+    /// documents.
     ///
     /// SAME-ROLE EXACT-DUPLICATE OVERRIDE: after ranking, if the source document's
     /// DOCUMENT-role embedding is bit-identical to a result's DOCUMENT-role
     /// embedding (doc↔doc same-role equality), that result's distance is
     /// overridden to 0. This surfaces exact content duplicates at distance 0
-    /// regardless of the asymmetric ranking distance.
+    /// regardless of the ranking distance.
     #[allow(clippy::too_many_arguments)]
     pub async fn similar_with_options(
         &self,
@@ -940,39 +973,26 @@ impl SearchService {
             )));
         }
 
-        // PROBE: use the source document's stored QUERY-role embedding (asymmetric
-        // query→document signal — same as /resolve). This supersedes the old doc→doc
-        // probe and provides better recall via the asymmetric prefix separation.
-        let probe_embedding = doc_chunks[0].query_embedding.clone();
+        // PROBE: use the source document's stored DOCUMENT-role embedding (same-role
+        // doc→doc probe). This is the correct comparison for finding similar documents.
+        let probe_embedding = doc_chunks[0].embedding.clone();
 
-        // Keep the source doc's DOCUMENT-role embedding for the same-role exact-
-        // duplicate override (doc↔doc equality check against result embeddings).
-        let source_doc_embedding = doc_chunks[0].embedding.clone();
-
-        // FAIL-LOUD sanity check: both stored vectors must be present and the right
+        // FAIL-LOUD sanity check: the stored vector must be present and the right
         // dimension. A violation means the projection or the insert invariant is
         // broken — surface it rather than silently search on garbage.
         let expected_dim = self.config.embed_provider.expected_dim();
         if probe_embedding.len() != expected_dim {
             return Err(ServiceError::Internal(format!(
-                "stored query_embedding for {} has dimension {}, expected {}",
-                id,
-                probe_embedding.len(),
-                expected_dim
-            )));
-        }
-        if source_doc_embedding.len() != expected_dim {
-            return Err(ServiceError::Internal(format!(
                 "stored embedding for {} has dimension {}, expected {}",
                 id,
-                source_doc_embedding.len(),
+                probe_embedding.len(),
                 expected_dim
             )));
         }
         let norm_sq: f32 = probe_embedding.iter().map(|v| v * v).sum();
         if (norm_sq - 1.0).abs() > 1e-3 {
             return Err(ServiceError::Internal(format!(
-                "stored query_embedding for {} is not L2-normalised (norm^2 = {}); \
+                "stored embedding for {} is not L2-normalised (norm^2 = {}); \
                  the insert-time normalisation invariant is violated",
                 id, norm_sq
             )));
@@ -1009,7 +1029,7 @@ impl SearchService {
         // stored DOCUMENT-role embedding and compare with the source's. If bit-
         // identical → override distance to 0.
         let result_ids: Vec<String> = paginated.iter().map(|h| h.id.clone()).collect();
-        if !result_ids.is_empty() && !source_doc_embedding.is_empty() {
+        if !result_ids.is_empty() && !probe_embedding.is_empty() {
             let result_embeddings = self
                 .store
                 .io_fetch_result_embeddings(
@@ -1024,7 +1044,7 @@ impl SearchService {
 
             for hit in &mut paginated {
                 if let Some(result_emb) = result_embeddings.get(&hit.id) {
-                    if crate::kernel::distance::vectors_equal(&source_doc_embedding, result_emb) {
+                    if crate::kernel::distance::vectors_equal(&probe_embedding, result_emb) {
                         hit.distance = 0.0;
                     }
                 }
@@ -1275,26 +1295,23 @@ impl SearchService {
         Ok(paginated)
     }
 
-    /// Entity resolution: batch server-side matching over stored vectors.
+    /// Raw bidirectional KNN gather for the /candidates endpoint.
     ///
-    /// Replaces N sequential HTTP /similar calls with a single in-process batch:
-    /// scan both populations, collect reciprocal cross-NN in-process (FD-safe per
-    /// BUG-FD24), then run the 3-threshold matching algorithm (port of resolve.js).
-    ///
-    /// Returns the 3-partition output (matched, set_only, target_only) plus stats.
+    /// Returns directional candidate maps (set→target and target→set) with
+    /// optional embeddings and content. No matching algorithm, no tau thresholds.
     #[allow(clippy::too_many_arguments)]
-    pub async fn resolve_with_options(
+    pub async fn candidates_gather(
         &self,
         domain_raw: &str,
         commit: &str,
         scope: &DuplicateScope,
         k: usize,
-        threshold: f32,
-        tau_one_to_one: f32,
-        tau_one_to_many: Option<f32>,
-        tau_many_to_one: Option<f32>,
+        threshold_set: f32,
+        threshold_target: f32,
+        include_embeddings: bool,
+        include_content: bool,
         ancestors: &[String],
-    ) -> Result<crate::resolve::ResolveResult, ServiceError> {
+    ) -> Result<CandidatesResult, ServiceError> {
         let rp =
             parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
 
@@ -1304,8 +1321,6 @@ impl SearchService {
             ));
         }
 
-        // Acquire heavy-scan permit (BUG-FD24): bounds concurrent /resolve requests
-        // so stacked FD spikes cannot exhaust nofile under load.
         let _permit = self
             .heavy_scan_semaphore
             .acquire()
@@ -1316,14 +1331,12 @@ impl SearchService {
         let domain_str = domain.as_str().to_owned();
         let branch = extract_branch(&rp);
 
-        // Resolve the searchable commit (catch-up resolution).
         let served_commit = self
             .resolve_searchable_commit(&domain, &branch, commit, ancestors)
             .await?;
 
         let start_time = std::time::Instant::now();
 
-        // Collect reciprocal cross-NN maps (in-process batch, FD-safe).
         let maps = self
             .store
             .io_resolve_cross_neighbours(
@@ -1332,39 +1345,31 @@ impl SearchService {
                 &served_commit,
                 scope,
                 k,
-                threshold,
+                threshold_set,
+                threshold_target,
                 crate::store::lance::DEFAULT_DUPLICATE_MAX_POINTS,
             )
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
-        // Run the pure matching algorithm.
-        let options = crate::resolve::ResolveOptions {
-            k,
-            threshold,
-            tau_one_to_one,
-            tau_one_to_many,
-            tau_many_to_one,
-        };
-
-        let elapsed_ms = start_time.elapsed().as_millis() as u64;
-        let mut result =
-            crate::resolve::resolve(&maps.set_to_target, &maps.target_to_set, &options, elapsed_ms);
-
-        // SAME-ROLE EXACT-DUPLICATE OVERRIDE (doc↔doc): sweep all matched pairs
-        // and compare the set member's DOCUMENT-role embedding with the target
-        // member's DOCUMENT-role embedding. If bit-identical → override to 0.
-        if !result.matched.is_empty() {
-            let all_doc_ids: Vec<String> = result
-                .matched
-                .iter()
-                .flat_map(|m| [m.set_id.clone(), m.target_id.clone()])
+        // Collect all doc_ids for optional embedding/content fetch.
+        let all_doc_ids: Vec<String> = if include_embeddings || include_content {
+            maps.set_to_target
+                .values()
+                .flat_map(|nbrs| nbrs.iter().map(|n| n.id.clone()))
+                .chain(maps.set_to_target.keys().cloned())
+                .chain(maps.target_to_set.values().flat_map(|nbrs| nbrs.iter().map(|n| n.id.clone())))
+                .chain(maps.target_to_set.keys().cloned())
                 .collect::<std::collections::HashSet<String>>()
                 .into_iter()
-                .collect();
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-            let doc_embeddings = self
-                .store
+        // Fetch embeddings if requested.
+        let doc_embeddings = if include_embeddings {
+            self.store
                 .io_fetch_result_embeddings(
                     &domain_str,
                     &branch,
@@ -1373,20 +1378,74 @@ impl SearchService {
                     "embedding",
                 )
                 .await
-                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+                .map_err(|e| ServiceError::Internal(e.to_string()))?
+        } else {
+            std::collections::HashMap::new()
+        };
 
-            for matched_pair in &mut result.matched {
-                let emb_set = doc_embeddings.get(&matched_pair.set_id);
-                let emb_target = doc_embeddings.get(&matched_pair.target_id);
-                if let (Some(a), Some(b)) = (emb_set, emb_target) {
-                    if crate::kernel::distance::vectors_equal(a, b) {
-                        matched_pair.distance = 0.0;
-                    }
-                }
-            }
-        }
+        // Fetch content if requested.
+        let doc_contents = if include_content {
+            self.store
+                .io_fetch_doc_contents(
+                    &domain_str,
+                    &branch,
+                    &served_commit,
+                    &all_doc_ids,
+                )
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?
+        } else {
+            std::collections::HashMap::new()
+        };
 
-        Ok(result)
+        // Convert Neighbour maps to CandidateEntry maps.
+        let convert = |nbrs: &Vec<crate::resolve::Neighbour>| -> Vec<CandidateEntry> {
+            nbrs.iter()
+                .map(|n| CandidateEntry {
+                    id: n.id.clone(),
+                    distance: n.distance,
+                    embedding: if include_embeddings {
+                        doc_embeddings.get(&n.id).cloned()
+                    } else {
+                        None
+                    },
+                    content: if include_content {
+                        doc_contents.get(&n.id).cloned()
+                    } else {
+                        None
+                    },
+                })
+                .collect()
+        };
+
+        let set_to_target: std::collections::HashMap<String, Vec<CandidateEntry>> =
+            maps.set_to_target
+                .iter()
+                .map(|(id, nbrs)| (id.clone(), convert(nbrs)))
+                .collect();
+
+        let target_to_set: std::collections::HashMap<String, Vec<CandidateEntry>> =
+            maps.target_to_set
+                .iter()
+                .map(|(id, nbrs)| (id.clone(), convert(nbrs)))
+                .collect();
+
+        let set_to_target_edges: usize = set_to_target.values().map(|v| v.len()).sum();
+        let target_to_set_edges: usize = target_to_set.values().map(|v| v.len()).sum();
+
+        let elapsed_ms = start_time.elapsed().as_millis() as u64;
+
+        Ok(CandidatesResult {
+            set_to_target,
+            target_to_set,
+            stats: CandidatesStats {
+                elapsed_ms,
+                set_points: maps.set_to_target.len(),
+                target_points: maps.target_to_set.len(),
+                set_to_target_edges,
+                target_to_set_edges,
+            },
+        })
     }
 
     /// Global statistics — aggregates across ALL domains (admin/internal only).
@@ -3433,9 +3492,9 @@ mod tests_exact_duplicate_override {
 
     // ─── /resolve: exact-duplicate override (doc↔doc) ─────────────────────────
 
-    /// /resolve with bit-identical DOCUMENT embeddings: matched pair distance MUST be 0.
+    /// /candidates with bit-identical DOCUMENT embeddings: candidate distance MUST be 0.
     #[tokio::test]
-    async fn resolve_identical_doc_embeddings_distance_zero() {
+    async fn candidates_identical_doc_embeddings_distance_zero() {
         let dim = 16;
         let tmp = tempfile::tempdir().expect("temp dir");
         let store = Arc::new(LanceStore::new(tmp.path(), dim));
@@ -3501,40 +3560,38 @@ mod tests_exact_duplicate_override {
         };
 
         let result = svc
-            .resolve_with_options(
+            .candidates_gather(
                 domain,
                 commit,
                 &scope,
                 5,     // k
-                1.0,   // threshold (permissive)
-                1.0,   // tau_one_to_one (permissive)
-                None,  // tau_one_to_many
-                None,  // tau_many_to_one
+                1.0,   // threshold_set (permissive)
+                1.0,   // threshold_target (permissive)
+                false, // include_embeddings
+                false, // include_content
                 &[],   // ancestors
             )
             .await
-            .expect("resolve must succeed");
+            .expect("candidates must succeed");
 
-        // The matched pair should have distance=0.
-        let matched_pair = result.matched.iter().find(|m| {
-            (m.set_id == "doc/set_item" && m.target_id == "doc/target_item")
-                || (m.set_id == "doc/target_item" && m.target_id == "doc/set_item")
-        });
+        // set_item should have target_item as a candidate with distance=0.
+        let set_nbrs = result.set_to_target.get("doc/set_item");
+        assert!(set_nbrs.is_some(), "set_item must have candidates");
+        let candidate = set_nbrs.unwrap().iter().find(|c| c.id == "doc/target_item");
         assert!(
-            matched_pair.is_some(),
-            "set_item↔target_item must be matched, got: {:?}",
-            result.matched.iter().map(|m| (&m.set_id, &m.target_id, m.distance)).collect::<Vec<_>>()
+            candidate.is_some(),
+            "set_item must have target_item as a candidate"
         );
         assert_eq!(
-            matched_pair.unwrap().distance,
+            candidate.unwrap().distance,
             0.0,
-            "bit-identical doc-role embeddings must produce distance=0 via the override"
+            "bit-identical doc-role embeddings must produce distance=0"
         );
     }
 
-    /// /resolve with DIFFERENT document embeddings: matched pair distance MUST be > 0.
+    /// /candidates with DIFFERENT document embeddings: candidate distance MUST be > 0.
     #[tokio::test]
-    async fn resolve_different_doc_embeddings_distance_nonzero() {
+    async fn candidates_different_doc_embeddings_distance_nonzero() {
         let dim = 16;
         let tmp = tempfile::tempdir().expect("temp dir");
         let store = Arc::new(LanceStore::new(tmp.path(), dim));
@@ -3600,32 +3657,31 @@ mod tests_exact_duplicate_override {
         };
 
         let result = svc
-            .resolve_with_options(
+            .candidates_gather(
                 domain,
                 commit,
                 &scope,
                 5,
                 1.0,
                 1.0,
-                None,
-                None,
+                false,
+                false,
                 &[],
             )
             .await
-            .expect("resolve must succeed");
+            .expect("candidates must succeed");
 
-        let matched_pair = result.matched.iter().find(|m| {
-            (m.set_id == "doc/set_item" && m.target_id == "doc/target_item")
-                || (m.set_id == "doc/target_item" && m.target_id == "doc/set_item")
-        });
+        let set_nbrs = result.set_to_target.get("doc/set_item");
+        assert!(set_nbrs.is_some(), "set_item must have candidates");
+        let candidate = set_nbrs.unwrap().iter().find(|c| c.id == "doc/target_item");
         assert!(
-            matched_pair.is_some(),
-            "set_item↔target_item must be matched (close embeddings with permissive tau)"
+            candidate.is_some(),
+            "set_item must have target_item as a candidate (close embeddings with permissive threshold)"
         );
         assert!(
-            matched_pair.unwrap().distance > 0.0,
+            candidate.unwrap().distance > 0.0,
             "different doc-role embeddings must produce distance > 0, got {}",
-            matched_pair.unwrap().distance
+            candidate.unwrap().distance
         );
     }
 
