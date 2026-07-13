@@ -40,6 +40,11 @@ help:
 	@echo "  make docs-rebuild     Clean rebuild of the dist/api API docs"
 	@echo "  make verify           lint + test (no side effects)"
 	@echo "  make pr               Full pre-PR gate: lint + test + release build + docs"
+	@echo "  make server-start     Start tdb-search (7372) + TerminusDB (7373)"
+	@echo "  make server-stop      Stop both test servers"
+	@echo "  make server-restart   Restart both test servers"
+	@echo "  make server-clean     Stop, wipe storage, and start fresh"
+	@echo "  make server-status    Show status of both servers"
 	@echo "  make build-image      Build the dev/CI container image (deps pre-baked)"
 	@echo "  make fix-volumes      Remediate named volume ownership for non-root user"
 	@echo "  make clean            Remove generated artifacts ($(DIST)/)"
@@ -261,6 +266,39 @@ verify: lint test
 .PHONY: pr
 pr: lint test test-integration build-release docs
 	@echo "✓ PR gate passed — review $(DOCS_OUT), then commit (GPG-signed)"
+
+# ──────────────────────── test server ────────────────────────────────────
+# Manage the local test stack: tdb-search (7372) + TerminusDB (7373).
+# Delegates to tests/tdb-search-server.sh which handles both servers.
+.PHONY: server-start
+server-start:
+	tests/tdb-search-server.sh start
+
+.PHONY: server-stop
+server-stop:
+	tests/tdb-search-server.sh stop
+
+.PHONY: server-restart
+server-restart:
+	tests/tdb-search-server.sh restart
+
+.PHONY: server-status
+server-status:
+	tests/tdb-search-server.sh status
+
+.PHONY: server-clean
+server-clean:
+	tests/tdb-search-server.sh stop
+	rm -rf /tmp/tdb-search-data
+	@if [ -n "$$(tests/tdb-search-server.sh status 2>/dev/null | grep -o 'TerminusDB repo not found')" ]; then \
+		echo "• TerminusDB storage clean skipped — repo not found" ; \
+	else \
+		TDB_ROOT="$$(cd "$$(pwd)/../terminusdb" 2>/dev/null && pwd)" ; \
+		if [ -n "$$TDB_ROOT" ] && [ -f "$$TDB_ROOT/tests/terminusdb-test-server.sh" ]; then \
+			"$$TDB_ROOT/tests/terminusdb-test-server.sh" clean ; \
+		fi ; \
+	fi
+	tests/tdb-search-server.sh start
 
 # ──────────────────────── container image ────────────────────────────────
 # Build the dev/CI container image with all deps pre-baked. No apt-at-runtime.
