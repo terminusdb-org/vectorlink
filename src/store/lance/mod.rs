@@ -25,8 +25,8 @@ mod tests;
 pub use self::config::VectorIndexConfig;
 pub use self::schema::{
     ChunkHit, ChunkRow, DistanceKind, DuplicateScope, NeighbourObservation,
-    ResolveNeighbourMaps, SearchQuery, DEFAULT_DUPLICATE_MAX_PAIRS,
-    DEFAULT_DUPLICATE_MAX_POINTS, MAIN_BRANCH,
+    ResolveNeighbourMaps, SearchQuery, SuggestHit, SuggestQuery, SuggestResult,
+    DEFAULT_DUPLICATE_MAX_PAIRS, DEFAULT_DUPLICATE_MAX_POINTS, MAIN_BRANCH,
 };
 pub use self::dedup::{dedup_chunks_to_documents, pairs_from_neighbours};
 pub use self::index::{io_compact_data, io_ensure_fts_index_on_dataset};

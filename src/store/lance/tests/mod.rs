@@ -1689,6 +1689,67 @@ fn rrf_merge_combines_ranked_lists() {
     assert_eq!(ids.len(), 4);
 }
 
+// RRF distances should scale smoothly from 0.0, not create a bimodal
+// 0.0 / 0.5 cliff caused by normalising against the theoretical max.
+#[test]
+fn rrf_merge_distances_scale_smoothly() {
+    // Only vector hits, no FTS — all items in a single list.
+    let vector_hits = vec![
+        ChunkHit {
+            doc_id: "A".to_owned(),
+            distance: 0.1,
+            distance_kind: DistanceKind::RawCosine,
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            content: "a".to_owned(),
+            embedding: Vec::new(),
+            query_embedding: Vec::new(),
+        },
+        ChunkHit {
+            doc_id: "B".to_owned(),
+            distance: 0.3,
+            distance_kind: DistanceKind::RawCosine,
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            content: "b".to_owned(),
+            embedding: Vec::new(),
+            query_embedding: Vec::new(),
+        },
+    ];
+
+    let merged = rrf_merge(vector_hits, Vec::new());
+
+    // Rank 1 (A) should have distance 0.0 (normalised by actual max).
+    assert!(
+        (merged[0].distance - 0.0).abs() < f32::EPSILON,
+        "top result should have distance 0.0, got {}",
+        merged[0].distance
+    );
+
+    // Rank 2 (B) should have a smooth distance, NOT 0.5.
+    // RRF: A = 1/61, B = 1/62. Normalised by max (1/61):
+    // B distance = 1 - (1/62)/(1/61) = 1 - 61/62 ≈ 0.0161
+    let expected_b = 1.0 - (1.0 / 62.0) / (1.0 / 61.0);
+    assert!(
+        (merged[1].distance - expected_b as f32).abs() < 0.001,
+        "second result should scale smoothly to ~{}, got {}",
+        expected_b,
+        merged[1].distance
+    );
+
+    // The gap between A and B should be small, not a 0.5 cliff.
+    let gap = merged[1].distance - merged[0].distance;
+    assert!(
+        gap < 0.1,
+        "distance gap should be small (<0.1), got {} — no bimodal cliff",
+        gap
+    );
+}
+
 // VectorIndexConfig dimension validation.
 
 #[test]
@@ -3451,4 +3512,142 @@ async fn fd_measurement_historical_version_search_after_compaction() {
          fragments) is CONFIRMED.",
         fd_delta_c0, frags_mid, fd_delta_mid, fd_delta_head
     );
+}
+
+// --- extract_completions (typeahead suggestion logic) ---
+
+#[test]
+fn extract_completions_finds_query_and_extends_to_word_boundary() {
+    let snippets = vec!["the quick brown fox jumps"];
+    let completions = search::extract_completions("quick", snippets);
+    // n-gram completions: quick brown, quick brown fox, quick brown fox jumps
+    assert!(completions.contains(&"quick brown".to_owned()));
+    assert!(completions.contains(&"quick brown fox".to_owned()));
+    assert!(completions.contains(&"quick brown fox jumps".to_owned()));
+}
+
+#[test]
+fn extract_completions_deduplicates_case_insensitively() {
+    let snippets = vec!["Quick Brown fox", "quick brown bear"];
+    let completions = search::extract_completions("quick", snippets);
+    // "quick brown" appears twice (case-insensitive), so it should be first.
+    assert_eq!(completions[0].to_lowercase(), "quick brown");
+    // Both multi-word variants should be present.
+    assert!(completions.iter().any(|c| c.to_lowercase() == "quick brown fox"));
+    assert!(completions.iter().any(|c| c.to_lowercase() == "quick brown bear"));
+}
+
+#[test]
+fn extract_completions_returns_at_most_eight() {
+    let snippets: Vec<&str> = vec![
+        "alpha one two", "alpha three four", "alpha five six",
+        "alpha seven eight", "alpha nine ten", "alpha eleven twelve",
+    ];
+    let completions = search::extract_completions("alpha", snippets);
+    assert!(completions.len() <= 8);
+    // Each snippet produces 2 n-grams (alpha + 1 word, alpha + 2 words) = 12 total,
+    // but capped at 8.
+    assert_eq!(completions.len(), 8);
+}
+
+#[test]
+fn extract_completions_skips_snippets_without_query_match() {
+    let snippets = vec!["no match here", "target word found"];
+    let completions = search::extract_completions("target", snippets);
+    // n-gram: target word, target word found
+    assert!(completions.contains(&"target word".to_owned()));
+    assert!(completions.contains(&"target word found".to_owned()));
+}
+
+#[test]
+fn extract_completions_extends_to_punctuation_boundary() {
+    let snippets = vec!["the value, is great"];
+    let completions = search::extract_completions("the", snippets);
+    // Comma splits "value" from "is", but n-grams still produce:
+    // "the value", "the value is", "the value is great"
+    assert!(completions.contains(&"the value".to_owned()));
+    assert!(completions.contains(&"the value is".to_owned()));
+    assert!(completions.contains(&"the value is great".to_owned()));
+}
+
+#[test]
+fn extract_completions_returns_empty_when_no_snippet_matches() {
+    let snippets = vec!["nothing relevant", "also irrelevant"];
+    let completions = search::extract_completions("xyz", snippets);
+    assert!(completions.is_empty());
+}
+
+#[test]
+fn extract_completions_skips_completion_equal_to_query() {
+    let snippets = vec!["query query"];
+    let completions = search::extract_completions("query", snippets);
+    // "query query" is longer than "query", so it's included.
+    assert!(completions.contains(&"query query".to_owned()));
+}
+
+#[test]
+fn extract_completions_filters_when_no_next_word_exists() {
+    let snippets = vec!["the query"];
+    let completions = search::extract_completions("query", snippets);
+    assert!(completions.is_empty());
+}
+
+#[test]
+fn extract_completions_handles_query_at_end_of_snippet() {
+    let snippets = vec!["the end is near"];
+    let completions = search::extract_completions("near", snippets);
+    assert!(completions.is_empty());
+}
+
+#[tokio::test]
+async fn suggest_substring_fallback_finds_partial_word_matches() {
+    let (store, _tmp) = make_test_store(8);
+    let domain = "test/suggest_sub";
+    let branch = "main";
+    let commit = "c1";
+
+    let rows = vec![
+        ChunkRow {
+            doc_id: "doc1".to_owned(),
+            doc_type: "Product".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: fake_embedding(8, 0.1),
+            query_embedding: fake_embedding(8, 0.1),
+            content: "Electrical components for industrial use".to_owned(),
+        },
+        ChunkRow {
+            doc_id: "doc2".to_owned(),
+            doc_type: "Product".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 10,
+            embedding: fake_embedding(8, 0.2),
+            query_embedding: fake_embedding(8, 0.2),
+            content: "Electronic devices and gadgets".to_owned(),
+        },
+    ];
+
+    store.io_upsert_chunks(domain, branch, "doc1", &rows[0..1]).await.expect("upsert doc1");
+    let v2 = store.io_upsert_chunks(domain, branch, "doc2", &rows[1..2]).await.expect("upsert doc2");
+    // Tag the latest version so the commit is indexed.
+    store.io_tag_commit(domain, branch, commit, v2).await.expect("tag commit");
+    store.update_last_indexed(domain, branch, commit, v2).await;
+
+    let query = SuggestQuery {
+        query_text: "elect".to_owned(),
+        count: 10,
+        doc_type_filter: Vec::new(),
+        doc_id_filter: Vec::new(),
+    };
+
+    let result = store.io_suggest(domain, branch, commit, &query).await.expect("suggest");
+
+    assert!(result.total_approx >= 2, "substring fallback should find both docs");
+    let ids: Vec<&str> = result.hits.iter().map(|h| h.id.as_str()).collect();
+    assert!(ids.contains(&"doc1"), "should find 'electrical' via substring");
+    assert!(ids.contains(&"doc2"), "should find 'electronic' via substring");
 }

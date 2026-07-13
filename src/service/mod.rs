@@ -1503,7 +1503,7 @@ impl SearchService {
     /// Compare two texts by embedding them and computing their normalized cosine distance.
     /// Stateless: NO dataset, NO ANN index, NO domain required.
     ///
-    /// `source` is embedded with `EmbeddingRole::Query`, `target` with `EmbeddingRole::Document`.
+    /// `source` is embedded with `EmbeddingRole::Document`, `target` with `EmbeddingRole::Document`.
     /// Both vectors are L2-normalized, then the normalized cosine distance is computed on
     /// the same [0, 1] reference scale that `/search`, `/similar`, `/duplicates`, and
     /// `/resolve` return (0 = identical, ~0.5 = unrelated, 1 = opposite).
@@ -1512,16 +1512,29 @@ impl SearchService {
         source: &str,
         target: &str,
     ) -> Result<CompareResult, ServiceError> {
-        // FIX 3 (#48): If source and target are identical strings, return distance 0
-        // without embedding. This avoids the asymmetric-prefix artefact where identical
-        // text embeds to different vectors (search_query: vs search_document: prefixes)
-        // producing ~0.16 distance for genuinely identical content.
-        // Checked BEFORE embedding — input-string equality, NOT vector equality.
+        self.compare_with_roles(source, target, EmbeddingRole::Document, EmbeddingRole::Document)
+            .await
+    }
+
+    /// Compare two texts with explicit embedding roles for each side.
+    /// Supports all four nomic task prefixes: search_query, search_document,
+    /// clustering, classification.
+    pub async fn compare_with_roles(
+        &self,
+        source: &str,
+        target: &str,
+        source_role: EmbeddingRole,
+        target_role: EmbeddingRole,
+    ) -> Result<CompareResult, ServiceError> {
+        // If source and target are identical strings, return distance 0
+        // without embedding. Even with different role prefixes (e.g. query vs
+        // document), the user-visible contract is that comparing a text with
+        // itself yields zero distance.
         if source == target {
             return Ok(CompareResult {
                 distance: 0.0,
-                source_role: "query".to_owned(),
-                target_role: "document".to_owned(),
+                source_role: role_name(source_role).to_owned(),
+                target_role: role_name(target_role).to_owned(),
             });
         }
 
@@ -1531,15 +1544,14 @@ impl SearchService {
             ));
         }
 
-        // Embed both texts in a single batch of 2 for efficiency.
-        // Source uses Query role, Target uses Document role (asymmetric embedding).
+        // Embed both texts, each with its specified role.
         let source_texts = vec![source.to_owned()];
         let target_texts = vec![target.to_owned()];
 
         let source_embeddings = embed::io_embed(
             &self.config.embed_provider,
             &source_texts,
-            EmbeddingRole::Query,
+            source_role,
             &self.http_client,
         )
         .await
@@ -1548,7 +1560,7 @@ impl SearchService {
         let target_embeddings = embed::io_embed(
             &self.config.embed_provider,
             &target_texts,
-            EmbeddingRole::Document,
+            target_role,
             &self.http_client,
         )
         .await
@@ -1573,8 +1585,8 @@ impl SearchService {
 
         Ok(CompareResult {
             distance,
-            source_role: "query".to_owned(),
-            target_role: "document".to_owned(),
+            source_role: role_name(source_role).to_owned(),
+            target_role: role_name(target_role).to_owned(),
         })
     }
 
@@ -1589,6 +1601,16 @@ impl SearchService {
         self.store
             .record_task(task_id, TaskStatus::Error { error })
             .await;
+    }
+}
+
+/// Convert an EmbeddingRole to its string name for API responses.
+fn role_name(role: EmbeddingRole) -> &'static str {
+    match role {
+        EmbeddingRole::Document => "document",
+        EmbeddingRole::Query => "query",
+        EmbeddingRole::Clustering => "clustering",
+        EmbeddingRole::Classification => "classification",
     }
 }
 
