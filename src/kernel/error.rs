@@ -23,6 +23,9 @@ pub enum ServiceError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("push aborted by client: {0}")]
+    Abort(String),
 }
 
 /// Ingest (NDJSON parse) errors.

@@ -4711,6 +4711,7 @@ dependencies = [
  "thiserror",
  "tokenizers",
  "tokio",
+ "tokio-stream",
  "tokio-test",
  "tower",
  "tower-http",

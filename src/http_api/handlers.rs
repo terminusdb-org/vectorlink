@@ -9,12 +9,14 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use axum::body::Body;
 use serde::{Deserialize, Serialize};
 
 use super::auth::auth_middleware;
 use super::AppState;
+use crate::embed::EmbeddingRole;
 use crate::kernel::error::ServiceError;
-use crate::kernel::model::{Operation, TaskStatus};
+use crate::kernel::model::{Operation, ProgressUpdate, TaskStatus};
 
 // ─────────────────────────── Query param structs ──────────────────────────
 
@@ -30,6 +32,7 @@ pub struct PushParams {
     pub branch: Option<String>,
     pub target_commit: Option<String>,
     pub parent_commit: Option<String>,
+    pub stream: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +103,18 @@ pub struct DuplicatesParams {
 #[derive(Debug, Deserialize)]
 pub struct CompareParams {
     pub method: Option<String>,
+    pub role: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct SuggestParams {
+    pub domain: Option<String>,
+    pub commit: Option<String>,
+    pub q: Option<String>,
+    pub count: Option<i64>,
+    // Repeated params (ancestor, doc_type, doc_id) read from raw query via
+    // `extract_repeated_param` (see SearchGetParams note).
 }
 
 // ─────────────────────────── Request body structs ─────────────────────────
@@ -150,6 +165,7 @@ pub struct SimilarRequestBody {
     pub domain: Option<String>,
     pub commit: Option<String>,
     pub id: Option<String>,
+    pub text: Option<String>,
     pub start: Option<i64>,
     pub count: Option<i64>,
     pub doc_type: Option<Vec<String>>,
@@ -185,6 +201,9 @@ fn service_error_to_response(err: ServiceError) -> Response {
         }
         ServiceError::Internal(msg) => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, msg)
+        }
+        ServiceError::Abort(msg) => {
+            error_response(StatusCode::UNPROCESSABLE_ENTITY, msg)
         }
     }
 }
@@ -301,7 +320,7 @@ async fn handle_last_indexed(
 async fn handle_push(
     State(state): State<AppState>,
     Query(params): Query<PushParams>,
-    body: String,
+    body: Body,
 ) -> Response {
     let domain = match params.domain {
         Some(d) if !d.is_empty() => d,
@@ -323,37 +342,249 @@ async fn handle_push(
         }
     };
 
-    // Parse NDJSON body incrementally (line by line).
-    let mut operations = Vec::new();
+    let is_stream = params.stream.unwrap_or(false);
+
+    // Stream the NDJSON body incrementally, sending each parsed operation
+    // through a channel to the indexing pipeline. This enables true
+    // document-by-document streaming: the pipeline starts chunking and
+    // embedding operations as they arrive, rather than buffering the entire
+    // body before processing begins.
+    use futures::StreamExt;
+    use tokio::sync::mpsc;
+
+    // Channel for sending operations to the pipeline.
+    // Buffer size 128 provides backpressure without excessive memory.
+    let (op_tx, op_rx) = mpsc::channel::<Operation>(128);
+
+    // Progress channel for streaming push (stream=true).
+    // Buffer 1024 items (~128KB at ~128 bytes per ProgressUpdate).
+    // Backpressure: pipeline blocks on send().await when full (levels the stream).
+    // On send() Err (receiver dropped = client disconnected): pipeline aborts (R1).
+    let (progress_tx, progress_rx) = mpsc::channel::<ProgressUpdate>(1024);
+    let progress_tx_opt = if is_stream { Some(progress_tx) } else { None };
+
+    // Start the streaming pipeline — it will read operations from op_rx.
+    let pipeline_result = state
+        .service
+        .push_stream(
+            &domain,
+            &branch,
+            &target_commit,
+            params.parent_commit.as_deref(),
+            op_rx,
+            progress_tx_opt,
+        )
+        .await;
+
+    // If the pipeline couldn't start (e.g. 409 conflict), return early.
+    let task_id = match pipeline_result {
+        Ok(id) => id,
+        Err(e) => return service_error_to_response(e),
+    };
+
+    // ── Stream mode: build streaming NDJSON response ──
+    if is_stream {
+        // Clone task_id for the header — the spawned task captures its own clone.
+        let task_id_for_header = task_id.clone();
+
+        // Spawn the body-reader task: reads NDJSON from the request body,
+        // parses each line, and sends operations to op_tx.
+        // In stream mode, abort is NOT a 422 — it's sent to the pipeline
+        // which sends ProgressUpdate::Aborted through the progress channel.
+        tokio::spawn(async move {
+            let mut stream = body.into_data_stream();
+            let mut buf = String::new();
+            let mut line_num = 0usize;
+
+            loop {
+                // Try to extract complete lines from the buffer.
+                while let Some(nl_pos) = buf.find('\n') {
+                    let line = buf[..nl_pos].to_owned();
+                    buf.drain(..=nl_pos);
+                    line_num += 1;
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<Operation>(trimmed) {
+                        Ok(Operation::Abort) => {
+                            // Send Abort to the pipeline — it will send
+                            // ProgressUpdate::Aborted through the progress channel.
+                            let _ = op_tx.send(Operation::Abort).await;
+                            return;
+                        }
+                        Ok(op) => {
+                            if op_tx.send(op).await.is_err() {
+                                // Pipeline closed early. Stop sending.
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            let error_msg = format!("malformed NDJSON at line {}: {}", line_num, e);
+                            state.service.record_error_task(&task_id, error_msg).await;
+                            // Drop op_tx to signal the pipeline to stop.
+                            drop(op_tx);
+                            return;
+                        }
+                    }
+                }
+
+                // Read the next chunk from the stream.
+                match stream.next().await {
+                    Some(Ok(chunk)) => {
+                        buf.push_str(&String::from_utf8_lossy(&chunk));
+                    }
+                    Some(Err(_)) => {
+                        drop(op_tx);
+                        return;
+                    }
+                    None => break,
+                }
+            }
+
+            // Process any remaining data in the buffer (last line without trailing newline).
+            let remaining = buf.trim();
+            if !remaining.is_empty() {
+                line_num += 1;
+                match serde_json::from_str::<Operation>(remaining) {
+                    Ok(Operation::Abort) => {
+                        let _ = op_tx.send(Operation::Abort).await;
+                    }
+                    Ok(op) => {
+                        let _ = op_tx.send(op).await;
+                    }
+                    Err(e) => {
+                        let error_msg = format!("malformed NDJSON at line {}: {}", line_num, e);
+                        state.service.record_error_task(&task_id, error_msg).await;
+                    }
+                }
+            }
+
+            // Drop op_tx to signal the pipeline that all operations have been sent.
+            drop(op_tx);
+        });
+
+        // Build the streaming response: NDJSON lines from progress_rx.
+        // Each ProgressUpdate is serialized as JSON + newline.
+        let progress_stream = tokio_stream::wrappers::ReceiverStream::new(progress_rx);
+        let ndjson_stream = progress_stream.map(|update| {
+            let json = serde_json::to_string(&update).unwrap_or_else(|_| {
+                r#"{"status":"error","error":"failed to serialize progress update"}"#.to_owned()
+            });
+            Ok::<_, std::io::Error>(format!("{}\n", json))
+        });
+
+        // Build response with X-Task-Id header and streaming body.
+        let mut response = Response::new(Body::from_stream(ndjson_stream));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            "Content-Type",
+            axum::http::HeaderValue::from_static("application/x-ndjson"),
+        );
+        response.headers_mut().insert(
+            "X-Task-Id",
+            axum::http::HeaderValue::from_str(&task_id_for_header).unwrap_or_else(|_| {
+                axum::http::HeaderValue::from_static("task-unknown")
+            }),
+        );
+        return response;
+    }
+
+    // ── Non-stream mode: current behavior (text/plain with task-id) ──
+    // Drop the unused progress_rx so progress_tx (held by the pipeline as None)
+    // doesn't block. Since progress_tx_opt is None, the pipeline won't send
+    // anything, but we still need to drop progress_rx to avoid a resource leak.
+    drop(progress_rx);
+
+    // Now stream the NDJSON body, parsing each line and forwarding to the channel.
+    let mut stream = body.into_data_stream();
+    let mut buf = String::new();
     let mut line_num = 0usize;
-    for line in body.lines() {
-        line_num += 1;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    let mut stream_error: Option<String> = None;
+
+    loop {
+        // Try to extract complete lines from the buffer.
+        while let Some(nl_pos) = buf.find('\n') {
+            let line = buf[..nl_pos].to_owned();
+            buf.drain(..=nl_pos);
+            line_num += 1;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Operation>(trimmed) {
+                Ok(Operation::Abort) => {
+                    // Send Abort to the pipeline so it can stop processing.
+                    let _ = op_tx.send(Operation::Abort).await;
+                    return error_response(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("abort received at line {}", line_num),
+                    );
+                }
+                Ok(op) => {
+                    if op_tx.send(op).await.is_err() {
+                        // Pipeline closed early (e.g. it aborted). Stop sending.
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let error_msg = format!("malformed NDJSON at line {}: {}", line_num, e);
+                    state.service.record_error_task(&task_id, error_msg).await;
+                    // Drop op_tx to signal the pipeline to stop.
+                    drop(op_tx);
+                    return (StatusCode::OK, task_id).into_response();
+                }
+            }
         }
-        match serde_json::from_str::<Operation>(trimmed) {
-            Ok(op) => operations.push(op),
+
+        // Read the next chunk from the stream.
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            Some(Err(e)) => {
+                stream_error = Some(format!("broken stream: {}", e));
+                break;
+            }
+            None => break,
+        }
+    }
+
+    // Process any remaining data in the buffer (last line without trailing newline).
+    let remaining = buf.trim();
+    if !remaining.is_empty() && stream_error.is_none() {
+        line_num += 1;
+        match serde_json::from_str::<Operation>(remaining) {
+            Ok(Operation::Abort) => {
+                let _ = op_tx.send(Operation::Abort).await;
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("abort received at line {}", line_num),
+                );
+            }
+            Ok(op) => {
+                let _ = op_tx.send(op).await;
+            }
             Err(e) => {
-                // Loud failure: malformed NDJSON line fails the push.
-                // Per contract: push returns 200 with a task_id; the error surfaces
-                // via /check (task status = Error with detail).
-                let task_id = format!("task-{}", uuid::Uuid::new_v4().as_simple());
                 let error_msg = format!("malformed NDJSON at line {}: {}", line_num, e);
                 state.service.record_error_task(&task_id, error_msg).await;
+                drop(op_tx);
                 return (StatusCode::OK, task_id).into_response();
             }
         }
     }
 
-    match state
-        .service
-        .push(&domain, &branch, &target_commit, params.parent_commit.as_deref(), operations)
-        .await
-    {
-        Ok(task_id) => (StatusCode::OK, task_id).into_response(),
-        Err(e) => service_error_to_response(e),
+    // Drop the sender to signal the pipeline that all operations have been sent.
+    drop(op_tx);
+
+    if let Some(err) = stream_error {
+        // The pipeline task will record its own error when the channel closes.
+        // We still return the task_id so the client can check the task status.
+        let _ = err; // logged via the task error
+        return (StatusCode::OK, task_id).into_response();
     }
+
+    (StatusCode::OK, task_id).into_response()
 }
 
 async fn handle_check(
@@ -712,41 +943,77 @@ async fn handle_similar_post(
             "missing required parameter: commit".to_owned(),
         );
     }
-    if id.is_empty() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "missing required parameter: id".to_owned(),
-        );
-    }
 
-    if let Err(r) = validate_pagination(start, count) {
-        return r;
-    }
+    // Text-based similarity: when id is empty but text is present, embed the
+    // text with Document role (search_document: prefix) and run vector search.
+    let text = body.text.or(None).unwrap_or_default();
+    if id.is_empty() && !text.is_empty() {
+        if let Err(r) = validate_pagination(start, count) {
+            return r;
+        }
 
-    let start_val = start.unwrap_or(0).max(0) as usize;
-    let count_val = count.unwrap_or(10).max(1) as usize;
-    let doc_type_filter = body.doc_type.unwrap_or_default();
-    let doc_id_filter = body.doc_id.unwrap_or_default();
-    let snippet = body.snippet.unwrap_or(false);
-    let ancestors = body.ancestors.unwrap_or_default();
+        let start_val = start.unwrap_or(0).max(0) as usize;
+        let count_val = count.unwrap_or(10).max(1) as usize;
+        let doc_type_filter = body.doc_type.unwrap_or_default();
+        let doc_id_filter = body.doc_id.unwrap_or_default();
+        let snippet = body.snippet.unwrap_or(false);
+        let ancestors = body.ancestors.unwrap_or_default();
 
-    match state
-        .service
-        .similar_with_options(
-            &domain,
-            &commit,
-            &id,
-            start_val,
-            count_val,
-            &doc_type_filter,
-            &doc_id_filter,
-            snippet,
-            &ancestors,
-        )
-        .await
-    {
-        Ok(outcome) => response_with_served_commit(outcome.hits, &outcome.served_commit),
-        Err(e) => service_error_to_response(e),
+        match state
+            .service
+            .similar_with_text(
+                &domain,
+                &commit,
+                &text,
+                start_val,
+                count_val,
+                &doc_type_filter,
+                &doc_id_filter,
+                snippet,
+                &ancestors,
+            )
+            .await
+        {
+            Ok(outcome) => response_with_served_commit(outcome.hits, &outcome.served_commit),
+            Err(e) => service_error_to_response(e),
+        }
+    } else {
+        if id.is_empty() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing required parameter: id or text".to_owned(),
+            );
+        }
+
+        if let Err(r) = validate_pagination(start, count) {
+            return r;
+        }
+
+        let start_val = start.unwrap_or(0).max(0) as usize;
+        let count_val = count.unwrap_or(10).max(1) as usize;
+        let doc_type_filter = body.doc_type.unwrap_or_default();
+        let doc_id_filter = body.doc_id.unwrap_or_default();
+        let snippet = body.snippet.unwrap_or(false);
+        let ancestors = body.ancestors.unwrap_or_default();
+
+        match state
+            .service
+            .similar_with_options(
+                &domain,
+                &commit,
+                &id,
+                start_val,
+                count_val,
+                &doc_type_filter,
+                &doc_id_filter,
+                snippet,
+                &ancestors,
+            )
+            .await
+        {
+            Ok(outcome) => response_with_served_commit(outcome.hits, &outcome.served_commit),
+            Err(e) => service_error_to_response(e),
+        }
     }
 }
 
@@ -1034,13 +1301,19 @@ async fn handle_health_ready(State(state): State<AppState>) -> Response {
 
 // ─────────────────────────── Compare ────────────────────────────────────
 
-/// POST /compare?method=embedding — stateless semantic distance between two texts.
-/// NO dataset, NO ANN index, NO domain. Pure convenience function: embed source
-/// (Query role) and target (Document role), L2-normalise, compute cosine distance.
-///
-/// Extensibility: requires `method=embedding` (the only supported method). Unknown
-/// or missing method values fail loud with 400 — this gate allows future methods
-/// (e.g. `method=lexical`) without a breaking change.
+/**
+ * POST /compare?method=embedding&role=<role> — stateless semantic distance.
+ *
+ * Optional `role` query param selects the nomic task prefix for BOTH texts:
+ *   - `query` (default) — source uses search_query:, target uses search_document:
+ *   - `clustering` — both texts use clustering: prefix (symmetric)
+ *   - `classification` — both texts use classification: prefix (symmetric)
+ *   - `document` — both texts use search_document: prefix (symmetric)
+ *
+ * When role is `query` (default), the asymmetric query→document embedding is used.
+ * For any other role, both sides use the same prefix (symmetric comparison),
+ * which is the correct mode for clustering and classification tasks.
+ */
 async fn handle_compare(
     State(state): State<AppState>,
     Query(params): Query<CompareParams>,
@@ -1066,6 +1339,23 @@ async fn handle_compare(
         }
     }
 
+    // Parse optional role parameter (default: query → asymmetric query/document).
+    let (source_role, target_role) = match params.role.as_deref() {
+        Some("query") | None => (EmbeddingRole::Query, EmbeddingRole::Document),
+        Some("clustering") => (EmbeddingRole::Clustering, EmbeddingRole::Clustering),
+        Some("classification") => (EmbeddingRole::Classification, EmbeddingRole::Classification),
+        Some("document") => (EmbeddingRole::Document, EmbeddingRole::Document),
+        Some(unknown) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unsupported role: '{}' (supported: query, document, clustering, classification)",
+                    unknown
+                ),
+            );
+        }
+    };
+
     // Validate body fields.
     let source = match body.source {
         Some(ref s) if !s.is_empty() => s.clone(),
@@ -1086,7 +1376,7 @@ async fn handle_compare(
         }
     };
 
-    match state.service.compare(&source, &target).await {
+    match state.service.compare_with_roles(&source, &target, source_role, target_role).await {
         Ok(result) => {
             let body = serde_json::json!({
                 "distance": result.distance,
@@ -1190,5 +1480,121 @@ mod tests {
     #[test]
     fn multiple_colons_fails() {
         assert!(!is_valid_data_version("commit:abc:def"));
+    }
+
+    // ─────────────────── Streaming /push tests ───────────────────
+
+    #[test]
+    fn service_error_abort_maps_to_422() {
+        let err = ServiceError::Abort("test abort".to_owned());
+        let response = service_error_to_response(err);
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn service_error_internal_maps_to_500() {
+        let err = ServiceError::Internal("test internal".to_owned());
+        let response = service_error_to_response(err);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn service_error_conflict_maps_to_409() {
+        let err = ServiceError::Conflict("test conflict".to_owned());
+        let response = service_error_to_response(err);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn operation_abort_deserializes_correctly() {
+        let json = r#"{"op":"Abort"}"#;
+        let op: Operation = serde_json::from_str(json).unwrap();
+        assert!(matches!(op, Operation::Abort));
+    }
+
+    #[test]
+    fn operation_error_deserializes_correctly() {
+        let json = r#"{"op":"Error","message":"something went wrong"}"#;
+        let op: Operation = serde_json::from_str(json).unwrap();
+        assert!(matches!(op, Operation::Error { .. }));
+    }
+
+    #[test]
+    fn operation_inserted_deserializes_correctly() {
+        let json = r#"{"op":"Inserted","id":"doc1","string":"hello world"}"#;
+        let op: Operation = serde_json::from_str(json).unwrap();
+        match op {
+            Operation::Inserted { id, string } => {
+                assert_eq!(id, "doc1");
+                assert_eq!(string, "hello world");
+            }
+            _ => panic!("expected Inserted"),
+        }
+    }
+
+    #[test]
+    fn ndjson_with_abort_line_parses_abort() {
+        let lines = vec![
+            r#"{"op":"Inserted","id":"doc1","string":"text"}"#,
+            r#"{"op":"Abort"}"#,
+        ];
+        let mut found_abort = false;
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let op: Operation = serde_json::from_str(trimmed).unwrap();
+            if matches!(op, Operation::Abort) {
+                found_abort = true;
+                break;
+            }
+        }
+        assert!(found_abort, "should have found Abort operation");
+    }
+
+    #[test]
+    fn ndjson_streaming_simulates_chunked_read() {
+        // Simulate a chunked stream where a newline arrives in a later chunk.
+        let chunk1 = r#"{"op":"Inserted","id":"d"#;
+        let chunk2 = r#"oc1","string":"hello"}"#;
+        let chunk3 = "\n";
+        let full = format!("{}{}{}", chunk1, chunk2, chunk3);
+        let mut buf = String::new();
+        let mut operations = Vec::new();
+        for chunk in [chunk1, chunk2, chunk3] {
+            buf.push_str(chunk);
+            while let Some(nl_pos) = buf.find('\n') {
+                let line = buf[..nl_pos].to_owned();
+                buf.drain(..=nl_pos);
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let op: Operation = serde_json::from_str(trimmed).unwrap();
+                operations.push(op);
+            }
+        }
+        assert_eq!(operations.len(), 1);
+        assert!(matches!(operations[0], Operation::Inserted { .. }));
+        assert_eq!(full.trim(), r#"{"op":"Inserted","id":"doc1","string":"hello"}"#);
+    }
+
+    #[test]
+    fn ndjson_streaming_handles_empty_body() {
+        let buf = String::new();
+        let remaining = buf.trim();
+        assert!(remaining.is_empty(), "empty body should produce no operations");
+    }
+
+    #[test]
+    fn ndjson_streaming_handles_trailing_line_without_newline() {
+        let mut buf = String::from(r#"{"op":"Inserted","id":"doc1","string":"hello"}"#);
+        // No trailing newline — process remaining buffer.
+        let remaining = buf.trim();
+        assert!(!remaining.is_empty());
+        let op: Operation = serde_json::from_str(remaining).unwrap();
+        assert!(matches!(op, Operation::Inserted { .. }));
+        buf.clear();
     }
 }

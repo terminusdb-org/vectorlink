@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use tokenizers::Tokenizer;
 
 use crate::chunk::{self, ChunkParams};
@@ -16,8 +17,8 @@ use crate::ingest;
 use crate::kernel::distance::l2_normalize;
 use crate::kernel::error::ServiceError;
 use crate::kernel::model::{
-    parse_domain, BranchName, Domain, DuplicateGroup, LastIndexed, Operation, Ref, SearchHit,
-    SearchMode, SkippedDoc, Statistics, TaskStatus,
+    parse_domain, BranchName, Domain, DuplicateGroup, LastIndexed, Operation, ProgressUpdate, Ref,
+    SearchHit, SearchMode, SkippedDoc, Statistics, TaskStatus,
 };
 use crate::store::lance::{
     ChunkRow, DuplicateScope, LanceStore, SearchQuery, dedup_chunks_to_documents,
@@ -77,6 +78,17 @@ pub struct CompareResult {
     pub source_role: String,
     /// Which embedding role was applied to the target text.
     pub target_role: String,
+}
+
+/// Outcome of a `/suggest` (typeahead) request.
+/// FTS-only (no embedding), carries approximate match count, completions,
+/// and the first N document IDs for UI typeahead assistance.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SuggestOutcome {
+    pub served_commit: String,
+    pub total_approx: usize,
+    pub completions: Vec<String>,
+    pub hits: Vec<crate::store::lance::SuggestHit>,
 }
 
 impl std::fmt::Debug for SearchService {
@@ -334,6 +346,152 @@ impl SearchService {
         Ok(task_id)
     }
 
+    /// Start an async push/index task that reads operations incrementally
+    /// from a channel rather than buffering all operations upfront.
+    /// This enables true streaming: the HTTP handler can start sending
+    /// operations through the channel while the pipeline begins chunking
+    /// and embedding them concurrently.
+    ///
+    /// When `progress_tx` is `Some`, the pipeline sends `ProgressUpdate` messages
+    /// through it as NDJSON progress lines. The caller holds the `progress_rx`
+    /// and streams its items as the HTTP response body.
+    pub async fn push_stream(
+        &self,
+        domain_raw: &str,
+        branch_raw: &str,
+        target_commit: &str,
+        parent_commit: Option<&str>,
+        operation_rx: mpsc::Receiver<Operation>,
+        progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
+    ) -> Result<String, ServiceError> {
+        let rp =
+            parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
+        let domain = Domain::from_resource_path(&rp);
+        let domain_str = domain.as_str().to_owned();
+        let branch = branch_raw.to_owned();
+        let commit = target_commit.to_owned();
+
+        let reserved = self
+            .store
+            .io_try_reserve_commit(&domain_str, &branch, &commit)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+        if !reserved {
+            return Err(ServiceError::Conflict(format!(
+                "commit {} already pushed (in-flight or indexed)",
+                commit
+            )));
+        }
+
+        if branch != crate::store::lance::MAIN_BRANCH {
+            if let Some(parent) = parent_commit {
+                if let Err(e) = crate::store::branch::io_ensure_branch_forked(
+                    &self.store,
+                    &domain_str,
+                    &branch,
+                    parent,
+                )
+                .await
+                {
+                    self.store
+                        .io_release_commit_reservation(&domain_str, &branch, &commit)
+                        .await;
+                    let msg = e.to_string();
+                    return Err(if msg.contains("not indexed") || msg.contains("does not exist") {
+                        ServiceError::NotFound(msg)
+                    } else {
+                        ServiceError::Internal(msg)
+                    });
+                }
+            }
+        }
+
+        let task_id = format!("task-{}", uuid::Uuid::new_v4().as_simple());
+
+        self.store
+            .record_task(
+                &task_id,
+                TaskStatus::Pending { percentage: 0.0 },
+            )
+            .await;
+
+        let store = Arc::clone(&self.store);
+        let tokenizer = Arc::clone(&self.tokenizer);
+        let chunk_params = self.chunk_params.clone();
+        let provider = self.config.embed_provider.clone();
+        let http_client = self.http_client.clone();
+        let embed_batch_size = self.config.embed_batch_size;
+        let task_id_clone = task_id.clone();
+
+        let store_for_panic = Arc::clone(&store);
+        let task_id_for_panic = task_id.clone();
+        let reservation_coords = (domain_str.clone(), branch.clone(), commit.clone());
+        let handle = tokio::spawn(async move {
+            let ctx = PipelineCtx {
+                store: &store,
+                tokenizer: &tokenizer,
+                chunk_params: &chunk_params,
+                provider: &provider,
+                http_client: &http_client,
+                domain: &domain_str,
+                branch: &branch,
+                embed_batch_size,
+            };
+            let result = io_run_index_pipeline_stream(&ctx, &commit, operation_rx, progress_tx).await;
+
+            match result {
+                Ok((indexed, skipped)) => {
+                    if indexed > 0 {
+                        LanceStore::maybe_trigger_background_compaction(
+                            Arc::clone(&store),
+                            domain_str.clone(),
+                            branch.clone(),
+                        );
+                    }
+                    store
+                        .record_task(
+                            &task_id_clone,
+                            TaskStatus::Complete {
+                                indexed_documents: indexed,
+                                skipped,
+                            },
+                        )
+                        .await;
+                }
+                Err(error_msg) => {
+                    store
+                        .record_task(
+                            &task_id_clone,
+                            TaskStatus::Error { error: error_msg },
+                        )
+                        .await;
+                }
+            }
+            store
+                .io_release_commit_reservation(&domain_str, &branch, &commit)
+                .await;
+        });
+
+        tokio::spawn(async move {
+            if let Err(join_err) = handle.await {
+                let msg = if join_err.is_panic() {
+                    format!("pipeline panicked: {:?}", join_err)
+                } else {
+                    format!("pipeline cancelled: {:?}", join_err)
+                };
+                store_for_panic
+                    .record_task(&task_id_for_panic, TaskStatus::Error { error: msg })
+                    .await;
+                let (d, b, c) = &reservation_coords;
+                store_for_panic
+                    .io_release_commit_reservation(d, b, c)
+                    .await;
+            }
+        });
+
+        Ok(task_id)
+    }
+
     /// Check the status of a push task.
     pub async fn check_task(&self, task_id: &str) -> Result<TaskStatus, ServiceError> {
         self.store
@@ -539,6 +697,58 @@ impl SearchService {
         Ok(SearchOutcome {
             hits: paginated,
             served_commit,
+        })
+    }
+
+    /// Suggest (typeahead): FTS-only partial-query assistance.
+    /// No embedding call — fast path using the existing FTS inverted index.
+    /// Returns approximate match count, completion suggestions, and first N doc IDs.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn suggest(
+        &self,
+        domain_raw: &str,
+        commit: &str,
+        q: &str,
+        count: usize,
+        doc_type_filter: &[String],
+        doc_id_filter: &[String],
+        ancestors: &[String],
+    ) -> Result<SuggestOutcome, ServiceError> {
+        let rp =
+            parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
+
+        if !self.is_search_ready() {
+            return Err(ServiceError::Unavailable(
+                "search capability not ready (embedding backend cold)".to_owned(),
+            ));
+        }
+
+        let domain = Domain::from_resource_path(&rp);
+        let domain_str = domain.as_str().to_owned();
+        let branch = extract_branch(&rp);
+
+        let served_commit = self
+            .resolve_searchable_commit(&domain, &branch, commit, ancestors)
+            .await?;
+
+        let suggest_query = crate::store::lance::SuggestQuery {
+            query_text: q.to_owned(),
+            count,
+            doc_type_filter: doc_type_filter.to_vec(),
+            doc_id_filter: doc_id_filter.to_vec(),
+        };
+
+        let result = self
+            .store
+            .io_suggest(&domain_str, &branch, &served_commit, &suggest_query)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        Ok(SuggestOutcome {
+            served_commit,
+            total_approx: result.total_approx,
+            completions: result.completions,
+            hits: result.hits,
         })
     }
 
@@ -769,7 +979,7 @@ impl SearchService {
         }
 
         let search_query = SearchQuery {
-            query_embedding: probe_embedding,
+            query_embedding: probe_embedding.clone(),
             query_text: String::new(),
             mode: SearchMode::Vector,
             start,
@@ -827,6 +1037,87 @@ impl SearchService {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
         }
+
+        Ok(SimilarOutcome {
+            hits: paginated,
+            served_commit,
+        })
+    }
+
+    /// Similar by text: embed the input text with Document role and run vector
+    /// search against all stored document embeddings. Uses search_document:
+    /// prefix since the text represents document content, not a query.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn similar_with_text(
+        &self,
+        domain_raw: &str,
+        commit: &str,
+        text: &str,
+        start: usize,
+        count: usize,
+        doc_type_filter: &[String],
+        doc_id_filter: &[String],
+        snippet: bool,
+        ancestors: &[String],
+    ) -> Result<SimilarOutcome, ServiceError> {
+        let rp =
+            parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
+
+        if !self.is_search_ready() {
+            return Err(ServiceError::Unavailable(
+                "search capability not ready (embedding backend cold)".to_owned(),
+            ));
+        }
+
+        let domain = Domain::from_resource_path(&rp);
+        let domain_str = domain.as_str().to_owned();
+        let branch = extract_branch(&rp);
+
+        let served_commit = self
+            .resolve_searchable_commit(&domain, &branch, commit, ancestors)
+            .await?;
+
+        // Embed the text with Document role (search_document: prefix).
+        let texts = vec![text.to_owned()];
+        let embeddings = embed::io_embed(
+            &self.config.embed_provider,
+            &texts,
+            EmbeddingRole::Document,
+            &self.http_client,
+        )
+        .await
+        .map_err(|e| ServiceError::Internal(format!("embedding failed: {}", e)))?;
+
+        let mut probe_embedding = embeddings
+            .into_iter()
+            .next()
+            .ok_or_else(|| ServiceError::Internal("no embedding returned".to_owned()))?;
+        l2_normalize(&mut probe_embedding);
+
+        let search_query = SearchQuery {
+            query_embedding: probe_embedding,
+            query_text: text.to_owned(),
+            mode: SearchMode::Vector,
+            start,
+            count,
+            doc_type_filter: doc_type_filter.to_vec(),
+            doc_id_filter: doc_id_filter.to_vec(),
+            snippet,
+        };
+
+        let chunk_hits = self
+            .store
+            .io_search(&domain_str, &branch, &served_commit, &search_query)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        let results = dedup_chunks_to_documents(chunk_hits, snippet);
+
+        let paginated: Vec<SearchHit> = results
+            .into_iter()
+            .skip(start)
+            .take(count)
+            .collect();
 
         Ok(SimilarOutcome {
             hits: paginated,
@@ -1444,6 +1735,10 @@ async fn io_run_index_pipeline(
                     message: format!("operation error: {}", message),
                 });
             }
+            Operation::Abort => {
+                // Abort: cancel in-process work immediately.
+                return Err("push aborted by client".to_string());
+            }
         }
     }
 
@@ -1682,6 +1977,386 @@ async fn io_run_index_pipeline(
     Ok((indexed_count, skipped))
 }
 
+/// Streaming variant of `io_run_index_pipeline`.
+///
+/// Reads operations incrementally from an mpsc channel, chunking and embedding
+/// them in batches as they arrive. This overlaps network IO (reading the NDJSON
+/// stream in the HTTP handler) with CPU/IO work (chunking, embedding), providing
+/// true document-by-document streaming rather than buffering all operations
+/// before processing begins.
+///
+/// When `progress_tx` is `Some`, the pipeline sends `ProgressUpdate` messages
+/// after each embedding batch and at terminal states (complete/error/aborted).
+/// The pipeline blocks on `progress_tx.send().await` when the channel buffer is
+/// full (backpressure — levels the stream). If `send()` returns `Err` (receiver
+/// dropped = client disconnected), the pipeline ABORTS immediately and cleans up
+/// any written data for this commit.
+///
+/// When `progress_tx` is `None`, behavior is identical to the non-streaming
+/// pipeline (no progress updates, no incremental embedding).
+///
+/// The write phase (delete-append, optimize, tag) still happens once at the end
+/// under the pipeline lock, preserving the one-fragment-per-commit efficiency.
+async fn io_run_index_pipeline_stream(
+    ctx: &PipelineCtx<'_>,
+    commit: &str,
+    mut operation_rx: mpsc::Receiver<Operation>,
+    progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
+) -> Result<(u64, Vec<SkippedDoc>), String> {
+    struct DocToEmbed {
+        id: String,
+        chunks: Vec<chunk::Chunk>,
+        is_changed: bool,
+    }
+
+    let mut all_docs_to_embed: Vec<DocToEmbed> = Vec::new();
+    let mut all_delete_ids: Vec<String> = Vec::new();
+    let mut skipped: Vec<SkippedDoc> = Vec::new();
+
+    // Read operations from the channel and process them incrementally.
+    // Chunking is CPU-bound and can happen immediately as operations arrive.
+    // Embedding is batched and happens when we have enough chunks or when the
+    // channel is drained/closed.
+    while let Some(op) = operation_rx.recv().await {
+        match op {
+            Operation::Inserted { id, string } => {
+                match chunk::chunk_text(ctx.tokenizer, &string, ctx.chunk_params) {
+                    Ok(chunks) if chunks.is_empty() => {
+                        skipped.push(SkippedDoc {
+                            id,
+                            message: "chunking produced zero chunks".to_owned(),
+                        });
+                    }
+                    Ok(chunks) => {
+                        all_docs_to_embed.push(DocToEmbed {
+                            id,
+                            chunks,
+                            is_changed: false,
+                        });
+                    }
+                    Err(e) => {
+                        skipped.push(SkippedDoc {
+                            id,
+                            message: format!("chunking failed: {}", e),
+                        });
+                    }
+                }
+            }
+            Operation::Changed { id, string } => {
+                match chunk::chunk_text(ctx.tokenizer, &string, ctx.chunk_params) {
+                    Ok(chunks) if chunks.is_empty() => {
+                        skipped.push(SkippedDoc {
+                            id,
+                            message: "chunking produced zero chunks".to_owned(),
+                        });
+                    }
+                    Ok(chunks) => {
+                        all_docs_to_embed.push(DocToEmbed {
+                            id,
+                            chunks,
+                            is_changed: true,
+                        });
+                    }
+                    Err(e) => {
+                        skipped.push(SkippedDoc {
+                            id,
+                            message: format!("chunking failed: {}", e),
+                        });
+                    }
+                }
+            }
+            Operation::Deleted { id } => {
+                all_delete_ids.push(id);
+            }
+            Operation::Error { message } => {
+                skipped.push(SkippedDoc {
+                    id: "unknown".to_owned(),
+                    message: format!("operation error: {}", message),
+                });
+            }
+            Operation::Abort => {
+                // Send Aborted progress update if streaming.
+                if let Some(tx) = &progress_tx {
+                    let _ = tx.send(ProgressUpdate::Aborted).await;
+                }
+                return Err("push aborted by client".to_string());
+            }
+        }
+    }
+
+    // Channel closed — all operations received. Now proceed with embedding
+    // and the write phase, identical to the non-streaming pipeline.
+
+    // Flatten chunk texts into one ordered list.
+    let mut flat_texts: Vec<String> = Vec::new();
+    let mut doc_flat_ranges: Vec<(usize, usize)> = Vec::with_capacity(all_docs_to_embed.len());
+
+    for doc in &all_docs_to_embed {
+        let start = flat_texts.len();
+        for chunk in &doc.chunks {
+            flat_texts.push(chunk.text.clone());
+        }
+        doc_flat_ranges.push((start, doc.chunks.len()));
+    }
+
+    // Batch-embed in groups, sending progress after each batch.
+    // This gives real-time trickling feedback during the embedding phase
+    // rather than a single update after all embeddings are done.
+    let mut embed_results_doc: Vec<EmbedResult> = Vec::with_capacity(flat_texts.len());
+    let mut embed_results_query: Vec<EmbedResult> = Vec::with_capacity(flat_texts.len());
+
+    let total_docs = all_docs_to_embed.len() as u64;
+    let mut texts_embedded: usize = 0;
+
+    for batch in flat_texts.chunks(ctx.embed_batch_size) {
+        let batch_doc = embed::io_embed_batched(
+            ctx.provider,
+            batch,
+            ctx.embed_batch_size,
+            EmbeddingRole::Document,
+            ctx.http_client,
+        )
+        .await;
+        let batch_query = embed::io_embed_batched(
+            ctx.provider,
+            batch,
+            ctx.embed_batch_size,
+            EmbeddingRole::Query,
+            ctx.http_client,
+        )
+        .await;
+
+        embed_results_doc.extend(batch_doc);
+        embed_results_query.extend(batch_query);
+
+        texts_embedded += batch.len();
+
+        // Send progress update after each batch (if streaming).
+        // Count docs whose chunks are all within the embedded range.
+        if let Some(tx) = &progress_tx {
+            let docs_done = doc_flat_ranges
+                .iter()
+                .filter(|(start, count)| start + count <= texts_embedded)
+                .count() as u64;
+            if tx
+                .send(ProgressUpdate::Progress {
+                    indexed: docs_done,
+                    total_seen: total_docs,
+                    skipped: skipped.len() as u64,
+                })
+                .await
+                .is_err()
+            {
+                // Client disconnected — abort before writing any data.
+                return Err("client disconnected during embedding".to_string());
+            }
+        }
+    }
+
+    // Scatter embeddings back → build ChunkRows.
+    let mut all_rows: Vec<ChunkRow> = Vec::new();
+    let mut indexed_count: u64 = 0;
+
+    for (doc_idx, doc) in all_docs_to_embed.iter().enumerate() {
+        let (start, count) = doc_flat_ranges[doc_idx];
+        let doc_results_doc = &embed_results_doc[start..start + count];
+        let doc_results_query = &embed_results_query[start..start + count];
+
+        let first_failure = doc_results_doc
+            .iter()
+            .chain(doc_results_query.iter())
+            .find_map(|r| match r {
+                EmbedResult::Failed(msg) => Some(msg.clone()),
+                EmbedResult::Ok(_) => None,
+            });
+
+        if let Some(failure_msg) = first_failure {
+            skipped.push(SkippedDoc {
+                id: doc.id.clone(),
+                message: failure_msg,
+            });
+            continue;
+        }
+
+        let mut embeddings_doc: Vec<Vec<f32>> = Vec::with_capacity(doc_results_doc.len());
+        let mut embeddings_query: Vec<Vec<f32>> = Vec::with_capacity(doc_results_query.len());
+        let mut extraction_failed = false;
+
+        for r in doc_results_doc {
+            match r {
+                EmbedResult::Ok(emb) => embeddings_doc.push(emb.clone()),
+                EmbedResult::Failed(msg) => {
+                    skipped.push(SkippedDoc {
+                        id: doc.id.clone(),
+                        message: format!(
+                            "internal: EmbedResult::Failed after first_failure check (doc): {}",
+                            msg
+                        ),
+                    });
+                    extraction_failed = true;
+                    break;
+                }
+            }
+        }
+        if extraction_failed {
+            continue;
+        }
+
+        for r in doc_results_query {
+            match r {
+                EmbedResult::Ok(emb) => embeddings_query.push(emb.clone()),
+                EmbedResult::Failed(msg) => {
+                    skipped.push(SkippedDoc {
+                        id: doc.id.clone(),
+                        message: format!(
+                            "internal: EmbedResult::Failed after first_failure check (query): {}",
+                            msg
+                        ),
+                    });
+                    extraction_failed = true;
+                    break;
+                }
+            }
+        }
+        if extraction_failed {
+            continue;
+        }
+
+        for emb in &mut embeddings_doc {
+            l2_normalize(emb);
+        }
+        for emb in &mut embeddings_query {
+            l2_normalize(emb);
+        }
+
+        let doc_type = ingest::extract_doc_type(&doc.id);
+        let rows: Vec<ChunkRow> = doc
+            .chunks
+            .iter()
+            .zip(embeddings_doc.into_iter().zip(embeddings_query))
+            .map(|(chunk, (embedding, query_embedding))| ChunkRow {
+                doc_id: doc.id.clone(),
+                doc_type: doc_type.clone(),
+                chunk_index: chunk.index as i32,
+                chunk_count: chunk.count as i32,
+                chunk_token_start: chunk.token_start as i32,
+                doc_token_len: chunk.doc_token_len as i32,
+                embedding,
+                query_embedding,
+                content: chunk.text.clone(),
+            })
+            .collect();
+
+        if doc.is_changed {
+            all_delete_ids.push(doc.id.clone());
+        }
+
+        all_rows.extend(rows);
+        indexed_count += 1;
+    }
+
+    // Write phase (batched, under pipeline lock) — identical to non-streaming.
+    let has_work = !all_rows.is_empty() || !all_delete_ids.is_empty();
+
+    let _guard = ctx.store.acquire_pipeline_lock(ctx.domain, ctx.branch).await;
+
+    if has_work {
+        let last_version = match ctx
+            .store
+            .io_batch_delete_append(ctx.domain, ctx.branch, &all_delete_ids, &all_rows)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = format!("batch delete-append failed: {}", e);
+                if let Some(tx) = &progress_tx {
+                    let _ = tx.send(ProgressUpdate::Error { error: msg.clone() }).await;
+                }
+                return Err(msg);
+            }
+        };
+
+        let indexed_version = match io_optimize_on_uncached_handle(ctx.store, ctx.domain, ctx.branch).await {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = format!("index optimization failed: {}", e);
+                if let Some(tx) = &progress_tx {
+                    let _ = tx.send(ProgressUpdate::Error { error: msg.clone() }).await;
+                }
+                return Err(msg);
+            }
+        };
+
+        let tag_version = indexed_version.unwrap_or(last_version);
+        if let Err(e) = ctx
+            .store
+            .io_tag_commit(ctx.domain, ctx.branch, commit, tag_version)
+            .await
+        {
+            let msg = format!("failed to tag commit: {}", e);
+            if let Some(tx) = &progress_tx {
+                let _ = tx.send(ProgressUpdate::Error { error: msg.clone() }).await;
+            }
+            return Err(msg);
+        }
+
+        ctx.store
+            .update_last_indexed(ctx.domain, ctx.branch, commit, tag_version)
+            .await;
+    } else {
+        if let Err(e) = ctx.store.io_open_dataset(ctx.domain, ctx.branch).await {
+            let msg = format!("no-op tag: failed to ensure dataset: {}", e);
+            if let Some(tx) = &progress_tx {
+                let _ = tx.send(ProgressUpdate::Error { error: msg.clone() }).await;
+            }
+            return Err(msg);
+        }
+
+        let current_version = match ctx
+            .store
+            .io_branch_head_version(ctx.domain, ctx.branch)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = format!("no-op tag: failed to get branch head version: {}", e);
+                if let Some(tx) = &progress_tx {
+                    let _ = tx.send(ProgressUpdate::Error { error: msg.clone() }).await;
+                }
+                return Err(msg);
+            }
+        };
+
+        if let Err(e) = ctx
+            .store
+            .io_tag_commit(ctx.domain, ctx.branch, commit, current_version)
+            .await
+        {
+            let msg = format!("no-op tag: failed to tag commit: {}", e);
+            if let Some(tx) = &progress_tx {
+                let _ = tx.send(ProgressUpdate::Error { error: msg.clone() }).await;
+            }
+            return Err(msg);
+        }
+
+        ctx.store
+            .update_last_indexed(ctx.domain, ctx.branch, commit, current_version)
+            .await;
+    }
+
+    // Send Complete progress update if streaming.
+    if let Some(tx) = &progress_tx {
+        let _ = tx
+            .send(ProgressUpdate::Complete {
+                indexed_documents: indexed_count,
+                skipped: skipped.clone(),
+            })
+            .await;
+    }
+
+    Ok((indexed_count, skipped))
+}
+
 /// Optimize FTS + vector indices on an uncached dataset handle.
 /// Returns the version after optimization, or None if the dataset doesn't exist yet.
 ///
@@ -1862,6 +2537,61 @@ mod tests_risk26 {
         );
         // The tag version should be the seed version (no new data written).
         assert_eq!(resolved.unwrap(), v_seed, "tag must point to the prior data version");
+    }
+
+    /// Abort operation: pipeline must return Err and NOT advance last_indexed.
+    #[tokio::test]
+    async fn abort_operation_returns_error() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8);
+        let tokenizer = test_tokenizer();
+        let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
+        let provider = dummy_provider();
+        let http_client = reqwest::Client::new();
+        let domain = "admin/abort_test";
+        let branch = "main";
+
+        // Seed with one doc so a prior version exists.
+        let seed_row = ChunkRow {
+            doc_id: "doc/seed".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: vec![0.1; 8],
+            query_embedding: vec![0.1; 8],
+            content: "seed".to_owned(),
+        };
+        let v_seed = store
+            .io_upsert_chunks(domain, branch, "doc/seed", std::slice::from_ref(&seed_row))
+            .await
+            .expect("seed upsert");
+        store.io_tag_commit(domain, branch, "c0_seed", v_seed).await.expect("tag seed");
+        store.update_last_indexed(domain, branch, "c0_seed", v_seed).await;
+
+        // ACT: push a commit with an Abort operation.
+        let operations = vec![Operation::Abort];
+        let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
+        let result = io_run_index_pipeline(&ctx, "c1_abort", operations).await;
+
+        // ASSERT: pipeline returns Err.
+        assert!(result.is_err(), "Abort must return an error");
+        assert!(result.unwrap_err().contains("aborted"), "error message must mention abort");
+
+        // ASSERT: last_indexed NOT advanced (still at seed commit).
+        let li = store
+            .last_indexed(
+                &Domain::from_resource_path(&parse_domain(domain).unwrap()),
+                &BranchName::new(branch.to_owned()),
+            )
+            .await
+            .expect("last_indexed read");
+        assert_eq!(
+            li.commit.as_deref(),
+            Some("c0_seed"),
+            "last_indexed must NOT advance after abort"
+        );
     }
 
     /// regression (b): an empty-operations commit must tag + advance last_indexed.
@@ -2068,6 +2798,287 @@ mod tests_risk26 {
         // ASSERT: the commit is tagged.
         let resolved = store.io_resolve_commit(domain, branch, "c0_first_empty").await.expect("resolve");
         assert!(resolved.is_some(), "first-ever empty commit must be tagged");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Streaming pipeline tests: verify io_run_index_pipeline_stream produces the
+// same results as the batch io_run_index_pipeline.
+// ═══════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod tests_streaming {
+    use super::*;
+    use crate::kernel::model::BranchName;
+    use std::path::Path;
+
+    fn test_tokenizer() -> Tokenizer {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("spikes")
+            .join("tokenizer")
+            .join("tokenizer.json");
+        crate::chunk::io_load_tokenizer(&path).expect("test tokenizer must load")
+    }
+
+    fn dummy_provider() -> Provider {
+        Provider::OpenAiCompatible {
+            base_url: "http://127.0.0.1:0/never-called".to_owned(),
+            model: "test-noop".to_owned(),
+            dim: 8,
+        }
+    }
+
+    fn make_ctx<'a>(
+        store: &'a LanceStore,
+        tokenizer: &'a Tokenizer,
+        chunk_params: &'a ChunkParams,
+        provider: &'a Provider,
+        http_client: &'a reqwest::Client,
+        domain: &'a str,
+        branch: &'a str,
+    ) -> PipelineCtx<'a> {
+        PipelineCtx {
+            store,
+            tokenizer,
+            chunk_params,
+            provider,
+            http_client,
+            domain,
+            branch,
+            embed_batch_size: 32,
+        }
+    }
+
+    /// The streaming pipeline must handle an empty channel (no operations)
+    /// the same way the batch pipeline handles an empty Vec.
+    #[tokio::test]
+    async fn stream_empty_operations_tags_and_advances_last_indexed() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8);
+        let tokenizer = test_tokenizer();
+        let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
+        let provider = dummy_provider();
+        let http_client = reqwest::Client::new();
+        let domain = "admin/stream_empty";
+        let branch = "main";
+
+        // Seed with one doc.
+        let seed_row = ChunkRow {
+            doc_id: "doc/seed".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: vec![0.1; 8],
+            query_embedding: vec![0.1; 8],
+            content: "seed".to_owned(),
+        };
+        let v_seed = store
+            .io_upsert_chunks(domain, branch, "doc/seed", std::slice::from_ref(&seed_row))
+            .await
+            .expect("seed upsert");
+        store.io_tag_commit(domain, branch, "c0_seed", v_seed).await.expect("tag seed");
+        store.update_last_indexed(domain, branch, "c0_seed", v_seed).await;
+
+        // ACT: streaming pipeline with an empty channel (immediately closed).
+        let (_tx, rx) = mpsc::channel::<Operation>(16);
+        drop(_tx); // Close immediately — no operations.
+
+        let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
+        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_empty", rx, None)
+            .await
+            .expect("streaming pipeline must succeed for empty channel");
+
+        assert_eq!(indexed, 0);
+        assert_eq!(skipped.len(), 0);
+
+        let li = store
+            .last_indexed(
+                &Domain::from_resource_path(&parse_domain(domain).unwrap()),
+                &BranchName::new(branch.to_owned()),
+            )
+            .await
+            .expect("last_indexed read");
+        assert_eq!(
+            li.commit.as_deref(),
+            Some("c1_empty"),
+            "streaming pipeline must advance last_indexed for empty channel"
+        );
+    }
+
+    /// The streaming pipeline must handle all-Error operations the same way
+    /// as the batch pipeline.
+    #[tokio::test]
+    async fn stream_all_error_operations_tags_and_advances() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8);
+        let tokenizer = test_tokenizer();
+        let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
+        let provider = dummy_provider();
+        let http_client = reqwest::Client::new();
+        let domain = "admin/stream_errors";
+        let branch = "main";
+
+        // Seed.
+        let seed_row = ChunkRow {
+            doc_id: "doc/seed".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: vec![0.1; 8],
+            query_embedding: vec![0.1; 8],
+            content: "seed".to_owned(),
+        };
+        let v_seed = store
+            .io_upsert_chunks(domain, branch, "doc/seed", std::slice::from_ref(&seed_row))
+            .await
+            .expect("seed upsert");
+        store.io_tag_commit(domain, branch, "c0_seed", v_seed).await.expect("tag seed");
+        store.update_last_indexed(domain, branch, "c0_seed", v_seed).await;
+
+        // ACT: streaming pipeline with all-Error operations.
+        let (tx, rx) = mpsc::channel::<Operation>(16);
+        tx.send(Operation::Error { message: "error1".to_owned() }).await.unwrap();
+        tx.send(Operation::Error { message: "error2".to_owned() }).await.unwrap();
+        drop(tx);
+
+        let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
+        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_errors", rx, None)
+            .await
+            .expect("streaming pipeline must succeed for all-error channel");
+
+        assert_eq!(indexed, 0, "no docs should be indexed for all-error stream");
+        assert_eq!(skipped.len(), 2, "both errors should be in skipped");
+
+        let li = store
+            .last_indexed(
+                &Domain::from_resource_path(&parse_domain(domain).unwrap()),
+                &BranchName::new(branch.to_owned()),
+            )
+            .await
+            .expect("last_indexed read");
+        assert_eq!(
+            li.commit.as_deref(),
+            Some("c1_errors"),
+            "streaming pipeline must advance last_indexed past all-error commit"
+        );
+    }
+
+    /// The streaming pipeline must handle Abort operations correctly.
+    #[tokio::test]
+    async fn stream_abort_returns_error() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8);
+        let tokenizer = test_tokenizer();
+        let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
+        let provider = dummy_provider();
+        let http_client = reqwest::Client::new();
+        let domain = "admin/stream_abort";
+        let branch = "main";
+
+        // Seed.
+        let seed_row = ChunkRow {
+            doc_id: "doc/seed".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: vec![0.1; 8],
+            query_embedding: vec![0.1; 8],
+            content: "seed".to_owned(),
+        };
+        let v_seed = store
+            .io_upsert_chunks(domain, branch, "doc/seed", std::slice::from_ref(&seed_row))
+            .await
+            .expect("seed upsert");
+        store.io_tag_commit(domain, branch, "c0_seed", v_seed).await.expect("tag seed");
+        store.update_last_indexed(domain, branch, "c0_seed", v_seed).await;
+
+        // ACT: streaming pipeline with Abort.
+        let (tx, rx) = mpsc::channel::<Operation>(16);
+        tx.send(Operation::Abort).await.unwrap();
+        drop(tx);
+
+        let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
+        let result = io_run_index_pipeline_stream(&ctx, "c1_abort", rx, None).await;
+
+        assert!(result.is_err(), "Abort must return error in streaming pipeline");
+        assert!(result.unwrap_err().contains("aborted"));
+
+        // last_indexed must NOT advance.
+        let li = store
+            .last_indexed(
+                &Domain::from_resource_path(&parse_domain(domain).unwrap()),
+                &BranchName::new(branch.to_owned()),
+            )
+            .await
+            .expect("last_indexed read");
+        assert_eq!(
+            li.commit.as_deref(),
+            Some("c0_seed"),
+            "last_indexed must NOT advance after abort in streaming pipeline"
+        );
+    }
+
+    /// The streaming pipeline must handle Deleted operations and advance last_indexed.
+    #[tokio::test]
+    async fn stream_deleted_operations_tags_and_advances() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8);
+        let tokenizer = test_tokenizer();
+        let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
+        let provider = dummy_provider();
+        let http_client = reqwest::Client::new();
+        let domain = "admin/stream_deleted";
+        let branch = "main";
+
+        // Seed with a doc.
+        let seed_row = ChunkRow {
+            doc_id: "doc/seed".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: vec![0.1; 8],
+            query_embedding: vec![0.1; 8],
+            content: "seed".to_owned(),
+        };
+        let v_seed = store
+            .io_upsert_chunks(domain, branch, "doc/seed", std::slice::from_ref(&seed_row))
+            .await
+            .expect("seed upsert");
+        store.io_tag_commit(domain, branch, "c0_seed", v_seed).await.expect("tag seed");
+        store.update_last_indexed(domain, branch, "c0_seed", v_seed).await;
+
+        // ACT: streaming pipeline with a Deleted operation.
+        let (tx, rx) = mpsc::channel::<Operation>(16);
+        tx.send(Operation::Deleted { id: "doc/seed".to_owned() }).await.unwrap();
+        drop(tx);
+
+        let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
+        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_delete", rx, None)
+            .await
+            .expect("streaming pipeline must succeed for delete-only channel");
+
+        assert_eq!(indexed, 0, "no docs indexed for delete-only stream");
+        assert_eq!(skipped.len(), 0, "no skipped for delete-only stream");
+
+        let li = store
+            .last_indexed(
+                &Domain::from_resource_path(&parse_domain(domain).unwrap()),
+                &BranchName::new(branch.to_owned()),
+            )
+            .await
+            .expect("last_indexed read");
+        assert_eq!(
+            li.commit.as_deref(),
+            Some("c1_delete"),
+            "streaming pipeline must advance last_indexed for delete-only commit"
+        );
     }
 }
 

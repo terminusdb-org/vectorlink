@@ -4,6 +4,9 @@
 /dist/
 !/dist/.gitkeep
 
+# Test data
+data/
+
 # ── Rust (Phase 1+) ──
 /target/
 **/*.rs.bk

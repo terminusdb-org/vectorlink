@@ -102,6 +102,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_abort_operation() {
+        let line = r#"{"op":"Abort"}"#;
+        let op = parse_operation_line(line, 1).unwrap();
+        assert!(matches!(op, Operation::Abort));
+    }
+
+    #[test]
     fn parse_malformed_line_fails_loud() {
         let line = "not json at all";
         let result = parse_operation_line(line, 5);

@@ -168,6 +168,7 @@ pub enum Operation {
     Changed { id: String, string: String },
     Deleted { id: String },
     Error { message: String },
+    Abort,
 }
 
 /// Task status for async push operations.
@@ -177,6 +178,33 @@ pub enum TaskStatus {
     Pending { percentage: f64 },
     Complete { indexed_documents: u64, skipped: Vec<SkippedDoc> },
     Error { error: String },
+}
+
+/// Progress update sent via the streaming push response (NDJSON, one line per update).
+///
+/// When `stream=true` is sent to `POST /push`, the response body is an NDJSON stream
+/// of `ProgressUpdate` objects. The pipeline emits `Progress` after each embedding
+/// batch, then a terminal `Complete`, `Error`, or `Aborted` as the final line.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum ProgressUpdate {
+    /// Incremental progress: docs embedded so far.
+    Progress {
+        indexed: u64,
+        total_seen: u64,
+        skipped: u64,
+    },
+    /// Terminal success: all docs processed, written to Lance, commit tagged.
+    Complete {
+        indexed_documents: u64,
+        skipped: Vec<SkippedDoc>,
+    },
+    /// Terminal error: pipeline failed (e.g. Lance write error).
+    Error {
+        error: String,
+    },
+    /// Terminal abort: client sent `{"op":"Abort"}` in the NDJSON request body.
+    Aborted,
 }
 
 /// A document skipped during indexing.
@@ -297,5 +325,83 @@ mod tests {
     fn parse_domain_incomplete_ref() {
         let result = parse_domain("org/db/local/branch");
         assert!(matches!(result, Err(ParseError::IncompleteRef(_))));
+    }
+
+    // ── ProgressUpdate serialization tests ──
+
+    #[test]
+    fn progress_update_progress_serializes_correctly() {
+        let update = ProgressUpdate::Progress {
+            indexed: 32,
+            total_seen: 64,
+            skipped: 1,
+        };
+        let json = serde_json::to_string(&update).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"status":"progress","indexed":32,"total_seen":64,"skipped":1}"#
+        );
+    }
+
+    #[test]
+    fn progress_update_complete_serializes_correctly() {
+        let update = ProgressUpdate::Complete {
+            indexed_documents: 100,
+            skipped: vec![SkippedDoc {
+                id: "doc/bad".to_owned(),
+                message: "chunking failed: empty".to_owned(),
+            }],
+        };
+        let json = serde_json::to_string(&update).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"status":"complete","indexed_documents":100,"skipped":[{"id":"doc/bad","message":"chunking failed: empty"}]}"#
+        );
+    }
+
+    #[test]
+    fn progress_update_complete_with_empty_skipped() {
+        let update = ProgressUpdate::Complete {
+            indexed_documents: 50,
+            skipped: vec![],
+        };
+        let json = serde_json::to_string(&update).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"status":"complete","indexed_documents":50,"skipped":[]}"#
+        );
+    }
+
+    #[test]
+    fn progress_update_error_serializes_correctly() {
+        let update = ProgressUpdate::Error {
+            error: "batch delete-append failed: I/O error".to_owned(),
+        };
+        let json = serde_json::to_string(&update).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"status":"error","error":"batch delete-append failed: I/O error"}"#
+        );
+    }
+
+    #[test]
+    fn progress_update_aborted_serializes_correctly() {
+        let update = ProgressUpdate::Aborted;
+        let json = serde_json::to_string(&update).expect("serialize");
+        assert_eq!(json, r#"{"status":"aborted"}"#);
+    }
+
+    #[test]
+    fn progress_update_progress_zero_values() {
+        let update = ProgressUpdate::Progress {
+            indexed: 0,
+            total_seen: 0,
+            skipped: 0,
+        };
+        let json = serde_json::to_string(&update).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"status":"progress","indexed":0,"total_seen":0,"skipped":0}"#
+        );
     }
 }
