@@ -317,6 +317,101 @@ paths:
         '503': { $ref: '#/components/responses/EmbeddingBackendUnavailable' }
         '500': { $ref: '#/components/responses/UpstreamError' }
 
+  # ─────────────────────────── suggest ─────────────────────────────────────
+  /suggest:
+    get:
+      tags: [search]
+      operationId: suggest
+      summary: Typeahead assist (FTS-only, no embedding).
+      description: >
+        Fast full-text-only typeahead endpoint for UI autocomplete. Given a partial
+        query string, returns an approximate match count, completion suggestions
+        extracted from indexed content, and the first N document IDs (default 11,
+        so the UI can show 10 + a "more" indicator). No embedding call — uses the
+        existing FTS inverted index directly, optimised for sub-100ms responses.
+        `doc_type`/`doc_id` are repeated params, same as `/search`. Staleness is
+        reported via the `TerminusDB-Data-Version` response header.
+      parameters:
+        - name: domain
+          in: query
+          required: true
+          schema: { type: string }
+          description: TerminusDB graphspec domain (e.g. `admin/db`).
+        - name: commit
+          in: query
+          required: true
+          schema: { type: string }
+          description: Commit hash to search at.
+        - name: q
+          in: query
+          required: true
+          schema: { type: string }
+          description: Partial query string for typeahead.
+        - name: count
+          in: query
+          required: false
+          schema: { type: integer, default: 11, minimum: 1 }
+          description: Number of document IDs to return.
+        - name: doc_type
+          in: query
+          required: false
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+          description: Filter by document type(s) (OR within, AND with doc_id).
+        - name: doc_id
+          in: query
+          required: false
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+          description: Filter by document ID(s) (OR within, AND with doc_type).
+        - name: ancestor
+          in: query
+          required: false
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+          description: Nearest-first ancestor window for catch-up resolution.
+      responses:
+        '200':
+          description: Suggest results.
+          headers:
+            TerminusDB-Data-Version:
+              schema: { type: string }
+              description: The commit actually served (may differ from requested under staleness).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  served_commit:
+                    type: string
+                    description: The commit whose snapshot was actually searched.
+                  total_approx:
+                    type: integer
+                    description: Approximate number of matching documents.
+                  completions:
+                    type: array
+                    items: { type: string }
+                    description: Completion suggestions extracted from matched content.
+                  hits:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          description: Document ID.
+                        distance:
+                          type: number
+                          format: float
+                          description: FTS distance (lower = more relevant).
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
+
   /similar:
     get:
       tags: [search]
