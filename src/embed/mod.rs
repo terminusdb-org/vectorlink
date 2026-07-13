@@ -10,27 +10,40 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Embedding role determines which task prefix is applied.
+///
+/// Nomic-embed-text-v2-moe supports four task prefixes for different purposes:
+/// - `search_document: ` — for documents being indexed (retrieval corpus)
+/// - `search_query: ` — for search queries (retrieval queries)
+/// - `clustering: ` — for clustering / duplicate detection / entity resolution
+/// - `classification: ` — for classification / categorization tasks
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddingRole {
     Document,
     Query,
+    Clustering,
+    Classification,
 }
 
-/// Task prefix pair for a model (document prefix, query prefix).
+/// Task prefix set for a model (all four nomic prefixes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskPrefix {
     pub document: &'static str,
     pub query: &'static str,
+    pub clustering: &'static str,
+    pub classification: &'static str,
 }
 
 /// Hard-coded model → prefix table. Returns None for unknown models (no prefix).
 pub fn prefixes_for_model(model: &str) -> Option<TaskPrefix> {
     match model {
         "nomic-ai/nomic-embed-text-v2-moe"
+        | "nomic-embed-text-v2-moe"
         | "nomic-embed-v2"
         | "nomic-ai/nomic-embed-text-v1.5" => Some(TaskPrefix {
             document: "search_document: ",
             query: "search_query: ",
+            clustering: "clustering: ",
+            classification: "classification: ",
         }),
         _ => None,
     }
@@ -41,6 +54,8 @@ pub fn prefix_for_role(prefix: &TaskPrefix, role: EmbeddingRole) -> &'static str
     match role {
         EmbeddingRole::Document => prefix.document,
         EmbeddingRole::Query => prefix.query,
+        EmbeddingRole::Clustering => prefix.clustering,
+        EmbeddingRole::Classification => prefix.classification,
     }
 }
 
@@ -314,18 +329,29 @@ mod tests {
 
     // --- prefix lookup for known and unknown models ---
     #[test]
-    fn nomic_v2_has_search_prefixes() {
+    fn nomic_v2_has_all_four_prefixes() {
         let prefix = prefixes_for_model("nomic-ai/nomic-embed-text-v2-moe");
         assert!(prefix.is_some());
         let p = prefix.unwrap();
         assert_eq!(p.document, "search_document: ");
         assert_eq!(p.query, "search_query: ");
+        assert_eq!(p.clustering, "clustering: ");
+        assert_eq!(p.classification, "classification: ");
     }
 
     #[test]
     fn nomic_v2_short_name_has_prefixes() {
         let prefix = prefixes_for_model("nomic-embed-v2");
         assert!(prefix.is_some());
+    }
+
+    #[test]
+    fn nomic_v2_moe_short_name_has_prefixes() {
+        let prefix = prefixes_for_model("nomic-embed-text-v2-moe");
+        assert!(prefix.is_some());
+        let p = prefix.unwrap();
+        assert_eq!(p.document, "search_document: ");
+        assert_eq!(p.query, "search_query: ");
     }
 
     #[test]
@@ -354,6 +380,35 @@ mod tests {
         let texts = vec!["hello world".to_owned()];
         let result = apply_prefix(&texts, "unknown-model", EmbeddingRole::Document);
         assert_eq!(result, vec!["hello world"]);
+    }
+
+    // --- clustering and classification roles ---
+    #[test]
+    fn apply_prefix_clustering_role() {
+        let texts = vec!["hello world".to_owned()];
+        let result = apply_prefix(&texts, "nomic-ai/nomic-embed-text-v2-moe", EmbeddingRole::Clustering);
+        assert_eq!(result, vec!["clustering: hello world"]);
+    }
+
+    #[test]
+    fn apply_prefix_classification_role() {
+        let texts = vec!["hello world".to_owned()];
+        let result = apply_prefix(&texts, "nomic-ai/nomic-embed-text-v2-moe", EmbeddingRole::Classification);
+        assert_eq!(result, vec!["classification: hello world"]);
+    }
+
+    #[test]
+    fn apply_prefix_clustering_short_name() {
+        let texts = vec!["test".to_owned()];
+        let result = apply_prefix(&texts, "nomic-embed-v2", EmbeddingRole::Clustering);
+        assert_eq!(result, vec!["clustering: test"]);
+    }
+
+    #[test]
+    fn apply_prefix_classification_short_name() {
+        let texts = vec!["test".to_owned()];
+        let result = apply_prefix(&texts, "nomic-embed-v2", EmbeddingRole::Classification);
+        assert_eq!(result, vec!["classification: test"]);
     }
 
     // --- dimension mismatch in parse ---

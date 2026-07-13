@@ -90,7 +90,7 @@ fn parse_args() -> Result<LoadArgs, String> {
     let embed_url = std::env::var("TDB_SEARCH_EMBED_URL")
         .unwrap_or_else(|_| "http://localhost:11434".to_owned());
     let model = std::env::var("TDB_SEARCH_MODEL")
-        .unwrap_or_else(|_| "nomic-embed-v2".to_owned());
+        .unwrap_or_else(|_| "nomic-embed-text-v2-moe".to_owned());
     let dim: usize = std::env::var("TDB_SEARCH_DIM")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -119,7 +119,7 @@ fn print_usage() {
          \n\
          Environment variables:\n\
          TDB_SEARCH_EMBED_URL       Embedding endpoint (default: http://localhost:11434)\n\
-         TDB_SEARCH_MODEL           Model name (default: nomic-embed-v2)\n\
+         TDB_SEARCH_MODEL           Model name (default: nomic-embed-text-v2-moe)\n\
          TDB_SEARCH_DIM             Embedding dimension (default: 768)\n\
          TDB_SEARCH_TOKENIZER_PATH  Path to tokenizer.json"
     );
@@ -248,6 +248,10 @@ async fn main() -> ExitCode {
             Operation::Error { message } => {
                 eprintln!("  skip {}: operation error — {}", i + 1, message);
                 skipped_count += 1;
+            }
+            Operation::Abort => {
+                eprintln!("  abort: client requested abort at line {}", i + 1);
+                break;
             }
         }
     }

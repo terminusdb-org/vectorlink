@@ -31,7 +31,7 @@ impl Config {
         let embed_url = std::env::var("TDB_SEARCH_EMBED_URL")
             .unwrap_or_else(|_| "http://localhost:11434".to_owned());
         let model = std::env::var("TDB_SEARCH_MODEL")
-            .unwrap_or_else(|_| "nomic-embed-v2".to_owned());
+            .unwrap_or_else(|_| "nomic-embed-text-v2-moe".to_owned());
         let dim: usize = std::env::var("TDB_SEARCH_DIM")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -93,7 +93,7 @@ impl Config {
             port,
             embed_provider: Provider::OpenAiCompatible {
                 base_url: "http://localhost:11434".to_owned(),
-                model: "nomic-embed-v2".to_owned(),
+                model: "nomic-embed-text-v2-moe".to_owned(),
                 dim: 768,
             },
             data_dir: "/tmp/tdb-search-test".to_owned(),
@@ -111,7 +111,7 @@ impl Default for Config {
             port: 8080,
             embed_provider: Provider::OpenAiCompatible {
                 base_url: "http://localhost:11434".to_owned(),
-                model: "nomic-embed-v2".to_owned(),
+                model: "nomic-embed-text-v2-moe".to_owned(),
                 dim: 768,
             },
             data_dir: "/tmp/tdb-search-test".to_owned(),

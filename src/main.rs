@@ -39,11 +39,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[config] auto-compaction DISABLED (TDB_SEARCH_DISABLE_AUTO_COMPACTION=1)");
     }
 
+    let port = config.port;
+    let data_dir = config.data_dir.clone();
+    let model_name = config.embed_provider.model_name().to_owned();
     let service = SearchService::new(lance_store, config.clone(), tokenizer);
     let app = http_api::router(service, config);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 8080));
+    let addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port));
+    eprintln!("[tdb-search] starting on port {} | data_dir={} | model={}", port, data_dir, model_name);
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    eprintln!("[tdb-search] listening on {}", addr);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
