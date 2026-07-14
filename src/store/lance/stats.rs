@@ -37,7 +37,7 @@ impl LanceStore {
         let branches = distinct_branches.len() as u64;
 
         // Count rows and distinct doc_ids from datasets (best-effort).
-        for (_key, ds_arc) in datasets.iter() {
+        for ds_arc in datasets.values() {
             let ds = ds_arc.read().await;
             if let Ok(count) = ds.count_rows(None).await {
                 chunks += count as u64;
@@ -64,7 +64,7 @@ impl LanceStore {
 
         // Count pending index fragments across all datasets.
         let mut pending_index_fragments: u64 = 0;
-        for (_key, ds_arc) in datasets.iter() {
+        for ds_arc in datasets.values() {
             let ds = ds_arc.read().await;
             if let Ok(pending) = crate::store::vector_index::count_unindexed_fragments(&ds).await {
                 pending_index_fragments += pending;

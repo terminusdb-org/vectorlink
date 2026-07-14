@@ -570,16 +570,14 @@ impl LanceStore {
         branch: &str,
         commit: &str,
         doc_ids: &[String],
+        doc_types: &[String],
         column: &str,
     ) -> Result<std::collections::HashMap<String, Vec<f32>>, StoreError> {
-        if doc_ids.is_empty() {
-            return Ok(std::collections::HashMap::new());
-        }
-
         let snapshot = self.io_snapshot_from_cache(domain, branch, commit).await?;
 
-        // Build an IN-list filter for the requested doc_ids.
-        let filter = build_filter_expression(&[], doc_ids);
+        // Build a combined filter for doc_types and doc_ids.
+        // When both are empty, no filter is applied — all rows are returned.
+        let filter = build_filter_expression(doc_types, doc_ids);
 
         let mut scanner = snapshot.scan();
         scanner
@@ -587,11 +585,13 @@ impl LanceStore {
             .map_err(|e| StoreError::Internal(format!(
                 "result embedding projection failed: {}", e
             )))?;
-        scanner
-            .filter(&filter)
-            .map_err(|e| StoreError::Internal(format!(
-                "result embedding filter failed: {}", e
-            )))?;
+        if !filter.is_empty() {
+            scanner
+                .filter(&filter)
+                .map_err(|e| StoreError::Internal(format!(
+                    "result embedding filter failed: {}", e
+                )))?;
+        }
 
         let batches: Vec<RecordBatch> = scanner
             .try_into_stream()

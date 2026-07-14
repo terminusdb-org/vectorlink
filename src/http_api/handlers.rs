@@ -34,9 +34,9 @@ pub struct PushParams {
     pub target_commit: Option<String>,
     pub parent_commit: Option<String>,
     pub stream: Option<bool>,
-    /// When `true` and the domain is new (no existing dataset), enables
-    /// clustering embedding generation at index time. Ignored if the domain
-    /// already exists (the existing setting wins). Defaults to `false`.
+    /// When `true`, enables clustering embedding generation at index time.
+    /// Updates the domain's setting (for both new and existing domains).
+    /// Defaults to `false` (no param sent).
     pub store_clustering: Option<bool>,
 }
 
@@ -349,8 +349,11 @@ async fn handle_push(
 
     let is_stream = params.stream.unwrap_or(false);
 
-    // Per-domain clustering setting: only honored for new domains (no existing
-    // dataset). If the domain already exists, the existing setting wins.
+    // Per-domain clustering setting: update domain_settings when
+    // store_clustering=true is passed. For new domains, this creates
+    // the setting. For existing domains, this updates it (so schema
+    // changes that enable clustering after initial indexing take effect
+    // on the next reindex).
     if let Some(true) = params.store_clustering {
         let rp = parse_domain(&domain)
             .map_err(|e| {
@@ -363,18 +366,15 @@ async fn handle_push(
         if let Some(rp) = rp {
             let domain_obj = Domain::from_resource_path(&rp);
             let domain_str = domain_obj.as_str().to_owned();
-            let dataset_exists = state.service.store.dataset_path(&domain_str).exists();
-            if !dataset_exists {
-                state
-                    .service
-                    .store
-                    .domain_settings
-                    .set(
-                        &domain_str,
-                        crate::config::DomainSettings { store_clustering: true },
-                    )
-                    .await;
-            }
+            state
+                .service
+                .store
+                .domain_settings
+                .set(
+                    &domain_str,
+                    crate::config::DomainSettings { store_clustering: true },
+                )
+                .await;
         }
     }
 
@@ -1147,8 +1147,14 @@ async fn handle_statistics(
 #[derive(Debug, Deserialize)]
 pub struct EmbeddingsParams {
     pub domain: String,
+    /// Commit ID (same contract as /search).
+    pub commit: String,
     /// Comma-separated list of doc IDs to fetch embeddings for.
-    pub doc_ids: String,
+    /// Now optional — when empty, doc_types or all-embeddings mode is used.
+    pub doc_ids: Option<String>,
+    /// Comma-separated list of doc types to filter by.
+    /// When empty along with doc_ids, all embeddings are returned.
+    pub doc_types: Option<String>,
     /// Nearest-first ancestor window (same contract as /search).
     pub ancestors: Option<Vec<String>>,
 }
@@ -1159,19 +1165,25 @@ async fn handle_embeddings(
 ) -> Response {
     let doc_ids: Vec<String> = params
         .doc_ids
+        .as_deref()
+        .unwrap_or("")
         .split(',')
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .collect();
 
-    if doc_ids.is_empty() {
-        return (StatusCode::BAD_REQUEST, "doc_ids parameter is required and must not be empty")
-            .into_response();
-    }
+    let doc_types: Vec<String> = params
+        .doc_types
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     let ancestors = params.ancestors.unwrap_or_default();
 
-    match state.service.fetch_embeddings(&params.domain, &doc_ids, &ancestors).await {
+    match state.service.fetch_embeddings(&params.domain, &params.commit, &doc_ids, &doc_types, &ancestors).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => service_error_to_response(e),
     }

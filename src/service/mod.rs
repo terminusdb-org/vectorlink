@@ -1021,6 +1021,7 @@ impl SearchService {
                     &branch,
                     &served_commit,
                     &result_ids,
+                    &[],
                     "embedding",
                 )
                 .await
@@ -1247,6 +1248,7 @@ impl SearchService {
                     &branch,
                     &served_commit,
                     &all_doc_ids,
+                    &[],
                     "embedding",
                 )
                 .await
@@ -1359,6 +1361,7 @@ impl SearchService {
                     &branch,
                     &served_commit,
                     &all_doc_ids,
+                    &[],
                     "embedding",
                 )
                 .await
@@ -1400,6 +1403,7 @@ impl SearchService {
                     &branch,
                     &served_commit,
                     &all_ids_vec,
+                    &[],
                     "clustering_embedding",
                 )
                 .await
@@ -1493,12 +1497,15 @@ impl SearchService {
         Ok(self.store.statistics_for_domain(&domain_str).await)
     }
 
-    /// Fetch stored embeddings for a set of doc IDs.
+    /// Fetch stored embeddings for a set of doc IDs and/or doc types.
     /// Returns both document and clustering embeddings (clustering only when enabled).
+    /// When both doc_ids and doc_types are empty, all embeddings are returned.
     pub async fn fetch_embeddings(
         &self,
         domain_raw: &str,
+        commit: &str,
         doc_ids: &[String],
+        doc_types: &[String],
         ancestors: &[String],
     ) -> Result<EmbeddingsResult, ServiceError> {
         let rp =
@@ -1515,19 +1522,19 @@ impl SearchService {
         let branch = extract_branch(&rp);
 
         let served_commit = self
-            .resolve_searchable_commit(&domain, &branch, "", ancestors)
+            .resolve_searchable_commit(&domain, &branch, commit, ancestors)
             .await?;
 
         let doc_embeddings = self
             .store
-            .io_fetch_result_embeddings(&domain_str, &branch, &served_commit, doc_ids, "embedding")
+            .io_fetch_result_embeddings(&domain_str, &branch, &served_commit, doc_ids, doc_types, "embedding")
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         let store_clustering = self.store.domain_settings.store_clustering(&domain_str).await;
         let clustering_embeddings = if store_clustering {
             self.store
-                .io_fetch_result_embeddings(&domain_str, &branch, &served_commit, doc_ids, "clustering_embedding")
+                .io_fetch_result_embeddings(&domain_str, &branch, &served_commit, doc_ids, doc_types, "clustering_embedding")
                 .await
                 .map_err(|e| ServiceError::Internal(e.to_string()))?
         } else {
@@ -3850,6 +3857,7 @@ mod tests_exact_duplicate_override {
                 "main",
                 "c1",
                 &["doc/x".to_owned(), "doc/y".to_owned()],
+                &[],
                 "embedding",
             )
             .await
@@ -3925,6 +3933,7 @@ mod tests_exact_duplicate_override {
                 "main",
                 "c1",
                 &["doc/p".to_owned(), "doc/q".to_owned()],
+                &[],
                 "clustering_embedding",
             )
             .await
@@ -3939,6 +3948,231 @@ mod tests_exact_duplicate_override {
             crate::kernel::distance::vectors_equal(result.get("doc/q").unwrap(), &qemb_b),
             "fetched clustering_embedding for doc/q must match stored"
         );
+    }
+
+    /// io_fetch_result_embeddings with doc_types filter returns only matching types.
+    #[tokio::test]
+    async fn fetch_result_embeddings_filters_by_doc_type() {
+        let dim = 8;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), dim);
+
+        let row_a = ChunkRow {
+            doc_id: "doc/a".to_owned(),
+            doc_type: "Product".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: make_embedding(dim, 1.0),
+            clustering_embedding: make_embedding(dim, 2.0),
+            content: "a".to_owned(),
+        };
+        let row_b = ChunkRow {
+            doc_id: "doc/b".to_owned(),
+            doc_type: "Customer".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: make_embedding(dim, 5.0),
+            clustering_embedding: make_embedding(dim, 6.0),
+            content: "b".to_owned(),
+        };
+
+        let domain = "admin/filter_type";
+        store
+            .io_upsert_chunks(domain, "main", "doc/a", std::slice::from_ref(&row_a))
+            .await
+            .unwrap();
+        store
+            .io_upsert_chunks(domain, "main", "doc/b", std::slice::from_ref(&row_b))
+            .await
+            .unwrap();
+        store
+            .io_refresh_cached_dataset(domain, "main")
+            .await
+            .unwrap();
+        let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+        let version = ds_arc.read().await.version().version;
+        store
+            .io_tag_commit(domain, "main", "c1", version)
+            .await
+            .unwrap();
+
+        let result = store
+            .io_fetch_result_embeddings(
+                domain,
+                "main",
+                "c1",
+                &[],
+                &["Product".to_owned()],
+                "embedding",
+            )
+            .await
+            .expect("fetch must succeed");
+
+        assert_eq!(result.len(), 1, "only Product docs should be returned");
+        assert!(
+            result.contains_key("doc/a"),
+            "doc/a (Product) should be present"
+        );
+        assert!(
+            !result.contains_key("doc/b"),
+            "doc/b (Customer) should be filtered out"
+        );
+    }
+
+    /// io_fetch_result_embeddings with both doc_ids and doc_types empty returns all embeddings.
+    #[tokio::test]
+    async fn fetch_result_embeddings_all_when_no_filters() {
+        let dim = 8;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), dim);
+
+        let row_a = ChunkRow {
+            doc_id: "doc/a".to_owned(),
+            doc_type: "Product".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: make_embedding(dim, 1.0),
+            clustering_embedding: make_embedding(dim, 2.0),
+            content: "a".to_owned(),
+        };
+        let row_b = ChunkRow {
+            doc_id: "doc/b".to_owned(),
+            doc_type: "Customer".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: make_embedding(dim, 5.0),
+            clustering_embedding: make_embedding(dim, 6.0),
+            content: "b".to_owned(),
+        };
+
+        let domain = "admin/all_emb";
+        store
+            .io_upsert_chunks(domain, "main", "doc/a", std::slice::from_ref(&row_a))
+            .await
+            .unwrap();
+        store
+            .io_upsert_chunks(domain, "main", "doc/b", std::slice::from_ref(&row_b))
+            .await
+            .unwrap();
+        store
+            .io_refresh_cached_dataset(domain, "main")
+            .await
+            .unwrap();
+        let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+        let version = ds_arc.read().await.version().version;
+        store
+            .io_tag_commit(domain, "main", "c1", version)
+            .await
+            .unwrap();
+
+        let result = store
+            .io_fetch_result_embeddings(
+                domain,
+                "main",
+                "c1",
+                &[],
+                &[],
+                "embedding",
+            )
+            .await
+            .expect("fetch must succeed");
+
+        assert_eq!(result.len(), 2, "all embeddings should be returned when no filters");
+        assert!(result.contains_key("doc/a"));
+        assert!(result.contains_key("doc/b"));
+    }
+
+    /// io_fetch_result_embeddings with both doc_ids and doc_types applies AND filter.
+    #[tokio::test]
+    async fn fetch_result_embeddings_combined_filter() {
+        let dim = 8;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), dim);
+
+        let row_a = ChunkRow {
+            doc_id: "doc/a".to_owned(),
+            doc_type: "Product".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: make_embedding(dim, 1.0),
+            clustering_embedding: make_embedding(dim, 2.0),
+            content: "a".to_owned(),
+        };
+        let row_b = ChunkRow {
+            doc_id: "doc/b".to_owned(),
+            doc_type: "Product".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: make_embedding(dim, 5.0),
+            clustering_embedding: make_embedding(dim, 6.0),
+            content: "b".to_owned(),
+        };
+        let row_c = ChunkRow {
+            doc_id: "doc/c".to_owned(),
+            doc_type: "Customer".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: make_embedding(dim, 9.0),
+            clustering_embedding: make_embedding(dim, 10.0),
+            content: "c".to_owned(),
+        };
+
+        let domain = "admin/combined_filter";
+        store
+            .io_upsert_chunks(domain, "main", "doc/a", std::slice::from_ref(&row_a))
+            .await
+            .unwrap();
+        store
+            .io_upsert_chunks(domain, "main", "doc/b", std::slice::from_ref(&row_b))
+            .await
+            .unwrap();
+        store
+            .io_upsert_chunks(domain, "main", "doc/c", std::slice::from_ref(&row_c))
+            .await
+            .unwrap();
+        store
+            .io_refresh_cached_dataset(domain, "main")
+            .await
+            .unwrap();
+        let ds_arc = store.io_open_dataset(domain, "main").await.unwrap();
+        let version = ds_arc.read().await.version().version;
+        store
+            .io_tag_commit(domain, "main", "c1", version)
+            .await
+            .unwrap();
+
+        // Filter: doc_type=Product AND doc_id IN (doc/a, doc/b) → doc/a and doc/b
+        // doc/c is excluded: it's Customer AND not in doc_ids list
+        let result = store
+            .io_fetch_result_embeddings(
+                domain,
+                "main",
+                "c1",
+                &["doc/a".to_owned(), "doc/b".to_owned()],
+                &["Product".to_owned()],
+                "embedding",
+            )
+            .await
+            .expect("fetch must succeed");
+
+        assert_eq!(result.len(), 2, "AND filter should return doc/a and doc/b (both Product and in doc_ids)");
+        assert!(result.contains_key("doc/a"));
+        assert!(result.contains_key("doc/b"));
+        assert!(!result.contains_key("doc/c"), "doc/c is Customer and not in doc_ids");
     }
 }
 
