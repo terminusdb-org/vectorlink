@@ -99,6 +99,23 @@ paths:
             The commit the delta is computed from (the prior last-indexed).
             Absent means the first index of this lineage (every doc is Inserted).
           schema: { type: string }
+        - name: stream
+          in: query
+          required: false
+          description: >
+            When true, the response is an NDJSON stream of progress updates
+            (one JSON object per line) with an `X-Task-Id` header, instead of
+            the default text/plain task-id response. The stream stays open
+            until indexing completes or aborts.
+          schema: { type: boolean, default: false }
+        - name: store_clustering
+          in: query
+          required: false
+          description: >
+            When true, enables clustering embedding generation at index time.
+            Updates the domain's setting (for both new and existing domains).
+            Defaults to false.
+          schema: { type: boolean, default: false }
       requestBody:
         required: true
         content:
@@ -117,11 +134,26 @@ paths:
                   {"op":"Error","message":"Failed to render terminusdb:///star-wars/People/99"}
       responses:
         '200':
-          description: Push accepted; indexing runs asynchronously. Poll `/check`.
+          description: >
+            Push accepted; indexing runs asynchronously. Poll `/check` (or read
+            the NDJSON stream if `stream=true`).
+          headers:
+            X-Task-Id:
+              description: Opaque task id (present in both stream and non-stream modes).
+              schema: { type: string }
           content:
             text/plain:
-              schema: { type: string, description: Opaque task id. }
+              schema: { type: string, description: Opaque task id (non-stream mode). }
               examples: { taskId: { value: "task-7f3a9c" } }
+            application/x-ndjson:
+              schema:
+                type: object
+                description: >
+                  One progress update per line (stream mode only). Each line is
+                  a JSON object with status, percentage, and optionally
+                  indexed_documents or error fields.
+              examples:
+                progress: { value: { status: "indexing", percentage: 42.5 } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '409':
@@ -220,6 +252,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Domain'
         - $ref: '#/components/parameters/Commit'
+        - $ref: '#/components/parameters/BranchOptional'
         - name: q
           in: query
           required: true
@@ -282,6 +315,11 @@ paths:
           required: false
           description: Optional on POST — body `commit` wins (see SearchRequest).
           schema: { type: string }
+        - name: branch
+          in: query
+          required: false
+          description: Optional on POST — body `branch` wins. When `commit` is absent, resolves the latest indexed commit for this branch.
+          schema: { type: string, default: main }
         - $ref: '#/components/parameters/Q'
         - $ref: '#/components/parameters/Start'
         - $ref: '#/components/parameters/Count'
@@ -337,11 +375,8 @@ paths:
           required: true
           schema: { type: string }
           description: TerminusDB graphspec domain (e.g. `admin/db`).
-        - name: commit
-          in: query
-          required: true
-          schema: { type: string }
-          description: Commit hash to search at.
+        - $ref: '#/components/parameters/Commit'
+        - $ref: '#/components/parameters/BranchOptional'
         - name: q
           in: query
           required: true
@@ -430,6 +465,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Domain'
         - $ref: '#/components/parameters/Commit'
+        - $ref: '#/components/parameters/BranchOptional'
         - name: id
           in: query
           required: true
@@ -475,6 +511,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Domain'
         - $ref: '#/components/parameters/Commit'
+        - $ref: '#/components/parameters/BranchOptional'
         - name: id
           in: query
           required: false
@@ -554,6 +591,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Domain'
         - $ref: '#/components/parameters/Commit'
+        - $ref: '#/components/parameters/BranchOptional'
         - name: threshold
           in: query
           required: false
@@ -587,6 +625,7 @@ paths:
         - $ref: '#/components/parameters/Snippet'
         - $ref: '#/components/parameters/Start'
         - $ref: '#/components/parameters/Count'
+        - $ref: '#/components/parameters/Ancestor'
       responses:
         '200':
           description: >
@@ -984,9 +1023,8 @@ components:
           • `org/db/<repo>`                   → `org/db/<repo>/branch/main`
           • `org/db/<repo>/branch/<branch>`   → that branch
           • `org/db/<repo>/commit/<commit>`   → that snapshot, directly
-        A branch is resolved to a concrete commit by the caller (TerminusDB owns
-        branch heads); the searched snapshot is always explicit (`commit`), never
-        an implicit "latest".
+        When `commit` is omitted, the engine resolves the latest indexed commit
+        for the given `branch` (defaulting to `main`).
       schema: { type: string }
       example: admin/star_wars
     Branch:
@@ -995,11 +1033,22 @@ components:
       required: true
       description: Branch name.
       schema: { type: string, default: main }
+    BranchOptional:
+      name: branch
+      in: query
+      required: false
+      description: >
+        Branch name. When `commit` is omitted, the engine resolves the latest
+        indexed commit for this branch (defaulting to `main`).
+      schema: { type: string, default: main }
     Commit:
       name: commit
       in: query
-      required: true
-      description: Opaque commit hash; the searched snapshot.
+      required: false
+      description: >
+        Opaque commit hash — the searched snapshot. When omitted, the engine
+        resolves the latest indexed commit for the given `branch` (defaulting
+        to `main`).
       schema: { type: string }
     Q:
       name: q
@@ -1021,7 +1070,7 @@ components:
       in: query
       required: false
       description: Max results to return (pagination page size).
-      schema: { type: integer, minimum: 1, default: 50 }
+      schema: { type: integer, minimum: 1, default: 10 }
     Mode:
       name: mode
       in: query
@@ -1209,6 +1258,7 @@ components:
         - $ref: '#/components/schemas/OpChanged'
         - $ref: '#/components/schemas/OpDeleted'
         - $ref: '#/components/schemas/OpError'
+        - $ref: '#/components/schemas/OpAbort'
       discriminator:
         propertyName: op
         mapping:
@@ -1216,6 +1266,7 @@ components:
           Changed:  '#/components/schemas/OpChanged'
           Deleted:  '#/components/schemas/OpDeleted'
           Error:    '#/components/schemas/OpError'
+          Abort:    '#/components/schemas/OpAbort'
     OpInserted:
       type: object
       required: [op, id, string]
@@ -1242,6 +1293,11 @@ components:
       properties:
         op:      { type: string, const: Error }
         message: { type: string, description: "Upstream per-doc render failure; skipped and recorded, never silently dropped." }
+    OpAbort:
+      type: object
+      required: [op]
+      properties:
+        op: { type: string, const: Abort, description: "Signals abort of the current push. The engine stops processing and returns 422." }
 
     TaskPending:
       type: object
