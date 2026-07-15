@@ -31,6 +31,17 @@ pub use self::schema::{
 pub use self::dedup::{dedup_chunks_to_documents, pairs_from_neighbours};
 pub use self::index::{io_compact_data, io_ensure_fts_index_on_dataset};
 
+/// A single embedding record for streaming. Contains the doc_id, the document
+/// embedding, and optionally the clustering embedding (when store_clustering
+/// is true).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EmbeddingRecord {
+    pub doc_id: String,
+    pub embedding: Vec<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clustering_embedding: Option<Vec<f32>>,
+}
+
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -682,7 +693,7 @@ impl LanceStore {
 ///
 /// This replaces the old `domain.replace('/', "__")` encoding. Existing
 /// on-disk datasets using `__` are incompatible — a clean re-index is required.
-fn encode_domain_path(domain: &str) -> String {
+pub fn encode_domain_path(domain: &str) -> String {
     use form_urlencoded::byte_serialize;
     domain
         .split('/')

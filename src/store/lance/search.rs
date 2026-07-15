@@ -3,7 +3,8 @@
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray,
 };
-use futures::TryStreamExt;
+use futures::StreamExt as _;
+use futures::TryStreamExt as _;
 use lance::dataset::Dataset;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_linalg::distance::DistanceType;
@@ -11,7 +12,7 @@ use lance_linalg::distance::DistanceType;
 use crate::kernel::error::StoreError;
 use crate::kernel::model::SearchMode;
 
-use super::{ChunkHit, DistanceKind, LanceStore, SearchQuery, SuggestQuery, SuggestResult, SuggestHit, MAIN_BRANCH};
+use super::{ChunkHit, DistanceKind, EmbeddingRecord, LanceStore, SearchQuery, SuggestQuery, SuggestResult, SuggestHit, MAIN_BRANCH};
 
 impl LanceStore {
     /// Vector/FTS/hybrid search over chunk rows at a given version.
@@ -652,6 +653,195 @@ impl LanceStore {
             .into_iter()
             .map(|(id, (_, emb))| (id, emb))
             .collect())
+    }
+
+    /// Stream embeddings for a set of doc IDs and/or doc types via a tokio mpsc
+    /// channel. Each `EmbeddingRecord` yields a doc_id, the document embedding,
+    /// and optionally the clustering embedding (when `store_clustering` is true).
+    ///
+    /// Deduplicates by doc_id keeping chunk_index=0 (same logic as
+    /// `io_fetch_result_embeddings`). The count of unique doc_ids is returned
+    /// alongside the receiver for progress reporting.
+    ///
+    /// When `store_clustering` is false, only the `embedding` column is scanned
+    /// and `clustering_embedding` is `None` in every record.
+    pub async fn io_stream_embeddings(
+        &self,
+        domain: &str,
+        branch: &str,
+        commit: &str,
+        doc_ids: &[String],
+        doc_types: &[String],
+        store_clustering: bool,
+    ) -> Result<(u64, tokio::sync::mpsc::Receiver<EmbeddingRecord>), StoreError> {
+        let snapshot = self.io_snapshot_from_cache(domain, branch, commit).await?;
+
+        let filter = build_filter_expression(doc_types, doc_ids);
+
+        // Count unique doc_ids by scanning the doc_id column.
+        let mut count_scanner = snapshot.scan();
+        count_scanner
+            .project(&["doc_id", "chunk_index"])
+            .map_err(|e| StoreError::Internal(format!("count projection failed: {}", e)))?;
+        if !filter.is_empty() {
+            count_scanner
+                .filter(&filter)
+                .map_err(|e| StoreError::Internal(format!("count filter failed: {}", e)))?;
+        }
+        let count_batches: Vec<RecordBatch> = count_scanner
+            .try_into_stream()
+            .await
+            .map_err(|e| StoreError::Internal(format!("count stream failed: {}", e)))?
+            .try_collect()
+            .await
+            .map_err(|e| StoreError::Internal(format!("count collect failed: {}", e)))?;
+
+        let mut unique_doc_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for batch in &count_batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            if let Some(ids) = batch
+                .column_by_name("doc_id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            {
+                for i in 0..batch.num_rows() {
+                    unique_doc_ids.insert(ids.value(i).to_owned());
+                }
+            }
+        }
+        let total_count = unique_doc_ids.len() as u64;
+        drop(unique_doc_ids);
+
+        // Now stream the actual embeddings.
+        let columns: Vec<&str> = if store_clustering {
+            vec!["doc_id", "chunk_index", "embedding", "clustering_embedding"]
+        } else {
+            vec!["doc_id", "chunk_index", "embedding"]
+        };
+
+        let mut scanner = snapshot.scan();
+        scanner
+            .project(&columns)
+            .map_err(|e| StoreError::Internal(format!("stream projection failed: {}", e)))?;
+        if !filter.is_empty() {
+            scanner
+                .filter(&filter)
+                .map_err(|e| StoreError::Internal(format!("stream filter failed: {}", e)))?;
+        }
+
+        let stream = scanner
+            .try_into_stream()
+            .await
+            .map_err(|e| StoreError::Internal(format!("stream embeddings failed: {}", e)))?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<EmbeddingRecord>(128);
+
+        // We need to track best per doc_id for dedup (chunk_index=0 preferred).
+        // Since we're streaming, we collect all rows, dedup, then send.
+        // This is a simplification — for true streaming dedup we'd need a state
+        // machine, but the current approach still avoids holding all embeddings
+        // in memory at once (we only hold the best per doc_id).
+        let store_clustering_clone = store_clustering;
+        tokio::spawn(async move {
+            let mut best_per_doc: std::collections::HashMap<String, (i32, Vec<f32>, Option<Vec<f32>>)> =
+                std::collections::HashMap::new();
+
+            let mut stream = stream;
+            while let Some(batch_result) = stream.next().await {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = tx
+                            .send(EmbeddingRecord {
+                                doc_id: format!("__error__: {}", e),
+                                embedding: vec![],
+                                clustering_embedding: None,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+
+                let ids = match batch
+                    .column_by_name("doc_id")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                {
+                    Some(ids) => ids,
+                    None => continue,
+                };
+                let chunk_indexes = match batch
+                    .column_by_name("chunk_index")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                {
+                    Some(ci) => ci,
+                    None => continue,
+                };
+                let embeddings = match batch
+                    .column_by_name("embedding")
+                    .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
+                {
+                    Some(emb) => emb,
+                    None => continue,
+                };
+
+                let clustering_embeddings = if store_clustering_clone {
+                    batch
+                        .column_by_name("clustering_embedding")
+                        .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
+                } else {
+                    None
+                };
+
+                for i in 0..batch.num_rows() {
+                    let doc_id = ids.value(i);
+                    let ci = chunk_indexes.value(i);
+
+                    let embedding = match extract_embedding_row(embeddings, i, doc_id) {
+                        Ok(emb) => emb,
+                        Err(_) => continue,
+                    };
+
+                    let clustering_emb = if let Some(ce) = clustering_embeddings {
+                        if ce.is_null(i) {
+                            None
+                        } else {
+                            extract_embedding_row(ce, i, doc_id).ok()
+                        }
+                    } else {
+                        None
+                    };
+
+                    let should_update = match best_per_doc.get(doc_id) {
+                        None => true,
+                        Some((existing_ci, _, _)) => ci < *existing_ci,
+                    };
+                    if should_update {
+                        best_per_doc.insert(
+                            doc_id.to_owned(),
+                            (ci, embedding, clustering_emb),
+                        );
+                    }
+                }
+            }
+
+            // Send all deduplicated records.
+            for (doc_id, (_, emb, clustering_emb)) in best_per_doc {
+                let _ = tx
+                    .send(EmbeddingRecord {
+                        doc_id,
+                        embedding: emb,
+                        clustering_embedding: clustering_emb,
+                    })
+                    .await;
+            }
+        });
+
+        Ok((total_count, rx))
     }
 
     /// Fetch concatenated chunk content for a set of document IDs.

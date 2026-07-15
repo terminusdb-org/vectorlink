@@ -1148,7 +1148,9 @@ async fn handle_statistics(
 pub struct EmbeddingsParams {
     pub domain: String,
     /// Commit ID (same contract as /search).
-    pub commit: String,
+    pub commit: Option<String>,
+    /// Branch name — when commit is absent, serves the latest indexed commit.
+    pub branch: Option<String>,
     /// Comma-separated list of doc IDs to fetch embeddings for.
     /// Now optional — when empty, doc_types or all-embeddings mode is used.
     pub doc_ids: Option<String>,
@@ -1162,6 +1164,58 @@ pub struct EmbeddingsParams {
 async fn handle_embeddings(
     State(state): State<AppState>,
     Query(params): Query<EmbeddingsParams>,
+    headers: HeaderMap,
+) -> Response {
+    let accept = headers
+        .get("accept")
+        .map(|v| v.to_str().unwrap_or(""))
+        .unwrap_or("");
+
+    let commit_raw = params.commit.as_deref().unwrap_or("");
+    let branch = params.branch.as_deref();
+    let commit = match state.service.resolve_commit_or_branch(&params.domain, commit_raw, branch).await {
+        Ok(c) => c,
+        Err(e) => return service_error_to_response(e),
+    };
+
+    if accept.contains("application/x-ndjson") {
+        return handle_embeddings_stream(state, &commit, params).await;
+    }
+
+    let doc_ids: Vec<String> = params
+        .doc_ids
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let doc_types: Vec<String> = params
+        .doc_types
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let ancestors = params.ancestors.unwrap_or_default();
+
+    match state.service.fetch_embeddings(&params.domain, &commit, &doc_ids, &doc_types, &ancestors).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(e) => service_error_to_response(e),
+    }
+}
+
+/// Streaming NDJSON handler for GET /embeddings.
+/// Returns headers: X-Served-Commit, X-Store-Clustering, X-Total-Count.
+/// Body is NDJSON: one JSON object per line, each containing doc_id, embedding,
+/// and optionally clustering_embedding.
+async fn handle_embeddings_stream(
+    state: AppState,
+    commit: &str,
+    params: EmbeddingsParams,
 ) -> Response {
     let doc_ids: Vec<String> = params
         .doc_ids
@@ -1183,8 +1237,247 @@ async fn handle_embeddings(
 
     let ancestors = params.ancestors.unwrap_or_default();
 
-    match state.service.fetch_embeddings(&params.domain, &params.commit, &doc_ids, &doc_types, &ancestors).await {
+    match state.service.fetch_embeddings_stream(&params.domain, commit, &doc_ids, &doc_types, &ancestors).await {
+        Ok(stream_result) => {
+            let served_commit = stream_result.served_commit;
+            let store_clustering = stream_result.store_clustering;
+            let total_count = stream_result.total_count;
+            let receiver = stream_result.receiver;
+
+            // Convert the mpsc receiver into an async stream of NDJSON lines.
+            let mapped = futures::StreamExt::map(
+                tokio_stream::wrappers::ReceiverStream::new(receiver),
+                |record| {
+                    serde_json::to_string(&record)
+                        .map(|json| format!("{}\n", json))
+                        .unwrap_or_default()
+                },
+            );
+            let ndjson_stream = futures::StreamExt::map(mapped, |line| Ok::<_, std::convert::Infallible>(line));
+
+            let body = Body::from_stream(ndjson_stream);
+
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("content-type", "application/x-ndjson".parse().unwrap());
+            headers.insert("x-served-commit", served_commit.parse().unwrap());
+            headers.insert(
+                "x-store-clustering",
+                if store_clustering { "true" } else { "false" }.parse().unwrap(),
+            );
+            headers.insert(
+                "x-total-count",
+                total_count.to_string().parse().unwrap(),
+            );
+
+            (StatusCode::OK, headers, body).into_response()
+        }
+        Err(e) => service_error_to_response(e),
+    }
+}
+
+// ──────────────────── POST /embeddings (batch + streaming) ────────────────────
+
+/// JSON body for POST /embeddings (batch and streaming-response modes).
+#[derive(Debug, Deserialize)]
+pub struct EmbeddingsBody {
+    pub domain: String,
+    /// Commit ID (same contract as /search).
+    pub commit: Option<String>,
+    /// Branch name — when commit is absent, serves the latest indexed commit.
+    pub branch: Option<String>,
+    /// List of doc IDs to fetch embeddings for.
+    /// When empty along with doc_types, all embeddings are returned.
+    #[serde(default)]
+    pub doc_ids: Vec<String>,
+    /// List of doc types to filter by.
+    #[serde(default)]
+    pub doc_types: Vec<String>,
+    /// Nearest-first ancestor window (same contract as /search).
+    #[serde(default)]
+    pub ancestors: Vec<String>,
+    /// When true, response is NDJSON stream; when false, single JSON response.
+    #[serde(default)]
+    pub stream: bool,
+}
+
+/// NDJSON line for bidirectional streaming mode (Content-Type: application/x-ndjson).
+/// Each line carries domain, commit, and a single doc_id (or doc_types for batch start).
+#[derive(Debug, Deserialize)]
+pub struct EmbeddingsNdjsonLine {
+    pub domain: String,
+    pub commit: String,
+    pub doc_id: Option<String>,
+    #[serde(default)]
+    pub doc_types: Vec<String>,
+    #[serde(default)]
+    pub ancestors: Vec<String>,
+}
+
+/// POST /embeddings handler.
+///
+/// Three modes based on Content-Type and `stream` flag:
+/// 1. JSON body with stream=false → single JSON response (batch)
+/// 2. JSON body with stream=true → NDJSON streaming response
+/// 3. NDJSON request body → bidirectional streaming (one doc_id per line in, one embedding per line out)
+async fn handle_embeddings_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if content_type.contains("application/x-ndjson") {
+        return handle_embeddings_post_ndjson(state, body).await;
+    }
+
+    // Parse JSON body
+    let params: EmbeddingsBody = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid JSON body: {}", e)})),
+            ).into_response();
+        }
+    };
+
+    let commit_raw = params.commit.as_deref().unwrap_or("");
+    let branch = params.branch.as_deref();
+    let commit = match state.service.resolve_commit_or_branch(&params.domain, commit_raw, branch).await {
+        Ok(c) => c,
+        Err(e) => return service_error_to_response(e),
+    };
+
+    if params.stream {
+        // Streaming response mode: JSON body in, NDJSON stream out
+        return embeddings_stream_response(
+            &state,
+            &params.domain,
+            &commit,
+            &params.doc_ids,
+            &params.doc_types,
+            &params.ancestors,
+        ).await;
+    }
+
+    // Batch mode: JSON body in, JSON response out
+    match state.service.fetch_embeddings(&params.domain, &commit, &params.doc_ids, &params.doc_types, &params.ancestors).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(e) => service_error_to_response(e),
+    }
+}
+
+/// Bidirectional NDJSON streaming: reads doc_id lines from request body,
+/// fetches embeddings one at a time (or in small batches), and streams
+/// NDJSON embedding records back.
+///
+/// The first line may include `doc_types` to pre-filter. Subsequent lines
+/// each carry a single `doc_id`. Domain and commit must be present on every line
+/// (or at least the first line — subsequent lines inherit from the first).
+async fn handle_embeddings_post_ndjson(
+    state: AppState,
+    body: axum::body::Bytes,
+) -> Response {
+    let body_str = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid UTF-8"}))).into_response(),
+    };
+
+    // Parse all NDJSON lines, collecting doc_ids.
+    // The first line provides domain/commit/ancestors/doc_types context.
+    let mut domain = String::new();
+    let mut commit = String::new();
+    let mut ancestors: Vec<String> = Vec::new();
+    let mut doc_types: Vec<String> = Vec::new();
+    let mut doc_ids: Vec<String> = Vec::new();
+
+    for (i, line) in body_str.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+
+        let parsed: EmbeddingsNdjsonLine = match serde_json::from_str(trimmed) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Invalid NDJSON line {}: {}", i, e)})),
+                ).into_response();
+            }
+        };
+
+        if i == 0 || domain.is_empty() {
+            domain = parsed.domain;
+            commit = parsed.commit;
+            if !parsed.ancestors.is_empty() {
+                ancestors = parsed.ancestors;
+            }
+            if !parsed.doc_types.is_empty() {
+                doc_types = parsed.doc_types;
+            }
+        }
+
+        if let Some(id) = parsed.doc_id {
+            doc_ids.push(id);
+        }
+    }
+
+    if domain.is_empty() || commit.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing domain or commit in NDJSON request"})),
+        ).into_response();
+    }
+
+    // Stream all collected doc_ids as NDJSON
+    embeddings_stream_response(&state, &domain, &commit, &doc_ids, &doc_types, &ancestors).await
+}
+
+/// Build an NDJSON streaming response from the service layer.
+/// Shared by both JSON-body-with-stream and NDJSON-body modes.
+async fn embeddings_stream_response(
+    state: &AppState,
+    domain: &str,
+    commit: &str,
+    doc_ids: &[String],
+    doc_types: &[String],
+    ancestors: &[String],
+) -> Response {
+    match state.service.fetch_embeddings_stream(domain, commit, doc_ids, doc_types, ancestors).await {
+        Ok(stream_result) => {
+            let served_commit = stream_result.served_commit;
+            let store_clustering = stream_result.store_clustering;
+            let total_count = stream_result.total_count;
+            let receiver = stream_result.receiver;
+
+            let mapped = futures::StreamExt::map(
+                tokio_stream::wrappers::ReceiverStream::new(receiver),
+                |record| {
+                    serde_json::to_string(&record)
+                        .map(|json| format!("{}\n", json))
+                        .unwrap_or_default()
+                },
+            );
+            let ndjson_stream = futures::StreamExt::map(mapped, |line| Ok::<_, std::convert::Infallible>(line));
+
+            let body = Body::from_stream(ndjson_stream);
+
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("content-type", "application/x-ndjson".parse().unwrap());
+            headers.insert("x-served-commit", served_commit.parse().unwrap());
+            headers.insert(
+                "x-store-clustering",
+                if store_clustering { "true" } else { "false" }.parse().unwrap(),
+            );
+            headers.insert(
+                "x-total-count",
+                total_count.to_string().parse().unwrap(),
+            );
+
+            (StatusCode::OK, headers, body).into_response()
+        }
         Err(e) => service_error_to_response(e),
     }
 }
@@ -1526,7 +1819,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/compact", post(handle_compact))
         .route("/compare", post(handle_compare))
         .route("/statistics", get(handle_statistics))
-        .route("/embeddings", get(handle_embeddings))
+        .route("/embeddings", get(handle_embeddings).post(handle_embeddings_post))
         .route("/domain", delete(handle_delete_domain))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 

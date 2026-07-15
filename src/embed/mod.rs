@@ -6,6 +6,9 @@
 //! io entry point for the actual HTTP call. Fail-loud on dimension mismatch
 //! and provider errors.
 
+pub mod cache;
+
+use cache::EmbedCache;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -182,22 +185,58 @@ pub fn parse_embedding_response(
 
 /// Fetch embeddings from the provider (the single io entry point).
 /// Applies the task prefix per role before sending.
+///
+/// When `cache` is `Some`, checks the cache for each text before making an HTTP
+/// call. Only cache misses are sent to the provider. Results from the provider
+/// are stored in the cache for future lookups.
 pub async fn io_embed(
     provider: &Provider,
     texts: &[String],
     role: EmbeddingRole,
     client: &reqwest::Client,
+    cache: Option<&EmbedCache>,
 ) -> Result<Vec<Vec<f32>>, EmbedError> {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
 
     let prefixed = apply_prefix(texts, provider.model_name(), role);
+    let dim = provider.expected_dim();
+    let model = provider.model_name();
+
+    // Partition texts into cache hits and misses.
+    let mut results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+    let mut miss_indices: Vec<usize> = Vec::new();
+
+    if let Some(cache) = cache {
+        for (i, prefixed_text) in prefixed.iter().enumerate() {
+            let key = EmbedCache::cache_key(model, prefixed_text);
+            if let Some(emb) = cache.get(&key, dim) {
+                results[i] = Some(emb);
+            } else {
+                miss_indices.push(i);
+            }
+        }
+        let hits = texts.len() - miss_indices.len();
+        eprintln!(
+            "[embed] cache: role={:?} hits={} misses={} of {}",
+            role, hits, miss_indices.len(), texts.len()
+        );
+    } else {
+        miss_indices = (0..texts.len()).collect();
+    }
+
+    if miss_indices.is_empty() {
+        return Ok(results.into_iter().map(|o| o.unwrap()).collect());
+    }
+
+    // Build the request with only the missed (prefixed) texts.
+    let miss_prefixed: Vec<String> = miss_indices.iter().map(|&i| prefixed[i].clone()).collect();
     let url = format!("{}/v1/embeddings", provider.base_url().trim_end_matches('/'));
 
     let request_body = EmbedRequest {
-        model: provider.model_name().to_owned(),
-        input: prefixed,
+        model: model.to_owned(),
+        input: miss_prefixed,
     };
 
     let response = client
@@ -221,21 +260,28 @@ pub async fn io_embed(
         .await
         .map_err(|e| EmbedError::ParseError(e.to_string()))?;
 
-    let embeddings = parse_embedding_response(&body_bytes, provider.expected_dim())?;
+    let embeddings = parse_embedding_response(&body_bytes, dim)?;
 
     // Count-parity guard: the provider MUST return exactly one embedding per input.
-    // A short response would silently corrupt the scatter mapping in the batched
-    // pipeline (wrong embeddings assigned to wrong docs). Fail loud here so the
-    // io_embed_batched retry path isolates the offending batch.
-    if embeddings.len() != texts.len() {
+    if embeddings.len() != miss_indices.len() {
         return Err(EmbedError::ParseError(format!(
             "count mismatch: sent {} texts, received {} embeddings",
-            texts.len(),
+            miss_indices.len(),
             embeddings.len()
         )));
     }
 
-    Ok(embeddings)
+    // Store misses in cache and merge into results.
+    for (miss_offset, &result_idx) in miss_indices.iter().enumerate() {
+        let emb = &embeddings[miss_offset];
+        if let Some(cache) = cache {
+            let key = EmbedCache::cache_key(model, &prefixed[result_idx]);
+            cache.put(&key, emb);
+        }
+        results[result_idx] = Some(emb.clone());
+    }
+
+    Ok(results.into_iter().map(|o| o.unwrap()).collect())
 }
 
 /// Result of batched embedding: either a successful embedding vector or an error
@@ -264,6 +310,7 @@ pub async fn io_embed_batched(
     batch_size: usize,
     role: EmbeddingRole,
     client: &reqwest::Client,
+    cache: Option<&EmbedCache>,
 ) -> Vec<EmbedResult> {
     assert!(batch_size > 0, "embed_batch_size must be > 0 (configuration error)");
 
@@ -274,7 +321,7 @@ pub async fn io_embed_batched(
     let mut results: Vec<EmbedResult> = Vec::with_capacity(texts.len());
 
     for batch in texts.chunks(batch_size) {
-        match io_embed(provider, batch, role, client).await {
+        match io_embed(provider, batch, role, client, cache).await {
             Ok(embeddings) => {
                 // Happy path: batch succeeded. Push all embeddings.
                 for emb in embeddings {
@@ -298,7 +345,7 @@ pub async fn io_embed_batched(
                 );
                 for text in batch {
                     let single = std::slice::from_ref(text);
-                    match io_embed(provider, single, role, client).await {
+                    match io_embed(provider, single, role, client, cache).await {
                         Ok(mut embeddings) => {
                             if let Some(emb) = embeddings.pop() {
                                 results.push(EmbedResult::Ok(emb));

@@ -330,11 +330,11 @@ async fn io_index_one(
 
     // Phase 6A Step 5: embed with BOTH roles (document + query).
     let mut embeddings_doc =
-        embed::io_embed(provider, &chunk_texts, EmbeddingRole::Document, http_client)
+        embed::io_embed(provider, &chunk_texts, EmbeddingRole::Document, http_client, None)
             .await
             .map_err(|e| format!("embedding (doc) failed: {}", e))?;
     let mut embeddings_query =
-        embed::io_embed(provider, &chunk_texts, EmbeddingRole::Clustering, http_client)
+        embed::io_embed(provider, &chunk_texts, EmbeddingRole::Clustering, http_client, None)
             .await
             .map_err(|e| format!("embedding (query) failed: {}", e))?;
 

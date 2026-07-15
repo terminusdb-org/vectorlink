@@ -119,6 +119,10 @@ pub struct Config {
     /// Number of texts to batch per embedding HTTP call (cross-document batching).
     /// Configurable via `TDB_SEARCH_EMBED_BATCH_SIZE`; default 32.
     pub embed_batch_size: usize,
+    /// Maximum entries for the disk-backed embedding cache (sled + zstd).
+    /// `None` disables the cache (passthrough to embedding provider).
+    /// Configurable via `TDB_SEARCH_EMBED_CACHE_SIZE`; default 20,000.
+    pub embed_cache_size: Option<usize>,
 }
 
 impl Config {
@@ -180,6 +184,11 @@ impl Config {
             tokenizer_path: std::env::var("TDB_SEARCH_TOKENIZER_PATH")
                 .unwrap_or_else(|_| "/data/tokenizer.json.bz2".to_owned()),
             embed_batch_size,
+            embed_cache_size: match std::env::var("TDB_SEARCH_EMBED_CACHE_SIZE") {
+                Ok(s) if s.eq_ignore_ascii_case("none") => None,
+                Ok(s) => Some(s.parse::<usize>().unwrap_or(20_000)),
+                Err(_) => Some(20_000),
+            },
         }
     }
 
@@ -197,6 +206,7 @@ impl Config {
             data_dir: "/tmp/tdb-search-test".to_owned(),
             tokenizer_path: "spikes/tokenizer/tokenizer.json".to_owned(),
             embed_batch_size: DEFAULT_EMBED_BATCH_SIZE,
+            embed_cache_size: None,
         }
     }
 }
@@ -215,6 +225,7 @@ impl Default for Config {
             data_dir: "/tmp/tdb-search-test".to_owned(),
             tokenizer_path: "spikes/tokenizer/tokenizer.json".to_owned(),
             embed_batch_size: DEFAULT_EMBED_BATCH_SIZE,
+            embed_cache_size: None,
         }
     }
 }

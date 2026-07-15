@@ -21,7 +21,7 @@ use crate::kernel::model::{
     SearchHit, SearchMode, SkippedDoc, Statistics, TaskStatus,
 };
 use crate::store::lance::{
-    ChunkRow, DuplicateScope, LanceStore, SearchQuery, dedup_chunks_to_documents,
+    ChunkRow, DuplicateScope, EmbeddingRecord, LanceStore, SearchQuery, dedup_chunks_to_documents,
 };
 
 use serde::Serialize;
@@ -37,6 +37,19 @@ pub struct EmbeddingsResult {
     pub store_clustering: bool,
     /// The commit that was searched.
     pub served_commit: String,
+}
+
+/// Streaming response for GET /embeddings (NDJSON mode).
+/// Contains metadata + a channel receiver for individual embedding records.
+pub struct EmbeddingsStreamResult {
+    /// The commit that was searched.
+    pub served_commit: String,
+    /// Whether clustering embeddings are stored for this domain.
+    pub store_clustering: bool,
+    /// Total number of unique doc_ids that will be streamed.
+    pub total_count: u64,
+    /// Channel receiver yielding `EmbeddingRecord` values.
+    pub receiver: tokio::sync::mpsc::Receiver<EmbeddingRecord>,
 }
 
 /// A single candidate neighbour in the /candidates response.
@@ -88,6 +101,7 @@ pub struct SearchService {
     tokenizer: Arc<Tokenizer>,
     chunk_params: ChunkParams,
     http_client: reqwest::Client,
+    embed_cache: crate::embed::cache::EmbedCache,
     /// Per-capability readiness: index readiness is independent of search
     /// readiness (search additionally requires a warm embedding backend).
     ready_index: Arc<std::sync::atomic::AtomicBool>,
@@ -156,6 +170,10 @@ impl SearchService {
         config: Config,
         tokenizer: Tokenizer,
     ) -> Self {
+        let embed_cache = {
+            let cache_dir = std::path::Path::new(&config.data_dir).join("embed_cache");
+            crate::embed::cache::EmbedCache::open(&cache_dir, config.embed_cache_size)
+        };
         let prefix = match embed::prefixes_for_model(config.embed_provider.model_name()) {
             Some(p) => embed::prefix_for_role(&p, EmbeddingRole::Document).to_owned(),
             None => String::new(),
@@ -175,6 +193,7 @@ impl SearchService {
             tokenizer: Arc::new(tokenizer),
             chunk_params,
             http_client: reqwest::Client::new(),
+            embed_cache,
             ready_index,
             ready_search,
             heavy_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(
@@ -219,6 +238,32 @@ impl SearchService {
             .last_indexed(&domain, &branch)
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))
+    }
+
+    /// Resolve a commit from either an explicit commit ID or a branch name.
+    ///
+    /// When `commit` is provided and non-empty, it is returned as-is.
+    /// When `commit` is absent/empty but `branch` is provided, the latest
+    /// indexed commit for that branch is returned. Defaults branch to "main"
+    /// when both are absent/empty (returns 400 if no branch can be resolved).
+    pub async fn resolve_commit_or_branch(
+        &self,
+        domain_raw: &str,
+        commit: &str,
+        branch: Option<&str>,
+    ) -> Result<String, ServiceError> {
+        if !commit.is_empty() {
+            return Ok(commit.to_owned());
+        }
+        let branch_name = branch
+            .filter(|b| !b.is_empty())
+            .unwrap_or("main");
+        let last = self.last_indexed(domain_raw, branch_name).await?;
+        last.commit
+            .ok_or_else(|| ServiceError::NotFound(format!(
+                "no indexed commit for branch {} on domain {}",
+                branch_name, domain_raw
+            )))
     }
 
     /// Start an async push/index task.
@@ -313,6 +358,7 @@ impl SearchService {
         let provider = self.config.embed_provider.clone();
         let http_client = self.http_client.clone();
         let embed_batch_size = self.config.embed_batch_size;
+        let embed_cache = self.embed_cache.clone();
         let task_id_clone = task_id.clone();
 
         // Spawn the indexing pipeline as a background task.
@@ -329,6 +375,7 @@ impl SearchService {
                 chunk_params: &chunk_params,
                 provider: &provider,
                 http_client: &http_client,
+                embed_cache: &embed_cache,
                 domain: &domain_str,
                 branch: &branch,
                 embed_batch_size,
@@ -472,6 +519,7 @@ impl SearchService {
         let provider = self.config.embed_provider.clone();
         let http_client = self.http_client.clone();
         let embed_batch_size = self.config.embed_batch_size;
+        let embed_cache = self.embed_cache.clone();
         let task_id_clone = task_id.clone();
 
         let store_for_panic = Arc::clone(&store);
@@ -484,6 +532,7 @@ impl SearchService {
                 chunk_params: &chunk_params,
                 provider: &provider,
                 http_client: &http_client,
+                embed_cache: &embed_cache,
                 domain: &domain_str,
                 branch: &branch,
                 embed_batch_size,
@@ -675,6 +724,7 @@ impl SearchService {
             &query_texts,
             EmbeddingRole::Query,
             &self.http_client,
+            Some(&self.embed_cache),
         )
         .await
         .map_err(|e| ServiceError::Internal(format!("embedding failed: {}", e)))?;
@@ -1089,6 +1139,7 @@ impl SearchService {
             &texts,
             EmbeddingRole::Document,
             &self.http_client,
+            Some(&self.embed_cache),
         )
         .await
         .map_err(|e| ServiceError::Internal(format!("embedding failed: {}", e)))?;
@@ -1549,6 +1600,50 @@ impl SearchService {
         })
     }
 
+    /// Streaming variant of `fetch_embeddings`. Returns metadata (served_commit,
+    /// store_clustering, total_count) plus a tokio mpsc receiver that yields
+    /// `EmbeddingRecord` values as they are read from Lance.
+    pub async fn fetch_embeddings_stream(
+        &self,
+        domain_raw: &str,
+        commit: &str,
+        doc_ids: &[String],
+        doc_types: &[String],
+        ancestors: &[String],
+    ) -> Result<EmbeddingsStreamResult, ServiceError> {
+        let rp =
+            parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
+
+        if !self.is_search_ready() {
+            return Err(ServiceError::Unavailable(
+                "search capability not ready (embedding backend cold)".to_owned(),
+            ));
+        }
+
+        let domain = Domain::from_resource_path(&rp);
+        let domain_str = domain.as_str().to_owned();
+        let branch = extract_branch(&rp);
+
+        let served_commit = self
+            .resolve_searchable_commit(&domain, &branch, commit, ancestors)
+            .await?;
+
+        let store_clustering = self.store.domain_settings.store_clustering(&domain_str).await;
+
+        let (total_count, rx) = self
+            .store
+            .io_stream_embeddings(&domain_str, &branch, &served_commit, doc_ids, doc_types, store_clustering)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        Ok(EmbeddingsStreamResult {
+            served_commit,
+            store_clustering,
+            total_count,
+            receiver: rx,
+        })
+    }
+
     /// Delete a domain's ENTIRE footprint: the `{domain}.lance` dataset (all
     /// branches/versions/tags) plus the store's in-memory caches. IDEMPOTENT —
     /// an unknown/already-gone domain succeeds (TerminusDB may retry). Fail-loud
@@ -1697,6 +1792,7 @@ impl SearchService {
             &source_texts,
             source_role,
             &self.http_client,
+            Some(&self.embed_cache),
         )
         .await
         .map_err(|e| ServiceError::Internal(format!("embedding source failed: {}", e)))?;
@@ -1706,6 +1802,7 @@ impl SearchService {
             &target_texts,
             target_role,
             &self.http_client,
+            Some(&self.embed_cache),
         )
         .await
         .map_err(|e| ServiceError::Internal(format!("embedding target failed: {}", e)))?;
@@ -1773,6 +1870,7 @@ struct PipelineCtx<'a> {
     chunk_params: &'a ChunkParams,
     provider: &'a Provider,
     http_client: &'a reqwest::Client,
+    embed_cache: &'a crate::embed::cache::EmbedCache,
     domain: &'a str,
     branch: &'a str,
     /// Cross-document embedding batch size (from Config, env-configurable).
@@ -1937,6 +2035,7 @@ async fn io_run_index_pipeline(
         ctx.embed_batch_size,
         EmbeddingRole::Document,
         ctx.http_client,
+        Some(ctx.embed_cache),
     )
     .await;
 
@@ -1947,6 +2046,7 @@ async fn io_run_index_pipeline(
             ctx.embed_batch_size,
             EmbeddingRole::Clustering,
             ctx.http_client,
+            Some(ctx.embed_cache),
         )
         .await
     } else {
@@ -2096,13 +2196,25 @@ async fn io_run_index_pipeline(
 
         // Optimize indices on an UNCACHED handle (Fix #2: doesn't block searches).
         // FTS + vector ANN are built incrementally via optimize_indices(append()) — O(delta).
-        // This runs BEFORE tagging so the tagged version has full index coverage (BLOCKER-1 fix).
-        let indexed_version = io_optimize_on_uncached_handle(ctx.store, ctx.domain, ctx.branch, store_clustering)
-            .await
-            .map_err(|e| format!("index optimization failed: {}", e))?;
+        // This runs BEFORE tagging so the tagged version has full index coverage.
+        //
+        // Optimization is a SOFT failure: if it fails (e.g. stale data file reference,
+        // LanceDB internal path issue), the data is already written and searchable
+        // via flat scan. We log the error and tag at last_version so the commit is
+        // available for search. The index will be built on a future optimize cycle.
+        let indexed_version = match io_optimize_on_uncached_handle(
+            ctx.store, ctx.domain, ctx.branch, store_clustering
+        ).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[pipeline] index optimization failed (soft): {} — tagging at data version {}", e, last_version);
+                None
+            }
+        };
 
-        // Tag the commit to the INDEXED version (data + indices).
-        // After this point, the commit is resolvable and fully searchable.
+        // Tag the commit to the INDEXED version (data + indices), or fall back
+        // to the data-only version if optimization was skipped/failed.
+        // After this point, the commit is resolvable and searchable.
         let tag_version = indexed_version.unwrap_or(last_version);
         ctx.store
             .io_tag_commit(ctx.domain, ctx.branch, commit, tag_version)
@@ -2295,6 +2407,7 @@ async fn io_run_index_pipeline_stream(
             ctx.embed_batch_size,
             EmbeddingRole::Document,
             ctx.http_client,
+            Some(ctx.embed_cache),
         )
         .await;
         let batch_query = if store_clustering {
@@ -2304,6 +2417,7 @@ async fn io_run_index_pipeline_stream(
                 ctx.embed_batch_size,
                 EmbeddingRole::Clustering,
                 ctx.http_client,
+                Some(ctx.embed_cache),
             )
             .await
         } else {
@@ -2460,14 +2574,14 @@ async fn io_run_index_pipeline_stream(
             }
         };
 
+        // Optimization is a SOFT failure: data is already written and searchable
+        // via flat scan. Log the error and tag at last_version so the commit is
+        // available for search. The index will be built on a future optimize cycle.
         let indexed_version = match io_optimize_on_uncached_handle(ctx.store, ctx.domain, ctx.branch, store_clustering).await {
             Ok(v) => v,
             Err(e) => {
-                let msg = format!("index optimization failed: {}", e);
-                if let Some(tx) = &progress_tx {
-                    let _ = tx.send(ProgressUpdate::Error { error: msg.clone() }).await;
-                }
-                return Err(msg);
+                eprintln!("[pipeline] index optimization failed (soft): {} — tagging at data version {}", e, last_version);
+                None
             }
         };
 
@@ -2622,6 +2736,8 @@ mod tests_risk26 {
     use crate::kernel::model::BranchName;
     use std::path::Path;
 
+    static DISABLED_CACHE: crate::embed::cache::EmbedCache = crate::embed::cache::EmbedCache::disabled();
+
     /// Build a test tokenizer from the checked-in fixture.
     fn test_tokenizer() -> Tokenizer {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2656,6 +2772,7 @@ mod tests_risk26 {
             chunk_params,
             provider,
             http_client,
+            embed_cache: &DISABLED_CACHE,
             domain,
             branch,
             embed_batch_size: 32,
@@ -3003,6 +3120,8 @@ mod tests_streaming {
     use crate::kernel::model::BranchName;
     use std::path::Path;
 
+    static DISABLED_CACHE: crate::embed::cache::EmbedCache = crate::embed::cache::EmbedCache::disabled();
+
     fn test_tokenizer() -> Tokenizer {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("spikes")
@@ -3034,6 +3153,7 @@ mod tests_streaming {
             chunk_params,
             provider,
             http_client,
+            embed_cache: &DISABLED_CACHE,
             domain,
             branch,
             embed_batch_size: 32,
@@ -3304,6 +3424,7 @@ mod tests_exact_duplicate_override {
             data_dir: "/tmp/test".to_owned(),
             tokenizer_path: "spikes/tokenizer/tokenizer.json".to_owned(),
             embed_batch_size: 32,
+            embed_cache_size: None,
         };
         let tokenizer_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("spikes")
