@@ -64,6 +64,7 @@ pub struct AssignParams {
 pub struct SearchGetParams {
     pub domain: Option<String>,
     pub commit: Option<String>,
+    pub branch: Option<String>,
     pub q: Option<String>,
     pub start: Option<i64>,
     pub count: Option<i64>,
@@ -80,6 +81,7 @@ pub struct SearchGetParams {
 pub struct SimilarParams {
     pub domain: Option<String>,
     pub commit: Option<String>,
+    pub branch: Option<String>,
     pub id: Option<String>,
     pub start: Option<i64>,
     pub count: Option<i64>,
@@ -93,6 +95,7 @@ pub struct SimilarParams {
 pub struct DuplicatesParams {
     pub domain: Option<String>,
     pub commit: Option<String>,
+    pub branch: Option<String>,
     pub threshold: Option<f32>,
     pub start: Option<i64>,
     pub count: Option<i64>,
@@ -116,6 +119,7 @@ pub struct CompareParams {
 pub struct SuggestParams {
     pub domain: Option<String>,
     pub commit: Option<String>,
+    pub branch: Option<String>,
     pub q: Option<String>,
     pub count: Option<i64>,
     // Repeated params (ancestor, doc_type, doc_id) read from raw query via
@@ -153,6 +157,7 @@ pub struct CandidatesRequestBody {
 pub struct SearchRequestBody {
     pub domain: Option<String>,
     pub commit: Option<String>,
+    pub branch: Option<String>,
     pub q: Option<String>,
     pub mode: Option<String>,
     pub start: Option<i64>,
@@ -169,6 +174,7 @@ pub struct SearchRequestBody {
 pub struct SimilarRequestBody {
     pub domain: Option<String>,
     pub commit: Option<String>,
+    pub branch: Option<String>,
     pub id: Option<String>,
     pub text: Option<String>,
     pub start: Option<i64>,
@@ -704,14 +710,11 @@ async fn handle_search_get(
             );
         }
     };
-    let commit = match params.commit {
-        Some(c) if !c.is_empty() => c,
-        _ => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "missing required query parameter: commit".to_owned(),
-            );
-        }
+    let commit_raw = params.commit.as_deref().unwrap_or("");
+    let branch = params.branch.as_deref();
+    let commit = match state.service.resolve_commit_or_branch(&domain, commit_raw, branch).await {
+        Ok(c) => c,
+        Err(e) => return service_error_to_response(e),
     };
     let q = match params.q {
         Some(q) if !q.is_empty() => q,
@@ -775,7 +778,8 @@ async fn handle_search_post(
 
     // Body takes precedence over query params (per openapi contract).
     let domain = body.domain.or(params.domain).unwrap_or_default();
-    let commit = body.commit.or(params.commit).unwrap_or_default();
+    let commit_raw = body.commit.or(params.commit).unwrap_or_default();
+    let branch = body.branch.or(params.branch);
     let q = body.q.or(params.q).unwrap_or_default();
     let mode = body.mode.or(params.mode);
     let start = body.start.or(params.start);
@@ -787,12 +791,10 @@ async fn handle_search_post(
             "missing required parameter: domain".to_owned(),
         );
     }
-    if commit.is_empty() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "missing required parameter: commit".to_owned(),
-        );
-    }
+    let commit = match state.service.resolve_commit_or_branch(&domain, &commit_raw, branch.as_deref()).await {
+        Ok(c) => c,
+        Err(e) => return service_error_to_response(e),
+    };
     if q.is_empty() {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -895,14 +897,11 @@ async fn handle_similar(
             );
         }
     };
-    let commit = match params.commit {
-        Some(c) if !c.is_empty() => c,
-        _ => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "missing required query parameter: commit".to_owned(),
-            );
-        }
+    let commit_raw = params.commit.as_deref().unwrap_or("");
+    let branch = params.branch.as_deref();
+    let commit = match state.service.resolve_commit_or_branch(&domain, commit_raw, branch).await {
+        Ok(c) => c,
+        Err(e) => return service_error_to_response(e),
     };
     let id = match params.id {
         Some(id) if !id.is_empty() => id,
@@ -960,7 +959,8 @@ async fn handle_similar_post(
 
     // Body takes precedence over query params (same contract as POST /search).
     let domain = body.domain.or(params.domain).unwrap_or_default();
-    let commit = body.commit.or(params.commit).unwrap_or_default();
+    let commit_raw = body.commit.or(params.commit).unwrap_or_default();
+    let branch = body.branch.or(params.branch);
     let id = body.id.or(params.id).unwrap_or_default();
     let start = body.start.or(params.start);
     let count = body.count.or(params.count);
@@ -971,12 +971,10 @@ async fn handle_similar_post(
             "missing required parameter: domain".to_owned(),
         );
     }
-    if commit.is_empty() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "missing required parameter: commit".to_owned(),
-        );
-    }
+    let commit = match state.service.resolve_commit_or_branch(&domain, &commit_raw, branch.as_deref()).await {
+        Ok(c) => c,
+        Err(e) => return service_error_to_response(e),
+    };
 
     // Text-based similarity: when id is empty but text is present, embed the
     // text with Document role (search_document: prefix) and run vector search.
@@ -1065,14 +1063,11 @@ async fn handle_duplicates(
             );
         }
     };
-    let commit = match params.commit {
-        Some(c) if !c.is_empty() => c,
-        _ => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "missing required query parameter: commit".to_owned(),
-            );
-        }
+    let commit_raw = params.commit.as_deref().unwrap_or("");
+    let branch = params.branch.as_deref();
+    let commit = match state.service.resolve_commit_or_branch(&domain, commit_raw, branch).await {
+        Ok(c) => c,
+        Err(e) => return service_error_to_response(e),
     };
 
     if let Err(r) = validate_pagination(params.start, params.count) {
@@ -1681,14 +1676,11 @@ async fn handle_suggest(
             );
         }
     };
-    let commit = match params.commit {
-        Some(c) if !c.is_empty() => c,
-        _ => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "missing required query parameter: commit".to_owned(),
-            );
-        }
+    let commit_raw = params.commit.as_deref().unwrap_or("");
+    let branch = params.branch.as_deref();
+    let commit = match state.service.resolve_commit_or_branch(&domain, commit_raw, branch).await {
+        Ok(c) => c,
+        Err(e) => return service_error_to_response(e),
     };
     let q = match params.q {
         Some(q) if !q.is_empty() => q,
