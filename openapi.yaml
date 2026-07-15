@@ -242,7 +242,7 @@ paths:
         request (long queries, programmatic composition). `doc_type`/`doc_id` are
         repeated params (e.g. `?doc_type=A&doc_type=B`), AND-ed across the two
         sets, OR within each. Results paginate with `start` (default 0) and
-        `count` (default 50). Staleness is reported via the `TerminusDB-Data-Version`
+        `count` (default 10). Staleness is reported via the `TerminusDB-Data-Version`
         response header.
 
 
@@ -290,9 +290,11 @@ paths:
         query parameter OR in the JSON body. The JSON body takes precedence — if a
         field is present in the body, the same-named query parameter is discarded
         (not merged). This lets a caller set defaults in the URL and override them
-        in the body. `domain`, `commit` and `q` must be present in the body OR the
-        query — absent in both gives 400. Results paginate with `start` (default
-        0) and `count` (default 50). Staleness is reported via the
+        in the body. `domain` and `q` must be present in the body OR the
+        query — absent in both gives 400. `commit` is optional; when omitted,
+        the engine resolves the latest indexed commit for `branch`. Results
+        paginate with `start` (default
+        0) and `count` (default 10). Staleness is reported via the
         `TerminusDB-Data-Version` response header — the response body stays the
         bare array.
 
@@ -719,6 +721,129 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NoIndexedLineage' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
+
+  /embeddings:
+    get:
+      tags: [search]
+      operationId: embeddingsGet
+      summary: Fetch stored embeddings for a domain (JSON or streaming NDJSON).
+      description: >
+        Returns embedding vectors for documents in a domain at a given commit
+        (or latest indexed commit for a branch). When the `Accept` header
+        includes `application/x-ndjson`, the response is a streaming NDJSON
+        body (one embedding record per line) with `X-Served-Commit`,
+        `X-Store-Clustering`, and `X-Total-Count` headers. Otherwise returns a
+        single JSON array.
+      parameters:
+        - name: domain
+          in: query
+          required: true
+          schema: { type: string }
+          description: TerminusDB graphspec domain.
+        - $ref: '#/components/parameters/Commit'
+        - $ref: '#/components/parameters/BranchOptional'
+        - name: doc_ids
+          in: query
+          required: false
+          description: Comma-separated document IDs to fetch embeddings for.
+          schema: { type: string }
+        - name: doc_types
+          in: query
+          required: false
+          description: Comma-separated document types to filter by. When empty along with doc_ids, all embeddings are returned.
+          schema: { type: string }
+        - name: ancestors
+          in: query
+          required: false
+          description: Nearest-first ancestor window (same contract as /search).
+          schema:
+            type: array
+            items: { type: string }
+          style: form
+          explode: true
+      responses:
+        '200':
+          description: Embedding records (JSON array or NDJSON stream).
+          headers:
+            X-Served-Commit:
+              schema: { type: string }
+              description: The commit actually served.
+            X-Store-Clustering:
+              schema: { type: string }
+              description: Whether clustering embeddings are stored ("true" or "false").
+            X-Total-Count:
+              schema: { type: integer }
+              description: Total number of embedding records in the response.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/EmbeddingRecord' }
+            application/x-ndjson:
+              schema: { $ref: '#/components/schemas/EmbeddingRecord' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NoIndexedLineage' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
+    post:
+      tags: [search]
+      operationId: embeddingsPost
+      summary: Fetch stored embeddings via JSON body or bidirectional NDJSON stream.
+      description: >
+        Three modes based on Content-Type and the `stream` field:
+
+        1. **JSON body, `stream=false` (default)** — single JSON array response.
+        2. **JSON body, `stream=true`** — NDJSON streaming response (same shape
+           as GET with `Accept: application/x-ndjson`).
+        3. **NDJSON request body** — bidirectional streaming: each request line
+           carries a `doc_id` (the first line may also set `domain`, `commit`,
+           `ancestors`, and `doc_types` context). Response is an NDJSON stream.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmbeddingsRequest' }
+            examples:
+              batch:
+                summary: Batch fetch
+                value:
+                  domain: admin/star_wars
+                  commit: abc123
+                  doc_ids: ["terminusdb:///star-wars/People/1"]
+              stream:
+                summary: Streaming fetch
+                value:
+                  domain: admin/star_wars
+                  branch: main
+                  stream: true
+          application/x-ndjson:
+            schema: { $ref: '#/components/schemas/EmbeddingsNdjsonLine' }
+            examples:
+              bidirectional:
+                value: |
+                  {"domain":"admin/star_wars","commit":"abc123","doc_types":["People"]}
+                  {"domain":"admin/star_wars","commit":"abc123","doc_id":"terminusdb:///star-wars/People/1"}
+      responses:
+        '200':
+          description: Embedding records (JSON array or NDJSON stream).
+          headers:
+            X-Served-Commit:
+              schema: { type: string }
+            X-Store-Clustering:
+              schema: { type: string }
+            X-Total-Count:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/EmbeddingRecord' }
+            application/x-ndjson:
+              schema: { $ref: '#/components/schemas/EmbeddingRecord' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NoIndexedLineage' }
         '500': { $ref: '#/components/responses/UpstreamError' }
@@ -1386,8 +1511,9 @@ components:
       description: >
         POST /search body. Every field may also be supplied as a query parameter;
         when a field is present here it wins and the same-named query parameter is
-        discarded (not merged). `domain`, `commit` and `q` must be present here or
-        in the query.
+        discarded (not merged). `domain` and `q` must be present here or in the
+        query. `commit` is optional; when omitted, the engine resolves the
+        latest indexed commit for `branch`.
       properties:
         domain:
           type: string
@@ -1397,7 +1523,11 @@ components:
           example: admin/star_wars
         commit:
           type: string
-          description: Opaque commit hash — the searched snapshot.
+          description: Opaque commit hash — the searched snapshot. When omitted, the engine resolves the latest indexed commit for `branch`.
+        branch:
+          type: string
+          default: main
+          description: Branch name — used to resolve the latest indexed commit when `commit` is absent.
         q:
           type: string
           description: Query text (embedded for vector; full-text terms for fts/hybrid).
@@ -1414,7 +1544,7 @@ components:
         count:
           type: integer
           minimum: 1
-          default: 50
+          default: 10
           description: Max results to return (pagination page size).
         doc_type:
           type: array
@@ -1444,8 +1574,10 @@ components:
       description: >
         POST /similar body. Every field may also be supplied as a query parameter;
         when a field is present here it wins and the same-named query parameter is
-        discarded (not merged). `domain`, `commit` and `id` must be present here
-        or in the query. Use this when the candidate pool (`doc_id`) is large.
+        discarded (not merged). `domain` and `commit` must be present here
+        or in the query. Either `id` (document IRI) or `text` (raw text to
+        embed) must be provided. Use this when the candidate pool (`doc_id`)
+        is large.
       properties:
         domain:
           type: string
@@ -1455,11 +1587,23 @@ components:
           example: admin/star_wars
         commit:
           type: string
-          description: Opaque commit hash — the searched snapshot.
+          description: Opaque commit hash — the searched snapshot. When omitted, the engine resolves the latest indexed commit for `branch`.
+        branch:
+          type: string
+          default: main
+          description: Branch name — used to resolve the latest indexed commit when `commit` is absent.
         id:
           type: string
           description: Full document IRI to find neighbours of.
           example: "terminusdb:///star-wars/People/1"
+        text:
+          type: string
+          description: >
+            Text to embed and find neighbours of (alternative to `id`). When
+            `id` is empty and `text` is present, the engine embeds the text
+            with Document role and runs vector search. Either `id` or `text`
+            must be provided.
+          example: "A wise old Jedi master"
         start:
           type: integer
           minimum: 0
@@ -1524,10 +1668,9 @@ components:
 
     CompareRequest:
       type: object
-      required: [source, target]
       description: >
         Request body for POST /compare. Both fields are plain text strings
-        to be embedded and compared.
+        to be embedded and compared. Both are required (empty strings give 400).
       properties:
         source:
           type: string
@@ -1568,7 +1711,7 @@ components:
 
     CandidatesRequest:
       type: object
-      required: [domain, commit]
+      required: [domain, commit, threshold_set]
       properties:
         domain:
           type: string
@@ -1598,10 +1741,9 @@ components:
           format: float
           minimum: 0
           maximum: 1
-          default: 0.5
           description: >
             GATHER cap for set→target direction: max [0,1] cosine distance
-            for a candidate NN from set to target.
+            for a candidate NN from set to target. Required.
         threshold_target:
           type: number
           format: float
@@ -1610,18 +1752,19 @@ components:
           default: 0.5
           description: >
             GATHER cap for target→set direction: max [0,1] cosine distance
-            for a candidate NN from target to set.
+            for a candidate NN from target to set. Defaults to `threshold_set`.
         k:
           type: integer
           minimum: 1
           default: 5
           description: NN fan-out per point (how many candidates to evaluate per document).
         include:
-          type: array
-          items: { type: string, enum: [embedding, content] }
+          type: string
           description: >
-            Optional fields to include per candidate. `embedding` adds the raw
-            vector; `content` adds the chunk text. Empty (default) = id + distance only.
+            Comma-separated list of extra fields to include per candidate:
+            `embeddings` adds the raw vector, `content` adds the chunk text.
+            Empty (default) = id + distance only.
+          example: "embeddings,content"
         ancestors:
           type: array
           items: { type: string }
@@ -1683,6 +1826,82 @@ components:
             set_to_target_edges:   { type: integer, description: Total candidate edges from set to target. }
             target_to_set_edges:   { type: integer, description: Total candidate edges from target to set. }
             elapsed_ms:            { type: integer, description: "Wall-clock milliseconds for the gather." }
+
+    EmbeddingRecord:
+      type: object
+      description: >
+        One embedding record. In NDJSON streaming mode, each line is one record.
+      required: [doc_id, embedding]
+      properties:
+        doc_id:
+          type: string
+          description: Document IRI.
+        embedding:
+          type: array
+          items: { type: number, format: float }
+          description: Embedding vector.
+        clustering_embedding:
+          type: array
+          items: { type: number, format: float }
+          description: Clustering embedding vector (present only when store_clustering is enabled for the domain).
+
+    EmbeddingsRequest:
+      type: object
+      required: [domain]
+      description: POST /embeddings JSON body (batch and streaming modes).
+      properties:
+        domain:
+          type: string
+          description: TerminusDB graphspec domain.
+        commit:
+          type: string
+          description: Commit hash. When omitted, resolves the latest indexed commit for `branch`.
+        branch:
+          type: string
+          default: main
+          description: Branch name — used when `commit` is absent.
+        doc_ids:
+          type: array
+          items: { type: string }
+          description: Document IDs to fetch embeddings for. Empty = all (filtered by doc_types).
+        doc_types:
+          type: array
+          items: { type: string }
+          description: Document types to filter by. Empty = all.
+        ancestors:
+          type: array
+          items: { type: string }
+          description: Nearest-first ancestor window (same contract as /search).
+        stream:
+          type: boolean
+          default: false
+          description: When true, response is NDJSON stream; when false, single JSON array.
+
+    EmbeddingsNdjsonLine:
+      type: object
+      description: >
+        One NDJSON line for bidirectional streaming mode (POST /embeddings with
+        Content-Type: application/x-ndjson). The first line may set domain,
+        commit, ancestors, and doc_types context. Subsequent lines each carry
+        a single doc_id (domain and commit inherited from the first line).
+      properties:
+        domain:
+          type: string
+          description: TerminusDB graphspec domain (required on first line).
+        commit:
+          type: string
+          description: Commit hash (required on first line).
+        doc_id:
+          type: string
+          description: Single document ID to fetch embedding for.
+        doc_types:
+          type: array
+          items: { type: string }
+          description: Document types to filter by (first line only).
+        ancestors:
+          type: array
+          items: { type: string }
+          description: Nearest-first ancestor window (first line only).
 
     CompactResult:
       type: object
