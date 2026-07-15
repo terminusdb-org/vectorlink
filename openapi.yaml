@@ -59,7 +59,7 @@ paths:
         (domain, branch) has never been indexed.
       parameters:
         - $ref: '#/components/parameters/Domain'
-        - $ref: '#/components/parameters/Branch'
+        - $ref: '#/components/parameters/BranchOptional'
       responses:
         '200':
           description: The last-indexed commit (or null if none).
@@ -86,7 +86,7 @@ paths:
         `/last-indexed` handshake.
       parameters:
         - $ref: '#/components/parameters/Domain'
-        - $ref: '#/components/parameters/Branch'
+        - $ref: '#/components/parameters/BranchOptional'
         - name: target_commit
           in: query
           required: true
@@ -146,14 +146,10 @@ paths:
               schema: { type: string, description: Opaque task id (non-stream mode). }
               examples: { taskId: { value: "task-7f3a9c" } }
             application/x-ndjson:
-              schema:
-                type: object
-                description: >
-                  One progress update per line (stream mode only). Each line is
-                  a JSON object with status, percentage, and optionally
-                  indexed_documents or error fields.
+              schema: { $ref: '#/components/schemas/ProgressUpdate' }
               examples:
                 progress: { value: { status: "indexing", percentage: 42.5 } }
+                complete: { value: { status: "complete", percentage: 100.0, indexed_documents: 1284 } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '409':
@@ -164,6 +160,15 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: >
+            Abort received in the NDJSON stream. The engine stops processing and
+            returns the line number where the abort was encountered.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                abort: { value: { error: "abort received at line 42" } }
 
   /check:
     get:
@@ -229,6 +234,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
 
   # ───────────────────────────── search ────────────────────────────────────
   /search:
@@ -410,6 +416,7 @@ paths:
           style: form
           explode: true
           description: Nearest-first ancestor window for catch-up resolution.
+        - $ref: '#/components/parameters/ExpectedDataVersion'
       responses:
         '200':
           description: Suggest results.
@@ -419,31 +426,7 @@ paths:
               description: The commit actually served (may differ from requested under staleness).
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  served_commit:
-                    type: string
-                    description: The commit whose snapshot was actually searched.
-                  total_approx:
-                    type: integer
-                    description: Approximate number of matching documents.
-                  completions:
-                    type: array
-                    items: { type: string }
-                    description: Completion suggestions extracted from matched content.
-                  hits:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        id:
-                          type: string
-                          description: Document ID.
-                        distance:
-                          type: number
-                          format: float
-                          description: FTS distance (lower = more relevant).
+              schema: { $ref: '#/components/schemas/SuggestResult' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NoIndexedLineage' }
@@ -553,6 +536,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NoIndexedLineage' }
         '500': { $ref: '#/components/responses/UpstreamError' }
+        '503': { $ref: '#/components/responses/EmbeddingBackendUnavailable' }
 
   /duplicates:
     get:
@@ -651,8 +635,10 @@ paths:
                         - { id: "terminusdb:///abt/Product/10", snippet: "Sony 5 disc CD changer ..." }
                         - { id: "terminusdb:///buy/Product/57", snippet: "Sony 5-disc CD player ..." }
                       distance: 0.04
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NoIndexedLineage' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
 
   /candidates:
     post:
@@ -764,6 +750,17 @@ paths:
             items: { type: string }
           style: form
           explode: true
+        - name: Accept
+          in: header
+          required: false
+          description: >
+            Set to `application/x-ndjson` for streaming NDJSON response (one
+            embedding record per line). Default `application/json` returns a
+            single JSON array.
+          schema:
+            type: string
+            enum: [application/json, application/x-ndjson]
+            default: application/json
       responses:
         '200':
           description: Embedding records (JSON array or NDJSON stream).
@@ -861,7 +858,7 @@ paths:
         HEAD only; historical tags do not suffer fragment pressure.
       parameters:
         - $ref: '#/components/parameters/Domain'
-        - $ref: '#/components/parameters/Branch'
+        - $ref: '#/components/parameters/BranchOptional'
       responses:
         '200':
           description: Compaction result with before/after fragment counts.
@@ -1040,6 +1037,7 @@ paths:
                     chunks: 51234
                     pending_index_fragments: 0
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
 
   /domain:
     delete:
@@ -1071,7 +1069,7 @@ paths:
           description: >
             The database footprint has been removed (or was already absent —
             idempotent).
-        '400': { $ref: '#/components/responses/SearchBadRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '500': { $ref: '#/components/responses/UpstreamError' }
 
@@ -1371,6 +1369,7 @@ components:
     LastIndexed:
       type: object
       required: [branch, commit, version]
+      additionalProperties: false
       properties:
         branch:  { type: string }
         commit:  { type: [string, "null"], description: "Last-indexed commit, or null if none." }
@@ -1395,6 +1394,7 @@ components:
     OpInserted:
       type: object
       required: [op, id, string]
+      additionalProperties: false
       properties:
         op:     { type: string, const: Inserted }
         id:     { type: string, description: Full document IRI. }
@@ -1402,6 +1402,7 @@ components:
     OpChanged:
       type: object
       required: [op, id, string]
+      additionalProperties: false
       properties:
         op:     { type: string, const: Changed }
         id:     { type: string }
@@ -1409,46 +1410,158 @@ components:
     OpDeleted:
       type: object
       required: [op, id]
+      additionalProperties: false
       properties:
         op: { type: string, const: Deleted }
         id: { type: string, description: "Removes all chunk rows for this id." }
     OpError:
       type: object
       required: [op, message]
+      additionalProperties: false
       properties:
         op:      { type: string, const: Error }
         message: { type: string, description: "Upstream per-doc render failure; skipped and recorded, never silently dropped." }
     OpAbort:
       type: object
       required: [op]
+      additionalProperties: false
       properties:
         op: { type: string, const: Abort, description: "Signals abort of the current push. The engine stops processing and returns 422." }
 
     TaskPending:
       type: object
       required: [status, percentage]
+      additionalProperties: false
       properties:
         status:     { type: string, const: Pending }
         percentage: { type: number, format: float, minimum: 0, maximum: 100 }
     TaskComplete:
       type: object
       required: [status, indexed_documents]
+      additionalProperties: false
       properties:
         status:            { type: string, const: Complete }
         indexed_documents: { type: integer }
         skipped:
           type: array
           description: "Per-doc errors skipped during this push — visible, never silent."
-          items:
-            type: object
-            required: [id, message]
-            properties:
-              id:      { type: string }
-              message: { type: string }
+          items: { $ref: '#/components/schemas/SkippedItem' }
+
+    SkippedItem:
+      type: object
+      required: [id, message]
+      additionalProperties: false
+      properties:
+        id:      { type: string, description: "Document IRI that failed." }
+        message: { type: string, description: "Error message for the skipped document." }
+
+    Chunk:
+      type: object
+      required: [index, count, token_start, doc_token_len, location]
+      additionalProperties: false
+      description: >
+        Which part of the document matched. The document's score is its
+        best-matching chunk; this object locates that chunk so a caller can
+        jump to the relevant passage.
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          description: 0-based index of the best-matching chunk within the document.
+        count:
+          type: integer
+          minimum: 1
+          description: Total number of chunks the document was split into (1 if it fit in a single chunk).
+        token_start:
+          type: integer
+          minimum: 0
+          description: >
+            Start token offset of the matched chunk within the document (in the
+            embedding model's tokens). The raw numerator behind `location`, for
+            callers that want exact offsets rather than a fraction.
+        doc_token_len:
+          type: integer
+          minimum: 0
+          description: >
+            Document length in the embedding model's tokens — the denominator
+            behind `location`. `token_start` and `doc_token_len` are token
+            offsets, not character offsets.
+        location:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: >
+            Convenience fraction = `token_start / doc_token_len` (0.0 = very
+            beginning, 1.0 = very end; ×100 for a percentage). `0.0` when
+            `doc_token_len` is 0. Approximate position, not a character index.
+        snippet:
+          type: string
+          description: >
+            The matched chunk's text. Present only when `snippet=true` is
+            requested (omitted by default to keep responses small).
+
+    ProgressUpdate:
+      type: object
+      additionalProperties: false
+      description: >
+        One NDJSON line in the streaming /push response (when stream=true).
+      properties:
+        status:
+          type: string
+          enum: [indexing, complete, error]
+          description: Current indexing phase.
+        percentage:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+          description: Progress percentage (0–100).
+        indexed_documents:
+          type: integer
+          description: Documents indexed so far (present on 'complete' status).
+        error:
+          type: string
+          description: Error message (present on 'error' status).
+
+    SuggestResult:
+      type: object
+      required: [served_commit, total_approx, completions, hits]
+      additionalProperties: false
+      description: Response from /suggest (FTS-only typeahead).
+      properties:
+        served_commit:
+          type: string
+          description: The commit whose snapshot was actually searched.
+        total_approx:
+          type: integer
+          description: Approximate number of matching documents.
+        completions:
+          type: array
+          items: { type: string }
+          description: Completion suggestions extracted from matched content.
+        hits:
+          type: array
+          items: { $ref: '#/components/schemas/SuggestHit' }
+          description: First N document hits (default 11).
+
+    SuggestHit:
+      type: object
+      required: [id, distance]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          description: Document ID.
+        distance:
+          type: number
+          format: float
+          description: FTS distance (lower = more relevant).
 
     SearchHit:
       type: object
       required: [id, distance, chunk]
+      additionalProperties: false
       properties:
         id: { type: string, description: "Document IRI. Results always dedup to one hit per document; chunk ids are never separate result rows." }
         distance:
@@ -1458,49 +1571,7 @@ components:
           maximum: 1
           description: "Normalised cosine distance: 0 identical, 0.5 unrelated, 1 opposite. Smaller is closer. This is the distance of the document's BEST-matching chunk."
         chunk:
-          type: object
-          description: >
-            Which part of the document matched. The document's score is its
-            best-matching chunk; this object locates that chunk so a caller can
-            jump to the relevant passage.
-          required: [index, count, token_start, doc_token_len, location]
-          properties:
-            index:
-              type: integer
-              minimum: 0
-              description: 0-based index of the best-matching chunk within the document.
-            count:
-              type: integer
-              minimum: 1
-              description: Total number of chunks the document was split into (1 if it fit in a single chunk).
-            token_start:
-              type: integer
-              minimum: 0
-              description: >
-                Start token offset of the matched chunk within the document (in the
-                embedding model's tokens). The raw numerator behind `location`, for
-                callers that want exact offsets rather than a fraction.
-            doc_token_len:
-              type: integer
-              minimum: 0
-              description: >
-                Document length in the embedding model's tokens — the denominator
-                behind `location`. `token_start` and `doc_token_len` are token
-                offsets, not character offsets.
-            location:
-              type: number
-              format: float
-              minimum: 0
-              maximum: 1
-              description: >
-                Convenience fraction = `token_start / doc_token_len` (0.0 = very
-                beginning, 1.0 = very end; ×100 for a percentage). `0.0` when
-                `doc_token_len` is 0. Approximate position, not a character index.
-            snippet:
-              type: string
-              description: >
-                The matched chunk's text. Present only when `snippet=true` is
-                requested (omitted by default to keep responses small).
+          $ref: '#/components/schemas/Chunk'
     SearchResults:
       type: array
       description: Ranked nearest-first; empty array means genuinely no match (never an error).
@@ -1508,6 +1579,7 @@ components:
 
     SearchRequest:
       type: object
+      required: [domain, q]
       description: >
         POST /search body. Every field may also be supplied as a query parameter;
         when a field is present here it wins and the same-named query parameter is
@@ -1571,6 +1643,7 @@ components:
 
     SimilarRequest:
       type: object
+      required: [domain]
       description: >
         POST /similar body. Every field may also be supplied as a query parameter;
         when a field is present here it wins and the same-named query parameter is
@@ -1639,35 +1712,42 @@ components:
         Near-duplicate groups, sorted nearest-first. The `group` array is
         symmetric (member order is canonical: lower id first) and extends to
         clusters of more than two members without a shape change.
-      items:
-        type: object
-        required: [group, distance]
-        properties:
-          group:
-            type: array
-            minItems: 2
-            description: The member documents of this near-duplicate group.
-            items:
-              type: object
-              required: [id]
-              properties:
-                id:
-                  type: string
-                  description: The member document id.
-                snippet:
-                  type: string
-                  description: >
-                    The member's matched chunk text. Present only when
-                    `snippet=true` was requested.
-          distance:
-            type: number
-            format: float
-            description: >
-              The [0, 1] cosine distance of the group's best matching chunks
-              (0 = identical, 0.5 = unrelated, 1 = opposite).
+      items: { $ref: '#/components/schemas/DuplicateGroup' }
+
+    DuplicateGroup:
+      type: object
+      required: [group, distance]
+      additionalProperties: false
+      properties:
+        group:
+          type: array
+          minItems: 2
+          description: The member documents of this near-duplicate group.
+          items: { $ref: '#/components/schemas/DuplicateMember' }
+        distance:
+          type: number
+          format: float
+          description: >
+            The [0, 1] cosine distance of the group's best matching chunks
+            (0 = identical, 0.5 = unrelated, 1 = opposite).
+
+    DuplicateMember:
+      type: object
+      required: [id]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          description: The member document id.
+        snippet:
+          type: string
+          description: >
+            The member's matched chunk text. Present only when
+            `snippet=true` was requested.
 
     CompareRequest:
       type: object
+      required: [source, target]
       description: >
         Request body for POST /compare. Both fields are plain text strings
         to be embedded and compared. Both are required (empty strings give 400).
@@ -1688,6 +1768,7 @@ components:
     CompareResult:
       type: object
       required: [distance, source_role, target_role]
+      additionalProperties: false
       properties:
         distance:
           type: number
@@ -1712,6 +1793,7 @@ components:
     CandidatesRequest:
       type: object
       required: [domain, commit, threshold_set]
+      additionalProperties: false
       properties:
         domain:
           type: string
@@ -1749,7 +1831,6 @@ components:
           format: float
           minimum: 0
           maximum: 1
-          default: 0.5
           description: >
             GATHER cap for target→set direction: max [0,1] cosine distance
             for a candidate NN from target to set. Defaults to `threshold_set`.
@@ -1773,6 +1854,7 @@ components:
     CandidatesResult:
       type: object
       required: [set_to_target, target_to_set, stats]
+      additionalProperties: false
       properties:
         set_to_target:
           type: object
@@ -1782,19 +1864,7 @@ components:
             and `distance`; optionally `embedding` and/or `content` if requested.
           additionalProperties:
             type: array
-            items:
-              type: object
-              required: [id, distance]
-              properties:
-                id:       { type: string, description: Target document IRI. }
-                distance: { type: number, format: float, description: "[0,1] cosine distance." }
-                embedding:
-                  type: array
-                  items: { type: number, format: float }
-                  description: Raw embedding vector (present when `include` contains `embedding`).
-                content:
-                  type: string
-                  description: Matched chunk text (present when `include` contains `content`).
+            items: { $ref: '#/components/schemas/CandidateNeighbour' }
         target_to_set:
           type: object
           description: >
@@ -1803,32 +1873,39 @@ components:
             set_to_target.
           additionalProperties:
             type: array
-            items:
-              type: object
-              required: [id, distance]
-              properties:
-                id:       { type: string, description: Set document IRI. }
-                distance: { type: number, format: float, description: "[0,1] cosine distance." }
-                embedding:
-                  type: array
-                  items: { type: number, format: float }
-                  description: Raw embedding vector (present when `include` contains `embedding`).
-                content:
-                  type: string
-                  description: Matched chunk text (present when `include` contains `content`).
-        stats:
-          type: object
-          description: Gather statistics.
-          required: [set_points, target_points, elapsed_ms]
-          properties:
-            set_points:            { type: integer, description: Number of set documents scanned. }
-            target_points:         { type: integer, description: Number of target documents scanned. }
-            set_to_target_edges:   { type: integer, description: Total candidate edges from set to target. }
-            target_to_set_edges:   { type: integer, description: Total candidate edges from target to set. }
-            elapsed_ms:            { type: integer, description: "Wall-clock milliseconds for the gather." }
+            items: { $ref: '#/components/schemas/CandidateNeighbour' }
+        stats: { $ref: '#/components/schemas/CandidatesStats' }
+
+    CandidateNeighbour:
+      type: object
+      required: [id, distance]
+      additionalProperties: false
+      properties:
+        id:       { type: string, description: "Document IRI of the candidate." }
+        distance: { type: number, format: float, description: "[0,1] cosine distance." }
+        embedding:
+          type: array
+          items: { type: number, format: float }
+          description: Raw embedding vector (present when `include` contains `embeddings`).
+        content:
+          type: string
+          description: Matched chunk text (present when `include` contains `content`).
+
+    CandidatesStats:
+      type: object
+      required: [set_points, target_points, elapsed_ms]
+      additionalProperties: false
+      description: Gather statistics.
+      properties:
+        set_points:            { type: integer, description: Number of set documents scanned. }
+        target_points:         { type: integer, description: Number of target documents scanned. }
+        set_to_target_edges:   { type: integer, description: Total candidate edges from set to target. }
+        target_to_set_edges:   { type: integer, description: Total candidate edges from target to set. }
+        elapsed_ms:            { type: integer, description: "Wall-clock milliseconds for the gather." }
 
     EmbeddingRecord:
       type: object
+      additionalProperties: false
       description: >
         One embedding record. In NDJSON streaming mode, each line is one record.
       required: [doc_id, embedding]
@@ -1849,6 +1926,7 @@ components:
       type: object
       required: [domain]
       description: POST /embeddings JSON body (batch and streaming modes).
+      additionalProperties: false
       properties:
         domain:
           type: string
@@ -1879,6 +1957,7 @@ components:
 
     EmbeddingsNdjsonLine:
       type: object
+      additionalProperties: false
       description: >
         One NDJSON line for bidirectional streaming mode (POST /embeddings with
         Content-Type: application/x-ndjson). The first line may set domain,
@@ -1906,6 +1985,7 @@ components:
     CompactResult:
       type: object
       required: [domain, branch, fragments_before, fragments_after, compacted, compacted_version]
+      additionalProperties: false
       properties:
         domain:            { type: string, description: "The compacted domain." }
         branch:            { type: string, description: "The compacted branch." }
@@ -1917,6 +1997,7 @@ components:
     Statistics:
       type: object
       required: [domains, branches, indexed_commits, documents, chunks, pending_index_fragments]
+      additionalProperties: false
       properties:
         domains:         { type: integer, description: Databases with at least one index. }
         branches:        { type: integer, description: Distinct branches across all domains. }
@@ -1935,12 +2016,14 @@ components:
     Liveness:
       type: object
       required: [status]
+      additionalProperties: false
       properties:
         status: { type: string, const: ok }
 
     Readiness:
       type: object
       required: [ready, index, search]
+      additionalProperties: false
       properties:
         ready:  { type: boolean, description: Coarse flag — true if any capability is serveable. }
         index:  { type: boolean, description: Store reachable → can accept /push. }
