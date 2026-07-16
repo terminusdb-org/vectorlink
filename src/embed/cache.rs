@@ -13,12 +13,22 @@
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
+use ruzstd::encoding::CompressionLevel;
 
 /// Zstd compression level for embedding storage.
-const ZSTD_LEVEL: i32 = 3;
+/// ruzstd uses a simplified level enum (Fastest/Fast/Default/High).
+const ZSTD_LEVEL: CompressionLevel = CompressionLevel::Fastest;
 
 /// Sled background flush interval in milliseconds.
 const SLED_FLUSH_MS: u64 = 2000;
+
+// Sled's `cache_capacity` is a soft limit on the in-memory page cache.
+// Sled persists ALL entries to disk (unbounded for now) and uses an internal
+// LRU to evict in-memory pages when the cache is full.
+// We keep the in-memory page cache small (~20MB) — just enough for hot
+// entries. The old formula (max_entries × 4KB) caused 12 GB RAM usage when
+// max_entries was set to 3M. Disk-side LRU eviction will be added later.
+const SLED_CACHE_CAPACITY_BYTES: u64 = 5_000 * 4096;
 
 /// Disk-backed embedding cache.
 ///
@@ -27,6 +37,12 @@ const SLED_FLUSH_MS: u64 = 2000;
 pub struct EmbedCache {
     db: Option<sled::Db>,
     enabled: bool,
+    /// Atomic entry counter shared across all clones via Arc.
+    /// Incremented on `put`, never decremented (sled doesn't expose eviction
+    /// callbacks). Initialized lazily on first `len()` call by scanning the
+    /// sled tree. After that, reads are O(1).
+    /// Uses `AtomicUsize::MAX` as a sentinel for "not yet initialized".
+    entry_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Clone for EmbedCache {
@@ -34,39 +50,44 @@ impl Clone for EmbedCache {
         Self {
             db: self.db.clone(),
             enabled: self.enabled,
+            entry_count: std::sync::Arc::clone(&self.entry_count),
         }
     }
 }
 
 impl EmbedCache {
-    /// Create a disabled cache (no-op for get/put). Usable in const contexts.
-    pub const fn disabled() -> Self {
+    /// Create a disabled cache (no-op for get/put).
+    pub fn disabled() -> Self {
         Self {
             db: None,
             enabled: false,
+            entry_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
     /// Open or create the sled cache at `path`.
     ///
-    /// `max_entries` controls sled's in-memory page cache capacity
-    /// (max_entries × 4KB). `None` disables the cache entirely.
+    /// `max_entries` controls whether the cache is enabled (Some) or disabled
+    /// (None). The in-memory page cache is fixed at ~20 MB regardless — sled
+    /// persists all entries to disk and uses LRU eviction for in-memory pages.
     pub fn open(path: &Path, max_entries: Option<usize>) -> Self {
         match max_entries {
             None => Self {
                 db: None,
                 enabled: false,
+                entry_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             },
-            Some(n) => {
+            Some(_) => {
                 let db = sled::Config::default()
                     .path(path)
                     .flush_every_ms(Some(SLED_FLUSH_MS))
-                    .cache_capacity((n as u64) * 4096)
+                    .cache_capacity(SLED_CACHE_CAPACITY_BYTES)
                     .open()
                     .expect("failed to open sled embed cache");
                 Self {
                     db: Some(db),
                     enabled: true,
+                    entry_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
                 }
             }
         }
@@ -91,7 +112,7 @@ impl EmbedCache {
         }
         let db = self.db.as_ref()?;
         let compressed = db.get(key).ok().flatten()?;
-        let decompressed = zstd::decode_all(&compressed[..]).ok()?;
+        let decompressed = decompress_zstd(&compressed).ok()?;
         let bytes = decompressed.len();
         let expected_bytes = expected_dim * std::mem::size_of::<f32>();
         if bytes != expected_bytes {
@@ -116,8 +137,10 @@ impl EmbedCache {
                 .iter()
                 .flat_map(|f| f.to_le_bytes())
                 .collect();
-            if let Ok(compressed) = zstd::encode_all(&raw[..], ZSTD_LEVEL) {
-                let _ = db.insert(key, compressed);
+            let compressed = ruzstd::encoding::compress_to_vec(&raw[..], ZSTD_LEVEL);
+            let was_new = db.insert(key, compressed).ok().flatten().is_none();
+            if was_new {
+                self.entry_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -128,8 +151,29 @@ impl EmbedCache {
     }
 
     /// Number of entries currently in the cache. Returns 0 if disabled.
+    /// Uses an atomic counter for O(1) reads. On first call after open,
+    /// initializes the counter by scanning the sled tree (one-time cost).
     pub fn len(&self) -> usize {
-        self.db.as_ref().map(|db| db.len()).unwrap_or(0)
+        if !self.enabled {
+            return 0;
+        }
+        let cached = self.entry_count.load(std::sync::atomic::Ordering::Relaxed);
+        if cached != usize::MAX {
+            return cached;
+        }
+        // First call: scan the sled tree to initialize the counter.
+        let db = match &self.db {
+            Some(db) => db,
+            None => return 0,
+        };
+        let count = db.len();
+        self.entry_count.store(count, std::sync::atomic::Ordering::Relaxed);
+        count
+    }
+
+    /// Returns true if the cache is empty or disabled.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Flush the cache to disk. No-op if disabled.
@@ -138,6 +182,16 @@ impl EmbedCache {
             let _ = db.flush();
         }
     }
+}
+
+/// Decompress zstd-compressed data using ruzstd's StreamingDecoder.
+fn decompress_zstd(compressed: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read;
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out)?;
+    Ok(out)
 }
 
 // ─────────────────────────────── Tests ───────────────────────────────
@@ -170,8 +224,8 @@ mod tests {
     fn compression_roundtrip() {
         let embedding: Vec<f32> = (0..768).map(|i| i as f32 * 0.1).collect();
         let raw: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let compressed = zstd::encode_all(&raw[..], ZSTD_LEVEL).expect("encode");
-        let decompressed = zstd::decode_all(&compressed[..]).expect("decode");
+        let compressed = ruzstd::encoding::compress_to_vec(&raw[..], ZSTD_LEVEL);
+        let decompressed = decompress_zstd(&compressed).expect("decode");
         let floats: Vec<f32> = decompressed
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
