@@ -15,6 +15,7 @@ form_urlencoded = "1"
 futures = "0.3"
 base64 = "0.22"
 hyper = { version = "1", features = ["full"] }
+libc = "0.2"
 # Lance: local-disk only — disable all cloud object-store backends (aws/azure/gcp/oss/tencent),
 # huggingface (not our embedding path), and geo (no spatial queries). This eliminates 87+ transitive
 # dependencies (aws-sdk-*, object-store cloud modules, etc.) and cuts binary size ~40%.
@@ -32,11 +33,12 @@ subtle = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
+tokio-util = "0.7"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 uuid = { version = "1", features = ["v4"] }
-zstd = "0.13"
+ruzstd = "0.8"
 
 tempfile = "3"
 
