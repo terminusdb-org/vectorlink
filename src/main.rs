@@ -24,6 +24,7 @@ use tdb_search::embed::{self, EmbeddingRole};
 use tdb_search::embed::cache::EmbedCache;
 use tdb_search::http_api;
 use tdb_search::kernel::model::{parse_domain, Domain};
+use tdb_search::metrics;
 use tdb_search::service::SearchService;
 use tdb_search::store::lance::{encode_domain_path, LanceStore};
 
@@ -53,7 +54,12 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Create the LanceStore backed by the data directory.
     let dim = config.embed_provider.expected_dim();
     let data_dir = Path::new(&config.data_dir);
-    let lance_store = Arc::new(LanceStore::new(data_dir, dim));
+    let lance_store = Arc::new(LanceStore::new(
+        data_dir,
+        dim,
+        config.lance_index_cache_bytes,
+        config.lance_metadata_cache_bytes,
+    ));
 
     // Disable probabilistic auto-compaction when opted out (deterministic test mode).
     // Explicit POST /compact still works regardless.
@@ -65,8 +71,18 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let port = config.port;
     let data_dir = config.data_dir.clone();
     let model_name = config.embed_provider.model_name().to_owned();
+    let prometheus_port = config.prometheus_port;
     let service = SearchService::new(lance_store, config.clone(), tokenizer);
-    let app = http_api::router(service, config);
+    let app = http_api::router(service.clone(), config);
+
+    // Spawn Prometheus metrics server on a separate port if configured.
+    if let Some(metrics_port) = prometheus_port {
+        tokio::spawn(async move {
+            if let Err(e) = metrics::start_metrics_server(metrics_port, service).await {
+                eprintln!("[metrics] server error: {}", e);
+            }
+        });
+    }
 
     let addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port));
     eprintln!("[tdb-search] starting on port {} | data_dir={} | model={}", port, data_dir, model_name);
@@ -241,7 +257,7 @@ async fn prime_embed_cache(args: &[String]) -> Result<(), Box<dyn std::error::Er
             }
 
             total_rows += 1;
-            if total_rows % 10_000 == 0 {
+            if total_rows.is_multiple_of(10_000) {
                 eprintln!(
                     "[prime] domain={} rows={} cached={} elapsed={}ms",
                     domain_str,

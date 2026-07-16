@@ -20,8 +20,8 @@ use crate::ingest;
 use crate::kernel::distance::l2_normalize;
 use crate::kernel::error::ServiceError;
 use crate::kernel::model::{
-    parse_domain, BranchName, Domain, DuplicateGroup, LastIndexed, Operation, ProgressUpdate, Ref,
-    SearchHit, SearchMode, SkippedDoc, Statistics, TaskStatus,
+    parse_domain, BranchName, Domain, DuplicateGroup, InternalStats, LastIndexed, Operation,
+    ProgressUpdate, Ref, SearchHit, SearchMode, SkippedDoc, Statistics, TaskStatus,
 };
 use crate::store::lance::{
     ChunkRow, DuplicateScope, EmbeddingRecord, LanceStore, SearchQuery, dedup_chunks_to_documents,
@@ -364,14 +364,18 @@ impl SearchService {
         let embed_cache = self.embed_cache.clone();
         let task_id_clone = task_id.clone();
 
+        // Clones for use after the spawned task (which moves the originals).
+        let store_after = Arc::clone(&store);
+        let domain_after = domain_str.clone();
+        let branch_after = branch.clone();
+        let commit_after = commit.clone();
+
         // Spawn the indexing pipeline as a background task.
-        // Monitor the JoinHandle so panics are captured → Error, never Pending forever.
         let store_for_panic = Arc::clone(&store);
         let task_id_for_panic = task_id.clone();
-        // Coordinates for releasing the reservation on the panic/cancel path
-        // (the in-task path releases via its own owned `domain_str`/`branch`/`commit`).
         let reservation_coords = (domain_str.clone(), branch.clone(), commit.clone());
         let handle = tokio::spawn(async move {
+            store.pipeline_active_tasks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let ctx = PipelineCtx {
                 store: &store,
                 tokenizer: &tokenizer,
@@ -384,51 +388,17 @@ impl SearchService {
                 embed_batch_size,
             };
             let result = io_run_index_pipeline(&ctx, &commit, operations).await;
-
-            // Release the reservation on EVERY terminal state. On success the
-            // durable Lance tag now keeps the 409 guard correct; on failure
-            // releasing returns the commit to absent so a retry is allowed.
-            match result {
-                Ok((indexed, skipped)) => {
-                    // Probabilistic background compaction (BUG-FD24): 5% chance
-                    // on a successful write that created fragments. Does NOT
-                    // block — spawns a background task if the roll hits.
-                    if indexed > 0 {
-                        LanceStore::maybe_trigger_background_compaction(
-                            Arc::clone(&store),
-                            domain_str.clone(),
-                            branch.clone(),
-                        );
-                    }
-                    store
-                        .record_task(
-                            &task_id_clone,
-                            TaskStatus::Complete {
-                                indexed_documents: indexed,
-                                skipped,
-                            },
-                        )
-                        .await;
-                }
-                Err(error_msg) => {
-                    store
-                        .record_task(
-                            &task_id_clone,
-                            TaskStatus::Error { error: error_msg },
-                        )
-                        .await;
-                }
-            }
-            store
-                .io_release_commit_reservation(&domain_str, &branch, &commit)
-                .await;
+            store.pipeline_active_tasks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            result
         });
 
-        // Monitor: if the spawned task panics, record Error (never leave Pending)
-        // AND release the reservation so the panicked commit can be retried (the
-        // in-task release never runs on a panic).
-        tokio::spawn(async move {
-            if let Err(join_err) = handle.await {
+        // Await the pipeline task before returning. This makes the push handler
+        // synchronous — TerminusDB pushes commits sequentially, so awaiting
+        // ensures the previous commit's pipeline completes (and its memory is
+        // freed) before the next push is accepted.
+        let result = match handle.await {
+            Ok(inner) => inner,
+            Err(join_err) => {
                 let msg = if join_err.is_panic() {
                     format!("pipeline panicked: {:?}", join_err)
                 } else {
@@ -441,8 +411,42 @@ impl SearchService {
                 store_for_panic
                     .io_release_commit_reservation(d, b, c)
                     .await;
+                store_for_panic.pipeline_active_tasks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(task_id);
             }
-        });
+        };
+
+        match result {
+            Ok((indexed, skipped)) => {
+                if indexed > 0 {
+                    LanceStore::maybe_trigger_background_compaction(
+                        Arc::clone(&store_after),
+                        domain_after.clone(),
+                        branch_after.clone(),
+                    );
+                }
+                store_after
+                    .record_task(
+                        &task_id_clone,
+                        TaskStatus::Complete {
+                            indexed_documents: indexed,
+                            skipped,
+                        },
+                    )
+                    .await;
+            }
+            Err(error_msg) => {
+                store_after
+                    .record_task(
+                        &task_id_clone,
+                        TaskStatus::Error { error: error_msg },
+                    )
+                    .await;
+            }
+        }
+        store_after
+            .io_release_commit_reservation(&domain_after, &branch_after, &commit_after)
+            .await;
 
         Ok(task_id)
     }
@@ -528,7 +532,22 @@ impl SearchService {
         let store_for_panic = Arc::clone(&store);
         let task_id_for_panic = task_id.clone();
         let reservation_coords = (domain_str.clone(), branch.clone(), commit.clone());
+        let cancel_domain = domain_str.clone();
+        let cancel_branch = branch.clone();
+
+        // Create cancellation token for this pipeline task.
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+
+        // Cancel any previous in-flight pipeline for this branch and register
+        // the new token. This ensures stale tasks from a previous run (e.g.
+        // before a reindex) are cancelled and cannot write old chunks.
+        self.store
+            .cancel_previous_pipeline_and_register(&cancel_domain, &cancel_branch, cancel_token.clone())
+            .await;
+
+        let cancel_token_for_task = cancel_token.clone();
         let handle = tokio::spawn(async move {
+            store.pipeline_active_tasks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let ctx = PipelineCtx {
                 store: &store,
                 tokenizer: &tokenizer,
@@ -540,8 +559,21 @@ impl SearchService {
                 branch: &branch,
                 embed_batch_size,
             };
-            let result = io_run_index_pipeline_stream(&ctx, &commit, operation_rx, progress_tx).await;
 
+            // The pipeline checks the cancellation token at every key point:
+            // - before each operation recv
+            // - before each sub-batch embed
+            // - during each embed HTTP call via tokio::select!
+            // This ensures immediate cancellation when a reindex triggers a
+            // new push, releasing memory from the old pipeline.
+            let result = io_run_index_pipeline_stream(
+                &ctx, &commit, operation_rx, progress_tx, &cancel_token_for_task,
+            ).await;
+
+            // Unregister cancel token — pipeline completed (not cancelled).
+            store.unregister_pipeline_cancel_token(&domain_str, &branch).await;
+
+            // Record task status and release reservation inside the spawned task.
             match result {
                 Ok((indexed, skipped)) => {
                     if indexed > 0 {
@@ -573,8 +605,11 @@ impl SearchService {
             store
                 .io_release_commit_reservation(&domain_str, &branch, &commit)
                 .await;
+            store.pipeline_active_tasks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         });
 
+        // Spawn a monitor to catch panics — if the pipeline task panics,
+        // record Error and release the reservation.
         tokio::spawn(async move {
             if let Err(join_err) = handle.await {
                 let msg = if join_err.is_panic() {
@@ -589,6 +624,8 @@ impl SearchService {
                 store_for_panic
                     .io_release_commit_reservation(d, b, c)
                     .await;
+                store_for_panic.unregister_pipeline_cancel_token(d, b).await;
+                store_for_panic.pipeline_active_tasks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
         });
 
@@ -1540,6 +1577,15 @@ impl SearchService {
         Ok(self.store.statistics().await)
     }
 
+    /// Internal instrumentation stats — sizes of in-memory data structures and
+    /// process RSS. Exposed via the global /statistics endpoint for leak monitoring.
+    pub async fn internal_stats(&self) -> InternalStats {
+        let mut stats = self.store.internal_stats().await;
+        stats.embed_cache_entries = self.embed_cache.len();
+        stats.embed_cache_size_bytes = self.embed_cache.len() * self.store.dim * std::mem::size_of::<f32>();
+        stats
+    }
+
     /// Domain-scoped statistics — aggregates ONLY the named domain's footprint.
     /// Validates the domain string via parse_domain (fail-loud on invalid input).
     pub async fn statistics_for_domain(&self, domain_raw: &str) -> Result<Statistics, ServiceError> {
@@ -2270,28 +2316,24 @@ async fn io_run_index_pipeline(
 /// Streaming variant of `io_run_index_pipeline`.
 ///
 /// Reads operations incrementally from an mpsc channel, chunking and embedding
-/// them in batches as they arrive. This overlaps network IO (reading the NDJSON
-/// stream in the HTTP handler) with CPU/IO work (chunking, embedding), providing
-/// true document-by-document streaming rather than buffering all operations
-/// before processing begins.
+/// them in micro-batches as they arrive. Each micro-batch is written to Lance
+/// immediately via `ds.append()`, bounding memory to the micro-batch size rather
+/// than the entire commit.
 ///
-/// When `progress_tx` is `Some`, the pipeline sends `ProgressUpdate` messages
-/// after each embedding batch and at terminal states (complete/error/aborted).
-/// The pipeline blocks on `progress_tx.send().await` when the channel buffer is
-/// full (backpressure — levels the stream). If `send()` returns `Err` (receiver
-/// dropped = client disconnected), the pipeline ABORTS immediately and cleans up
-/// any written data for this commit.
+/// Architecture:
+///   1. Acquire pipeline lock + domain guard + open write handle
+///   2. Micro-batch loop: read N docs → chunk → embed → delete old (Changed) → append → drop
+///   3. After all ops: optimize indices + tag commit
 ///
-/// When `progress_tx` is `None`, behavior is identical to the non-streaming
-/// pipeline (no progress updates, no incremental embedding).
-///
-/// The write phase (delete-append, optimize, tag) still happens once at the end
-/// under the pipeline lock, preserving the one-fragment-per-commit efficiency.
+/// The pipeline lock is held for the entire loop (still one commit at a time).
+/// Multiple appends produce multiple fragments — compaction merges them later.
+/// The commit is untagged until the end, so no search sees partial data.
 async fn io_run_index_pipeline_stream(
     ctx: &PipelineCtx<'_>,
     commit: &str,
     mut operation_rx: mpsc::Receiver<Operation>,
     progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
+    cancel_token: &tokio_util::sync::CancellationToken,
 ) -> Result<(u64, Vec<SkippedDoc>), String> {
     struct DocToEmbed {
         id: String,
@@ -2299,59 +2341,289 @@ async fn io_run_index_pipeline_stream(
         is_changed: bool,
     }
 
-    let mut all_docs_to_embed: Vec<DocToEmbed> = Vec::new();
+    // Reset pipeline progress counters.
+    ctx.store.pipeline_pending_chunks.store(0, std::sync::atomic::Ordering::Relaxed);
+    ctx.store.pipeline_embedded_chunks.store(0, std::sync::atomic::Ordering::Relaxed);
+    ctx.store.pipeline_written_chunks.store(0, std::sync::atomic::Ordering::Relaxed);
+
     let mut all_delete_ids: Vec<String> = Vec::new();
     let mut skipped: Vec<SkippedDoc> = Vec::new();
+    let mut indexed_count: u64 = 0;
+    let mut total_docs_seen: u64 = 0;
 
-    // Read operations from the channel and process them incrementally.
-    // Chunking is CPU-bound and can happen immediately as operations arrive.
-    // Embedding is batched and happens when we have enough chunks or when the
-    // channel is drained/closed.
-    while let Some(op) = operation_rx.recv().await {
+    // Micro-batch buffer: collect docs until we have enough to embed+write.
+    const MICRO_BATCH_DOCS: usize = 2000;
+    let mut batch_docs: Vec<DocToEmbed> = Vec::with_capacity(MICRO_BATCH_DOCS);
+
+    // Acquire the per-branch lock upfront — held for the entire micro-batch loop
+    // plus the final optimize+tag. This ensures at most one unindexed commit per
+    // branch and prevents snapshot isolation violations.
+    let _guard = ctx.store.acquire_pipeline_lock(ctx.domain, ctx.branch).await;
+
+    // Acquire domain guard to serialise against DELETE /domain.
+    let _domain_guard = ctx.store.acquire_domain_guard(ctx.domain).await;
+
+    // Ensure the dataset exists (creates the main branch on first use).
+    ctx.store.io_open_dataset(ctx.domain, ctx.branch).await
+        .map_err(|e| format!("failed to ensure dataset: {}", e))?;
+
+    // Open a fresh branch-bound write handle. This handle is reused for all
+    // micro-batch appends + deletes, so all fragments land on the same branch
+    // lineage.
+    let mut ds = ctx.store.io_open_branch_for_write(ctx.domain, ctx.branch).await
+        .map_err(|e| format!("failed to open write handle: {}", e))?;
+
+    let store_clustering = ctx.store.domain_settings.store_clustering(ctx.domain).await;
+
+    // ─── Micro-batch flush helper ───────────────────────────────────────
+    // Embeds, deletes old chunks (for Changed docs), appends new rows,
+    // then drops all Vecs to free memory. Returns (indexed, skipped) for this batch.
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_microbatch(
+        ctx: &PipelineCtx<'_>,
+        ds: &mut lance::dataset::Dataset,
+        batch_docs: &mut Vec<DocToEmbed>,
+        all_delete_ids: &mut Vec<String>,
+        skipped: &mut Vec<SkippedDoc>,
+        store_clustering: bool,
+        progress_tx: &Option<mpsc::Sender<ProgressUpdate>>,
+        total_docs_seen: &mut u64,
+        indexed_count: &mut u64,
+        cancel_token: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), String> {
+        if batch_docs.is_empty() {
+            return Ok(());
+        }
+
+        let batch_chunk_count: u64 = batch_docs.iter().map(|d| d.chunks.len() as u64).sum();
+        ctx.store.pipeline_pending_chunks.fetch_add(batch_chunk_count, std::sync::atomic::Ordering::Relaxed);
+
+        // Process docs in sub-batches of embed_batch_size so progress is
+        // reported frequently (per ~32 docs) rather than per 2000-doc batch.
+        // Each sub-batch: flatten chunks → embed doc+clustering → scatter →
+        // report progress → accumulate rows for the single Lance append.
+        let mut batch_rows: Vec<ChunkRow> = Vec::new();
+
+        for sub_batch in batch_docs.chunks(ctx.embed_batch_size.max(1)) {
+            // Check cancellation before starting this sub-batch's embed.
+            // This ensures we stop immediately when a reindex triggers a new
+            // push, rather than continuing to embed and accumulate memory.
+            if cancel_token.is_cancelled() {
+                return Err("pipeline superseded by new push (reindex)".to_string());
+            }
+            // Flatten chunk texts for this sub-batch.
+            let mut flat_texts: Vec<String> = Vec::new();
+            let mut doc_flat_ranges: Vec<(usize, usize)> = Vec::with_capacity(sub_batch.len());
+
+            for doc in sub_batch {
+                let start = flat_texts.len();
+                for chunk in &doc.chunks {
+                    flat_texts.push(chunk.text.clone());
+                }
+                doc_flat_ranges.push((start, doc.chunks.len()));
+            }
+
+            let sub_chunk_count = flat_texts.len() as u64;
+
+            // Embed document role (cancellation-aware).
+            let embed_results_doc = tokio::select! {
+                r = embed::io_embed_batched(
+                    ctx.provider,
+                    &flat_texts,
+                    ctx.embed_batch_size,
+                    EmbeddingRole::Document,
+                    ctx.http_client,
+                    Some(ctx.embed_cache),
+                ) => r,
+                _ = cancel_token.cancelled() => {
+                    return Err("pipeline superseded by new push (reindex)".to_string());
+                }
+            };
+
+            // Embed clustering role (or zeros if disabled, cancellation-aware).
+            let embed_results_query = if store_clustering {
+                tokio::select! {
+                    r = embed::io_embed_batched(
+                        ctx.provider,
+                        &flat_texts,
+                        ctx.embed_batch_size,
+                        EmbeddingRole::Clustering,
+                        ctx.http_client,
+                        Some(ctx.embed_cache),
+                    ) => r,
+                    _ = cancel_token.cancelled() => {
+                        return Err("pipeline superseded by new push (reindex)".to_string());
+                    }
+                }
+            } else {
+                flat_texts.iter().map(|_| EmbedResult::Ok(vec![0.0; ctx.store.dim])).collect::<Vec<_>>()
+            };
+
+            ctx.store.pipeline_embedded_chunks.fetch_add(sub_chunk_count, std::sync::atomic::Ordering::Relaxed);
+
+            // Scatter embeddings → build ChunkRows for this sub-batch.
+            for (doc_idx, doc) in sub_batch.iter().enumerate() {
+                let (start, count) = doc_flat_ranges[doc_idx];
+                let doc_results_doc = &embed_results_doc[start..start + count];
+                let doc_results_query = &embed_results_query[start..start + count];
+
+                let first_failure = doc_results_doc.iter().chain(doc_results_query.iter()).find_map(|r| match r {
+                    EmbedResult::Failed(msg) => Some(msg.clone()),
+                    EmbedResult::Ok(_) => None,
+                });
+
+                if let Some(failure_msg) = first_failure {
+                    skipped.push(SkippedDoc { id: doc.id.clone(), message: failure_msg });
+                    continue;
+                }
+
+                let mut embeddings_doc: Vec<Vec<f32>> = Vec::with_capacity(doc_results_doc.len());
+                let mut embeddings_query: Vec<Vec<f32>> = Vec::with_capacity(doc_results_query.len());
+
+                for r in doc_results_doc {
+                    match r {
+                        EmbedResult::Ok(emb) => embeddings_doc.push(emb.clone()),
+                        EmbedResult::Failed(msg) => {
+                            skipped.push(SkippedDoc {
+                                id: doc.id.clone(),
+                                message: format!("internal: EmbedResult::Failed after check (doc): {}", msg),
+                            });
+                            embeddings_doc.clear();
+                            break;
+                        }
+                    }
+                }
+                if embeddings_doc.is_empty() && !doc_results_doc.is_empty() {
+                    continue;
+                }
+
+                for r in doc_results_query {
+                    match r {
+                        EmbedResult::Ok(emb) => embeddings_query.push(emb.clone()),
+                        EmbedResult::Failed(msg) => {
+                            skipped.push(SkippedDoc {
+                                id: doc.id.clone(),
+                                message: format!("internal: EmbedResult::Failed after check (query): {}", msg),
+                            });
+                            embeddings_query.clear();
+                            break;
+                        }
+                    }
+                }
+                if embeddings_query.is_empty() && !doc_results_query.is_empty() {
+                    continue;
+                }
+
+                for emb in &mut embeddings_doc { l2_normalize(emb); }
+                for emb in &mut embeddings_query { l2_normalize(emb); }
+
+                let doc_type = ingest::extract_doc_type(&doc.id);
+
+                // For Changed docs: delete old chunks BEFORE appending new ones.
+                if doc.is_changed {
+                    let expr = lance::deps::datafusion::logical_expr::col("doc_id")
+                        .eq(lance::deps::datafusion::logical_expr::lit(doc.id.as_str()));
+                    if let Ok(result) = lance::dataset::write::DeleteBuilder::from_expr(
+                        std::sync::Arc::new(ds.clone()),
+                        expr,
+                    ).execute().await {
+                        *ds = result.new_dataset.as_ref().clone();
+                    }
+                    all_delete_ids.push(doc.id.clone());
+                }
+
+                let rows: Vec<ChunkRow> = doc.chunks.iter()
+                    .zip(embeddings_doc.into_iter().zip(embeddings_query))
+                    .map(|(chunk, (embedding, clustering_embedding))| ChunkRow {
+                        doc_id: doc.id.clone(),
+                        doc_type: doc_type.clone(),
+                        chunk_index: chunk.index as i32,
+                        chunk_count: chunk.count as i32,
+                        chunk_token_start: chunk.token_start as i32,
+                        doc_token_len: chunk.doc_token_len as i32,
+                        embedding,
+                        clustering_embedding,
+                        content: chunk.text.clone(),
+                    })
+                    .collect();
+
+                batch_rows.extend(rows);
+                *indexed_count += 1;
+
+                // Report progress per document — every document that
+                // receives its embedding triggers a progress update so
+                // the client (TerminusDB) sees continuous per-document
+                // advancement, not batch-boundary jumps.
+                if let Some(tx) = progress_tx {
+                    let _ = tx.send(ProgressUpdate::Progress {
+                        indexed: *indexed_count,
+                        total_seen: *total_docs_seen,
+                        skipped: skipped.len() as u64,
+                    }).await;
+                }
+            }
+        }
+
+        // Append all rows for this micro-batch (one fragment).
+        if !batch_rows.is_empty() {
+            batch_rows.shrink_to_fit();
+            ctx.store.io_microbatch_append(ds, &batch_rows).await
+                .map_err(|e| format!("microbatch append failed: {}", e))?;
+            ctx.store.pipeline_written_chunks.fetch_add(batch_rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Decrement pending by the batch chunk count (they're now embedded+written).
+        ctx.store.pipeline_pending_chunks.fetch_sub(batch_chunk_count, std::sync::atomic::Ordering::Relaxed);
+
+        // Drop all Vecs to free memory before the next micro-batch.
+        // clear() keeps capacity; shrink_to_fit() returns it to the allocator
+        // so RSS doesn't creep upward across micro-batches.
+        batch_docs.clear();
+        batch_docs.shrink_to_fit();
+
+        Ok(())
+    }
+
+    // ─── Main loop: read ops from channel, micro-batch embed+write ──────
+    loop {
+        if cancel_token.is_cancelled() {
+            return Err("pipeline superseded by new push (reindex)".to_string());
+        }
+        let op = tokio::select! {
+            op = operation_rx.recv() => match op {
+                Some(op) => op,
+                None => break, // channel closed — flush remaining
+            },
+            _ = cancel_token.cancelled() => {
+                return Err("pipeline superseded by new push (reindex)".to_string());
+            }
+        };
         match op {
             Operation::Inserted { id, string } => {
+                total_docs_seen += 1;
                 match chunk::chunk_text(ctx.tokenizer, &string, ctx.chunk_params) {
                     Ok(chunks) if chunks.is_empty() => {
-                        skipped.push(SkippedDoc {
-                            id,
-                            message: "chunking produced zero chunks".to_owned(),
-                        });
+                        skipped.push(SkippedDoc { id, message: "chunking produced zero chunks".to_owned() });
                     }
                     Ok(chunks) => {
-                        all_docs_to_embed.push(DocToEmbed {
-                            id,
-                            chunks,
-                            is_changed: false,
-                        });
+                        batch_docs.push(DocToEmbed { id, chunks, is_changed: false });
                     }
                     Err(e) => {
-                        skipped.push(SkippedDoc {
-                            id,
-                            message: format!("chunking failed: {}", e),
-                        });
+                        skipped.push(SkippedDoc { id, message: format!("chunking failed: {}", e) });
                     }
                 }
             }
             Operation::Changed { id, string } => {
+                total_docs_seen += 1;
                 match chunk::chunk_text(ctx.tokenizer, &string, ctx.chunk_params) {
                     Ok(chunks) if chunks.is_empty() => {
-                        skipped.push(SkippedDoc {
-                            id,
-                            message: "chunking produced zero chunks".to_owned(),
-                        });
+                        skipped.push(SkippedDoc { id, message: "chunking produced zero chunks".to_owned() });
                     }
                     Ok(chunks) => {
-                        all_docs_to_embed.push(DocToEmbed {
-                            id,
-                            chunks,
-                            is_changed: true,
-                        });
+                        batch_docs.push(DocToEmbed { id, chunks, is_changed: true });
                     }
                     Err(e) => {
-                        skipped.push(SkippedDoc {
-                            id,
-                            message: format!("chunking failed: {}", e),
-                        });
+                        skipped.push(SkippedDoc { id, message: format!("chunking failed: {}", e) });
                     }
                 }
             }
@@ -2359,228 +2631,57 @@ async fn io_run_index_pipeline_stream(
                 all_delete_ids.push(id);
             }
             Operation::Error { message } => {
-                skipped.push(SkippedDoc {
-                    id: "unknown".to_owned(),
-                    message: format!("operation error: {}", message),
-                });
+                skipped.push(SkippedDoc { id: "unknown".to_owned(), message: format!("operation error: {}", message) });
             }
             Operation::Abort => {
-                // Send Aborted progress update if streaming.
                 if let Some(tx) = &progress_tx {
                     let _ = tx.send(ProgressUpdate::Aborted).await;
                 }
                 return Err("push aborted by client".to_string());
             }
         }
-    }
 
-    // Channel closed — all operations received. Now proceed with embedding
-    // and the write phase, identical to the non-streaming pipeline.
-
-    // Flatten chunk texts into one ordered list.
-    let mut flat_texts: Vec<String> = Vec::new();
-    let mut doc_flat_ranges: Vec<(usize, usize)> = Vec::with_capacity(all_docs_to_embed.len());
-
-    for doc in &all_docs_to_embed {
-        let start = flat_texts.len();
-        for chunk in &doc.chunks {
-            flat_texts.push(chunk.text.clone());
-        }
-        doc_flat_ranges.push((start, doc.chunks.len()));
-    }
-
-    // Batch-embed in groups, sending progress after each batch.
-    // This gives real-time trickling feedback during the embedding phase
-    // rather than a single update after all embeddings are done.
-    //
-    // Clustering embeddings are only generated when store_clustering is enabled
-    // for the domain; otherwise zeros are stored (saves embed time + bandwidth).
-    let store_clustering = ctx.store.domain_settings.store_clustering(ctx.domain).await;
-
-    let mut embed_results_doc: Vec<EmbedResult> = Vec::with_capacity(flat_texts.len());
-    let mut embed_results_query: Vec<EmbedResult> = Vec::with_capacity(flat_texts.len());
-
-    let total_docs = all_docs_to_embed.len() as u64;
-    let mut texts_embedded: usize = 0;
-
-    for batch in flat_texts.chunks(ctx.embed_batch_size) {
-        let batch_doc = embed::io_embed_batched(
-            ctx.provider,
-            batch,
-            ctx.embed_batch_size,
-            EmbeddingRole::Document,
-            ctx.http_client,
-            Some(ctx.embed_cache),
-        )
-        .await;
-        let batch_query = if store_clustering {
-            embed::io_embed_batched(
-                ctx.provider,
-                batch,
-                ctx.embed_batch_size,
-                EmbeddingRole::Clustering,
-                ctx.http_client,
-                Some(ctx.embed_cache),
-            )
-            .await
-        } else {
-            batch.iter().map(|_| EmbedResult::Ok(vec![0.0; ctx.store.dim])).collect::<Vec<_>>()
-        };
-
-        embed_results_doc.extend(batch_doc);
-        embed_results_query.extend(batch_query);
-
-        texts_embedded += batch.len();
-
-        // Send progress update after each batch (if streaming).
-        // Count docs whose chunks are all within the embedded range.
-        if let Some(tx) = &progress_tx {
-            let docs_done = doc_flat_ranges
-                .iter()
-                .filter(|(start, count)| start + count <= texts_embedded)
-                .count() as u64;
-            if tx
-                .send(ProgressUpdate::Progress {
-                    indexed: docs_done,
-                    total_seen: total_docs,
-                    skipped: skipped.len() as u64,
-                })
-                .await
-                .is_err()
-            {
-                // Client disconnected — abort before writing any data.
-                return Err("client disconnected during embedding".to_string());
-            }
+        // Flush when the micro-batch is full.
+        if batch_docs.len() >= MICRO_BATCH_DOCS {
+            flush_microbatch(
+                ctx, &mut ds, &mut batch_docs, &mut all_delete_ids,
+                &mut skipped, store_clustering, &progress_tx,
+                &mut total_docs_seen, &mut indexed_count,
+                cancel_token,
+            ).await?;
         }
     }
 
-    // Scatter embeddings back → build ChunkRows.
-    let mut all_rows: Vec<ChunkRow> = Vec::new();
-    let mut indexed_count: u64 = 0;
+    // Channel closed — flush any remaining docs in the buffer.
+    flush_microbatch(
+        ctx, &mut ds, &mut batch_docs, &mut all_delete_ids,
+        &mut skipped, store_clustering, &progress_tx,
+        &mut total_docs_seen, &mut indexed_count,
+        cancel_token,
+    ).await?;
 
-    for (doc_idx, doc) in all_docs_to_embed.iter().enumerate() {
-        let (start, count) = doc_flat_ranges[doc_idx];
-        let doc_results_doc = &embed_results_doc[start..start + count];
-        let doc_results_query = &embed_results_query[start..start + count];
+    // ─── Write phase: optimize indices + tag ────────────────────────────
+    let has_work = indexed_count > 0 || !all_delete_ids.is_empty();
 
-        let first_failure = doc_results_doc
-            .iter()
-            .chain(doc_results_query.iter())
-            .find_map(|r| match r {
-                EmbedResult::Failed(msg) => Some(msg.clone()),
-                EmbedResult::Ok(_) => None,
-            });
-
-        if let Some(failure_msg) = first_failure {
-            skipped.push(SkippedDoc {
-                id: doc.id.clone(),
-                message: failure_msg,
-            });
-            continue;
-        }
-
-        let mut embeddings_doc: Vec<Vec<f32>> = Vec::with_capacity(doc_results_doc.len());
-        let mut embeddings_query: Vec<Vec<f32>> = Vec::with_capacity(doc_results_query.len());
-        let mut extraction_failed = false;
-
-        for r in doc_results_doc {
-            match r {
-                EmbedResult::Ok(emb) => embeddings_doc.push(emb.clone()),
-                EmbedResult::Failed(msg) => {
-                    skipped.push(SkippedDoc {
-                        id: doc.id.clone(),
-                        message: format!(
-                            "internal: EmbedResult::Failed after first_failure check (doc): {}",
-                            msg
-                        ),
-                    });
-                    extraction_failed = true;
-                    break;
-                }
-            }
-        }
-        if extraction_failed {
-            continue;
-        }
-
-        for r in doc_results_query {
-            match r {
-                EmbedResult::Ok(emb) => embeddings_query.push(emb.clone()),
-                EmbedResult::Failed(msg) => {
-                    skipped.push(SkippedDoc {
-                        id: doc.id.clone(),
-                        message: format!(
-                            "internal: EmbedResult::Failed after first_failure check (query): {}",
-                            msg
-                        ),
-                    });
-                    extraction_failed = true;
-                    break;
-                }
-            }
-        }
-        if extraction_failed {
-            continue;
-        }
-
-        for emb in &mut embeddings_doc {
-            l2_normalize(emb);
-        }
-        for emb in &mut embeddings_query {
-            l2_normalize(emb);
-        }
-
-        let doc_type = ingest::extract_doc_type(&doc.id);
-        let rows: Vec<ChunkRow> = doc
-            .chunks
-            .iter()
-            .zip(embeddings_doc.into_iter().zip(embeddings_query))
-            .map(|(chunk, (embedding, clustering_embedding))| ChunkRow {
-                doc_id: doc.id.clone(),
-                doc_type: doc_type.clone(),
-                chunk_index: chunk.index as i32,
-                chunk_count: chunk.count as i32,
-                chunk_token_start: chunk.token_start as i32,
-                doc_token_len: chunk.doc_token_len as i32,
-                embedding,
-                clustering_embedding,
-                content: chunk.text.clone(),
-            })
-            .collect();
-
-        if doc.is_changed {
-            all_delete_ids.push(doc.id.clone());
-        }
-
-        all_rows.extend(rows);
-        indexed_count += 1;
+    // For pure Deleted docs (not Changed), do one delete now.
+    if !all_delete_ids.is_empty() && indexed_count == 0 {
+        ctx.store.io_microbatch_delete(&mut ds, &all_delete_ids).await
+            .map_err(|e| format!("final delete failed: {}", e))?;
     }
 
-    // Write phase (batched, under pipeline lock) — identical to non-streaming.
-    let has_work = !all_rows.is_empty() || !all_delete_ids.is_empty();
+    // Capture the final version from the write handle.
+    let last_version = ds.version().version;
 
-    let _guard = ctx.store.acquire_pipeline_lock(ctx.domain, ctx.branch).await;
+    // Refresh the cached handle so subsequent reads see the new data.
+    ctx.store.io_refresh_cached_dataset(ctx.domain, ctx.branch).await
+        .map_err(|e| format!("cache refresh failed: {}", e))?;
 
     if has_work {
-        let last_version = match ctx
-            .store
-            .io_batch_delete_append(ctx.domain, ctx.branch, &all_delete_ids, &all_rows)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = format!("batch delete-append failed: {}", e);
-                if let Some(tx) = &progress_tx {
-                    let _ = tx.send(ProgressUpdate::Error { error: msg.clone() }).await;
-                }
-                return Err(msg);
-            }
-        };
-
-        // Optimization is a SOFT failure: data is already written and searchable
-        // via flat scan. Log the error and tag at last_version so the commit is
-        // available for search. The index will be built on a future optimize cycle.
-        let indexed_version = match io_optimize_on_uncached_handle(ctx.store, ctx.domain, ctx.branch, store_clustering).await {
+        // Optimize indices on an UNCACHED handle (FTS + vector ANN).
+        // This indexes all new fragments created by the micro-batch appends.
+        let indexed_version = match io_optimize_on_uncached_handle(
+            ctx.store, ctx.domain, ctx.branch, store_clustering
+        ).await {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[pipeline] index optimization failed (soft): {} — tagging at data version {}", e, last_version);
@@ -2589,11 +2690,7 @@ async fn io_run_index_pipeline_stream(
         };
 
         let tag_version = indexed_version.unwrap_or(last_version);
-        if let Err(e) = ctx
-            .store
-            .io_tag_commit(ctx.domain, ctx.branch, commit, tag_version)
-            .await
-        {
+        if let Err(e) = ctx.store.io_tag_commit(ctx.domain, ctx.branch, commit, tag_version).await {
             let msg = format!("failed to tag commit: {}", e);
             if let Some(tx) = &progress_tx {
                 let _ = tx.send(ProgressUpdate::Error { error: msg.clone() }).await;
@@ -2601,10 +2698,14 @@ async fn io_run_index_pipeline_stream(
             return Err(msg);
         }
 
-        ctx.store
-            .update_last_indexed(ctx.domain, ctx.branch, commit, tag_version)
-            .await;
+        ctx.store.update_last_indexed(ctx.domain, ctx.branch, commit, tag_version).await;
+
+        // Prune old untagged intermediate versions to prevent manifest/memory growth.
+        if let Err(e) = ctx.store.io_cleanup_old_versions(ctx.domain, ctx.branch).await {
+            eprintln!("[pipeline] version cleanup failed (soft): {}", e);
+        }
     } else {
+        // No-op commit: tag at current version.
         if let Err(e) = ctx.store.io_open_dataset(ctx.domain, ctx.branch).await {
             let msg = format!("no-op tag: failed to ensure dataset: {}", e);
             if let Some(tx) = &progress_tx {
@@ -2613,26 +2714,10 @@ async fn io_run_index_pipeline_stream(
             return Err(msg);
         }
 
-        let current_version = match ctx
-            .store
-            .io_branch_head_version(ctx.domain, ctx.branch)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = format!("no-op tag: failed to get branch head version: {}", e);
-                if let Some(tx) = &progress_tx {
-                    let _ = tx.send(ProgressUpdate::Error { error: msg.clone() }).await;
-                }
-                return Err(msg);
-            }
-        };
+        let current_version = ctx.store.io_branch_head_version(ctx.domain, ctx.branch).await
+            .map_err(|e| format!("no-op tag: failed to get branch head version: {}", e))?;
 
-        if let Err(e) = ctx
-            .store
-            .io_tag_commit(ctx.domain, ctx.branch, commit, current_version)
-            .await
-        {
+        if let Err(e) = ctx.store.io_tag_commit(ctx.domain, ctx.branch, commit, current_version).await {
             let msg = format!("no-op tag: failed to tag commit: {}", e);
             if let Some(tx) = &progress_tx {
                 let _ = tx.send(ProgressUpdate::Error { error: msg.clone() }).await;
@@ -2640,19 +2725,20 @@ async fn io_run_index_pipeline_stream(
             return Err(msg);
         }
 
-        ctx.store
-            .update_last_indexed(ctx.domain, ctx.branch, commit, current_version)
-            .await;
+        ctx.store.update_last_indexed(ctx.domain, ctx.branch, commit, current_version).await;
     }
+
+    // Reset pipeline counters after completion.
+    ctx.store.pipeline_pending_chunks.store(0, std::sync::atomic::Ordering::Relaxed);
+    ctx.store.pipeline_embedded_chunks.store(0, std::sync::atomic::Ordering::Relaxed);
+    ctx.store.pipeline_written_chunks.store(0, std::sync::atomic::Ordering::Relaxed);
 
     // Send Complete progress update if streaming.
     if let Some(tx) = &progress_tx {
-        let _ = tx
-            .send(ProgressUpdate::Complete {
-                indexed_documents: indexed_count,
-                skipped: skipped.clone(),
-            })
-            .await;
+        let _ = tx.send(ProgressUpdate::Complete {
+            indexed_documents: indexed_count,
+            skipped: skipped.clone(),
+        }).await;
     }
 
     Ok((indexed_count, skipped))
@@ -2739,7 +2825,7 @@ mod tests_risk26 {
     use crate::kernel::model::BranchName;
     use std::path::Path;
 
-    static DISABLED_CACHE: crate::embed::cache::EmbedCache = crate::embed::cache::EmbedCache::disabled();
+    static DISABLED_CACHE: std::sync::LazyLock<crate::embed::cache::EmbedCache> = std::sync::LazyLock::new(crate::embed::cache::EmbedCache::disabled);
 
     /// Build a test tokenizer from the checked-in fixture.
     fn test_tokenizer() -> Tokenizer {
@@ -2786,7 +2872,7 @@ mod tests_risk26 {
     #[tokio::test]
     async fn all_error_commit_tags_and_advances_last_indexed() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = LanceStore::new(tmp.path(), 8);
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
         let tokenizer = test_tokenizer();
         let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
         let provider = dummy_provider();
@@ -2855,7 +2941,7 @@ mod tests_risk26 {
     #[tokio::test]
     async fn abort_operation_returns_error() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = LanceStore::new(tmp.path(), 8);
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
         let tokenizer = test_tokenizer();
         let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
         let provider = dummy_provider();
@@ -2910,7 +2996,7 @@ mod tests_risk26 {
     #[tokio::test]
     async fn empty_operations_commit_tags_and_advances_last_indexed() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = LanceStore::new(tmp.path(), 8);
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
         let tokenizer = test_tokenizer();
         let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
         let provider = dummy_provider();
@@ -2973,7 +3059,7 @@ mod tests_risk26 {
     #[tokio::test]
     async fn normal_commit_after_noop_indexes_correctly() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = LanceStore::new(tmp.path(), 8);
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
         let tokenizer = test_tokenizer();
         let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
         let provider = dummy_provider();
@@ -3074,7 +3160,7 @@ mod tests_risk26 {
     #[tokio::test]
     async fn noop_commit_on_fresh_domain_creates_dataset_and_tags() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = LanceStore::new(tmp.path(), 8);
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
         let tokenizer = test_tokenizer();
         let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
         let provider = dummy_provider();
@@ -3123,7 +3209,7 @@ mod tests_streaming {
     use crate::kernel::model::BranchName;
     use std::path::Path;
 
-    static DISABLED_CACHE: crate::embed::cache::EmbedCache = crate::embed::cache::EmbedCache::disabled();
+    static DISABLED_CACHE: std::sync::LazyLock<crate::embed::cache::EmbedCache> = std::sync::LazyLock::new(crate::embed::cache::EmbedCache::disabled);
 
     fn test_tokenizer() -> Tokenizer {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3168,7 +3254,7 @@ mod tests_streaming {
     #[tokio::test]
     async fn stream_empty_operations_tags_and_advances_last_indexed() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = LanceStore::new(tmp.path(), 8);
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
         let tokenizer = test_tokenizer();
         let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
         let provider = dummy_provider();
@@ -3200,7 +3286,7 @@ mod tests_streaming {
         drop(_tx); // Close immediately — no operations.
 
         let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
-        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_empty", rx, None)
+        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_empty", rx, None, &tokio_util::sync::CancellationToken::new())
             .await
             .expect("streaming pipeline must succeed for empty channel");
 
@@ -3226,7 +3312,7 @@ mod tests_streaming {
     #[tokio::test]
     async fn stream_all_error_operations_tags_and_advances() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = LanceStore::new(tmp.path(), 8);
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
         let tokenizer = test_tokenizer();
         let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
         let provider = dummy_provider();
@@ -3260,7 +3346,7 @@ mod tests_streaming {
         drop(tx);
 
         let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
-        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_errors", rx, None)
+        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_errors", rx, None, &tokio_util::sync::CancellationToken::new())
             .await
             .expect("streaming pipeline must succeed for all-error channel");
 
@@ -3285,7 +3371,7 @@ mod tests_streaming {
     #[tokio::test]
     async fn stream_abort_returns_error() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = LanceStore::new(tmp.path(), 8);
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
         let tokenizer = test_tokenizer();
         let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
         let provider = dummy_provider();
@@ -3318,7 +3404,7 @@ mod tests_streaming {
         drop(tx);
 
         let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
-        let result = io_run_index_pipeline_stream(&ctx, "c1_abort", rx, None).await;
+        let result = io_run_index_pipeline_stream(&ctx, "c1_abort", rx, None, &tokio_util::sync::CancellationToken::new()).await;
 
         assert!(result.is_err(), "Abort must return error in streaming pipeline");
         assert!(result.unwrap_err().contains("aborted"));
@@ -3342,7 +3428,7 @@ mod tests_streaming {
     #[tokio::test]
     async fn stream_deleted_operations_tags_and_advances() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = LanceStore::new(tmp.path(), 8);
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
         let tokenizer = test_tokenizer();
         let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
         let provider = dummy_provider();
@@ -3375,7 +3461,7 @@ mod tests_streaming {
         drop(tx);
 
         let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
-        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_delete", rx, None)
+        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_delete", rx, None, &tokio_util::sync::CancellationToken::new())
             .await
             .expect("streaming pipeline must succeed for delete-only channel");
 
@@ -3428,6 +3514,9 @@ mod tests_exact_duplicate_override {
             tokenizer_path: "spikes/tokenizer/tokenizer.json".to_owned(),
             embed_batch_size: 32,
             embed_cache_size: None,
+            prometheus_port: None,
+            lance_index_cache_bytes: 256 * 1024 * 1024,
+            lance_metadata_cache_bytes: 128 * 1024 * 1024,
         };
         let tokenizer_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("spikes")
@@ -3517,7 +3606,7 @@ mod tests_exact_duplicate_override {
     async fn similar_identical_doc_embeddings_distance_zero() {
         let dim = 16;
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = Arc::new(LanceStore::new(tmp.path(), dim));
+        let store = Arc::new(LanceStore::new(tmp.path(), dim, 256 * 1024 * 1024, 128 * 1024 * 1024));
 
         let emb = make_embedding(dim, 1.0);
         let qemb_a = make_embedding(dim, 2.0);
@@ -3569,7 +3658,7 @@ mod tests_exact_duplicate_override {
     async fn similar_different_doc_embeddings_distance_nonzero() {
         let dim = 16;
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = Arc::new(LanceStore::new(tmp.path(), dim));
+        let store = Arc::new(LanceStore::new(tmp.path(), dim, 256 * 1024 * 1024, 128 * 1024 * 1024));
 
         let emb_a = make_embedding(dim, 1.0);
         let emb_b = make_embedding(dim, 5.0); // Different seed → different embedding.
@@ -3622,7 +3711,7 @@ mod tests_exact_duplicate_override {
     async fn duplicates_identical_doc_embeddings_distance_zero() {
         let dim = 16;
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = Arc::new(LanceStore::new(tmp.path(), dim));
+        let store = Arc::new(LanceStore::new(tmp.path(), dim, 256 * 1024 * 1024, 128 * 1024 * 1024));
 
         let emb = make_embedding(dim, 1.0);
         let qemb_a = make_embedding(dim, 2.0);
@@ -3677,7 +3766,7 @@ mod tests_exact_duplicate_override {
     async fn duplicates_different_doc_embeddings_distance_nonzero() {
         let dim = 16;
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = Arc::new(LanceStore::new(tmp.path(), dim));
+        let store = Arc::new(LanceStore::new(tmp.path(), dim, 256 * 1024 * 1024, 128 * 1024 * 1024));
 
         let emb_a = make_embedding(dim, 1.0);
         let emb_b = make_embedding(dim, 5.0); // Different seed.
@@ -3732,7 +3821,7 @@ mod tests_exact_duplicate_override {
     async fn candidates_identical_doc_embeddings_distance_zero() {
         let dim = 16;
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = Arc::new(LanceStore::new(tmp.path(), dim));
+        let store = Arc::new(LanceStore::new(tmp.path(), dim, 256 * 1024 * 1024, 128 * 1024 * 1024));
 
         let emb = make_embedding(dim, 1.0);
         let qemb_a = make_embedding(dim, 2.0);
@@ -3829,7 +3918,7 @@ mod tests_exact_duplicate_override {
     async fn candidates_different_doc_embeddings_distance_nonzero() {
         let dim = 16;
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = Arc::new(LanceStore::new(tmp.path(), dim));
+        let store = Arc::new(LanceStore::new(tmp.path(), dim, 256 * 1024 * 1024, 128 * 1024 * 1024));
 
         let emb_a = make_embedding(dim, 1.0);
         let emb_b = make_embedding(dim, 1.1); // Slightly different — close enough to match.
@@ -3927,7 +4016,7 @@ mod tests_exact_duplicate_override {
     async fn fetch_result_embeddings_returns_stored_vectors() {
         let dim = 8;
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = LanceStore::new(tmp.path(), dim);
+        let store = LanceStore::new(tmp.path(), dim, 256 * 1024 * 1024, 128 * 1024 * 1024);
 
         let emb_a = make_embedding(dim, 1.0);
         let emb_b = make_embedding(dim, 5.0);
@@ -4003,7 +4092,7 @@ mod tests_exact_duplicate_override {
     async fn fetch_result_clustering_embeddings_returns_stored_vectors() {
         let dim = 8;
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = LanceStore::new(tmp.path(), dim);
+        let store = LanceStore::new(tmp.path(), dim, 256 * 1024 * 1024, 128 * 1024 * 1024);
 
         let qemb_a = make_embedding(dim, 7.0);
         let qemb_b = make_embedding(dim, 9.0);
@@ -4079,7 +4168,7 @@ mod tests_exact_duplicate_override {
     async fn fetch_result_embeddings_filters_by_doc_type() {
         let dim = 8;
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = LanceStore::new(tmp.path(), dim);
+        let store = LanceStore::new(tmp.path(), dim, 256 * 1024 * 1024, 128 * 1024 * 1024);
 
         let row_a = ChunkRow {
             doc_id: "doc/a".to_owned(),
@@ -4152,7 +4241,7 @@ mod tests_exact_duplicate_override {
     async fn fetch_result_embeddings_all_when_no_filters() {
         let dim = 8;
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = LanceStore::new(tmp.path(), dim);
+        let store = LanceStore::new(tmp.path(), dim, 256 * 1024 * 1024, 128 * 1024 * 1024);
 
         let row_a = ChunkRow {
             doc_id: "doc/a".to_owned(),
@@ -4219,7 +4308,7 @@ mod tests_exact_duplicate_override {
     async fn fetch_result_embeddings_combined_filter() {
         let dim = 8;
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store = LanceStore::new(tmp.path(), dim);
+        let store = LanceStore::new(tmp.path(), dim, 256 * 1024 * 1024, 128 * 1024 * 1024);
 
         let row_a = ChunkRow {
             doc_id: "doc/a".to_owned(),

@@ -9,6 +9,7 @@ use arrow_array::{
 use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 use lance::dataset::Dataset;
+use lance::deps::datafusion::logical_expr::{col, in_list, lit, Expr};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_linalg::distance::DistanceType;
 
@@ -72,11 +73,8 @@ impl LanceStore {
             .map_err(|e| StoreError::Internal(format!("suggest limit failed: {}", e)))?;
 
         if !query.doc_type_filter.is_empty() || !query.doc_id_filter.is_empty() {
-            let filter = build_filter_expression(&query.doc_type_filter, &query.doc_id_filter);
-            if !filter.is_empty() {
-                scanner
-                    .filter(&filter)
-                    .map_err(|e| StoreError::Internal(format!("suggest filter failed: {}", e)))?;
+            if let Some(expr) = build_filter_expr(&query.doc_type_filter, &query.doc_id_filter) {
+                scanner.filter_expr(expr);
             }
         }
 
@@ -297,7 +295,8 @@ impl LanceStore {
         query: &SearchQuery,
     ) -> Result<Vec<ChunkHit>, StoreError> {
         // Over-fetch to allow for dedup (multiple chunks per doc).
-        let k = (query.start + query.count) * 3;
+        // Checked arithmetic: prevents silent overflow if start+count is large.
+        let k = query.start.saturating_add(query.count).saturating_mul(3);
 
         let mut scanner = ds.scan();
         scanner
@@ -313,10 +312,8 @@ impl LanceStore {
 
         // Apply filters if present.
         if !query.doc_type_filter.is_empty() || !query.doc_id_filter.is_empty() {
-            let filter = build_filter_expression(&query.doc_type_filter, &query.doc_id_filter);
-            if !filter.is_empty() {
-                scanner.filter(&filter)
-                    .map_err(|e| StoreError::Internal(format!("filter failed: {}", e)))?;
+            if let Some(expr) = build_filter_expr(&query.doc_type_filter, &query.doc_id_filter) {
+                scanner.filter_expr(expr);
             }
         }
 
@@ -340,7 +337,7 @@ impl LanceStore {
         ds: &Dataset,
         query: &SearchQuery,
     ) -> Result<Vec<ChunkHit>, StoreError> {
-        let k = (query.start + query.count) * 3;
+        let k = query.start.saturating_add(query.count).saturating_mul(3);
 
         let mut scanner = ds.scan();
         // Lance FTS via full_text_search on the "content" column.
@@ -353,11 +350,8 @@ impl LanceStore {
 
         // Apply filters if present.
         if !query.doc_type_filter.is_empty() || !query.doc_id_filter.is_empty() {
-            let filter = build_filter_expression(&query.doc_type_filter, &query.doc_id_filter);
-            if !filter.is_empty() {
-                scanner
-                    .filter(&filter)
-                    .map_err(|e| StoreError::Internal(format!("filter failed: {}", e)))?;
+            if let Some(expr) = build_filter_expr(&query.doc_type_filter, &query.doc_id_filter) {
+                scanner.filter_expr(expr);
             }
         }
 
@@ -456,11 +450,8 @@ impl LanceStore {
 
     /// Scan a dataset handle for all chunks of `doc_id` (filter on indexed column).
     async fn scan_doc_chunks(ds: &Dataset, doc_id: &str) -> Result<Vec<ChunkHit>, StoreError> {
-        let filter = format!("doc_id = '{}'", doc_id.replace('\'', "''"));
         let mut scanner = ds.scan();
-        scanner
-            .filter(&filter)
-            .map_err(|e| StoreError::Internal(format!("lookup filter failed: {}", e)))?;
+        scanner.filter_expr(doc_id_eq_expr(doc_id));
 
         let batches: Vec<RecordBatch> = scanner
             .try_into_stream()
@@ -581,21 +572,17 @@ impl LanceStore {
 
         // Build a combined filter for doc_types and doc_ids.
         // When both are empty, no filter is applied — all rows are returned.
-        let filter = build_filter_expression(doc_types, doc_ids);
+        let filter = build_filter_expr(doc_types, doc_ids);
 
         let mut scanner = snapshot.scan();
+        if let Some(expr) = filter {
+            scanner.filter_expr(expr);
+        }
         scanner
             .project(&["doc_id", "chunk_index", column])
             .map_err(|e| StoreError::Internal(format!(
                 "result embedding projection failed: {}", e
             )))?;
-        if !filter.is_empty() {
-            scanner
-                .filter(&filter)
-                .map_err(|e| StoreError::Internal(format!(
-                    "result embedding filter failed: {}", e
-                )))?;
-        }
 
         let batches: Vec<RecordBatch> = scanner
             .try_into_stream()
@@ -679,17 +666,15 @@ impl LanceStore {
     ) -> Result<(u64, tokio::sync::mpsc::Receiver<EmbeddingRecord>), StoreError> {
         let snapshot = self.io_snapshot_from_cache(domain, branch, commit).await?;
 
-        let filter = build_filter_expression(doc_types, doc_ids);
+        let filter = build_filter_expr(doc_types, doc_ids);
 
         // Count unique doc_ids by scanning the doc_id column.
         let mut count_scanner = snapshot.scan();
         count_scanner
             .project(&["doc_id", "chunk_index"])
             .map_err(|e| StoreError::Internal(format!("count projection failed: {}", e)))?;
-        if !filter.is_empty() {
-            count_scanner
-                .filter(&filter)
-                .map_err(|e| StoreError::Internal(format!("count filter failed: {}", e)))?;
+        if let Some(expr) = &filter {
+            count_scanner.filter_expr(expr.clone());
         }
         let count_batches: Vec<RecordBatch> = count_scanner
             .try_into_stream()
@@ -727,10 +712,8 @@ impl LanceStore {
         scanner
             .project(&columns)
             .map_err(|e| StoreError::Internal(format!("stream projection failed: {}", e)))?;
-        if !filter.is_empty() {
-            scanner
-                .filter(&filter)
-                .map_err(|e| StoreError::Internal(format!("stream filter failed: {}", e)))?;
+        if let Some(expr) = filter {
+            scanner.filter_expr(expr);
         }
 
         let stream = scanner
@@ -747,6 +730,7 @@ impl LanceStore {
         // in memory at once (we only hold the best per doc_id).
         let store_clustering_clone = store_clustering;
         tokio::spawn(async move {
+            #[allow(clippy::type_complexity)]
             let mut best_per_doc: std::collections::HashMap<String, (i32, Vec<f32>, Option<Vec<f32>>)> =
                 std::collections::HashMap::new();
 
@@ -863,18 +847,16 @@ impl LanceStore {
 
         let snapshot = self.io_snapshot_from_cache(domain, branch, commit).await?;
 
-        let filter = build_filter_expression(&[], doc_ids);
+        let filter = build_filter_expr(&[], doc_ids);
 
         let mut scanner = snapshot.scan();
+        if let Some(expr) = filter {
+            scanner.filter_expr(expr);
+        }
         scanner
             .project(&["doc_id", "chunk_index", "content"])
             .map_err(|e| StoreError::Internal(format!(
                 "doc content projection failed: {}", e
-            )))?;
-        scanner
-            .filter(&filter)
-            .map_err(|e| StoreError::Internal(format!(
-                "doc content filter failed: {}", e
             )))?;
 
         let batches: Vec<RecordBatch> = scanner
@@ -941,29 +923,40 @@ impl LanceStore {
     }
 }
 
-/// Build a Lance SQL filter combining doc_type and doc_id IN-lists.
+/// Build a DataFusion Expr filter combining doc_type and doc_id IN-lists.
 /// Used by search (vector/fts filters) and resolve (set/target population filters).
-pub(super) fn build_filter_expression(doc_types: &[String], doc_ids: &[String]) -> String {
-    let mut parts = Vec::new();
+/// Returns None when both lists are empty (no filter needed).
+///
+/// SECURITY: Uses pre-parsed DataFusion Expr values (lit/in_list) instead of
+/// SQL string interpolation. This eliminates SQL injection via backslash-quote
+/// escaping or control characters in doc_ids/doc_types.
+pub(super) fn build_filter_expr(
+    doc_types: &[String],
+    doc_ids: &[String],
+) -> Option<Expr> {
+    let mut parts: Vec<Expr> = Vec::new();
 
     if !doc_types.is_empty() {
-        let values: Vec<String> = doc_types
-            .iter()
-            .map(|t| format!("'{}'", t.replace('\'', "''")))
-            .collect();
-        parts.push(format!("doc_type IN ({})", values.join(", ")));
+        let values: Vec<Expr> = doc_types.iter().map(|t| lit(t.as_str())).collect();
+        parts.push(in_list(col("doc_type"), values, false));
     }
 
     if !doc_ids.is_empty() {
-        let values: Vec<String> = doc_ids
-            .iter()
-            .map(|id| format!("'{}'", id.replace('\'', "''")))
-            .collect();
-        parts.push(format!("doc_id IN ({})", values.join(", ")));
+        let values: Vec<Expr> = doc_ids.iter().map(|id| lit(id.as_str())).collect();
+        parts.push(in_list(col("doc_id"), values, false));
     }
 
-    // AND across the two sets (OR within each via IN).
-    parts.join(" AND ")
+    match parts.len() {
+        0 => None,
+        1 => Some(parts.into_iter().next().unwrap()),
+        _ => Some(parts.into_iter().reduce(Expr::and).unwrap()),
+    }
+}
+
+/// Build a DataFusion Expr for a single doc_id equality filter.
+/// SECURITY: Uses lit() instead of SQL string interpolation.
+pub(super) fn doc_id_eq_expr(doc_id: &str) -> Expr {
+    col("doc_id").eq(lit(doc_id))
 }
 
 /// Extract one row's embedding from a `FixedSizeListArray` of Float32 values.

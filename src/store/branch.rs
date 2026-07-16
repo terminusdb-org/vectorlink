@@ -99,7 +99,7 @@ mod tests {
 
     fn make_test_store(dim: usize) -> (LanceStore, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("create temp dir");
-        let store = LanceStore::new(tmp.path(), dim);
+        let store = LanceStore::new(tmp.path(), dim, 256 * 1024 * 1024, 128 * 1024 * 1024);
         (store, tmp)
     }
 

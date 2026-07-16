@@ -190,7 +190,7 @@ async fn main() -> ExitCode {
 
     // Open the LanceStore at the given directory.
     let data_dir = Path::new(&args.directory);
-    let store = LanceStore::new(data_dir, args.dim);
+    let store = LanceStore::new(data_dir, args.dim, 256 * 1024 * 1024, 128 * 1024 * 1024);
 
     // Configure the embedding provider.
     let provider = embed::Provider::OpenAiCompatible {

@@ -242,6 +242,8 @@ mod tests {
         let store = Arc::new(LanceStore::new(
             std::path::Path::new("/tmp/indexqueue-test-shutdown"),
             128,
+            256 * 1024 * 1024,
+            128 * 1024 * 1024,
         ));
 
         let handle = spawn_index_worker(Arc::clone(&queue), store);

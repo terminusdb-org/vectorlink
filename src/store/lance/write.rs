@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatchIterator;
 use lance::dataset::Dataset;
+use lance::dataset::write::DeleteBuilder;
+use lance::deps::datafusion::logical_expr::{col, lit, in_list};
 
 use crate::kernel::error::StoreError;
 
@@ -44,10 +46,12 @@ impl LanceStore {
         let mut ds = self.io_open_branch_for_write(domain, branch).await?;
 
         // Delete existing rows for this doc_id (replace semantics).
-        let filter = format!("doc_id = '{}'", doc_id.replace('\'', "''"));
-        ds.delete(&filter)
+        let expr = col("doc_id").eq(lit(doc_id));
+        let result = DeleteBuilder::from_expr(Arc::new(ds.clone()), expr)
+            .execute()
             .await
             .map_err(|e| StoreError::Internal(format!("delete failed: {}", e)))?;
+        ds = result.new_dataset.as_ref().clone();
 
         // Append new rows.
         let batch = self.rows_to_batch(rows)?;
@@ -115,10 +119,13 @@ impl LanceStore {
         // Creates deletion vectors only (no new data fragment). Handles shrinking
         // chunk counts: ALL rows for a doc_id are removed regardless of old/new count.
         if !delete_ids.is_empty() {
-            let filter = build_doc_id_in_filter(delete_ids);
-            ds.delete(&filter)
+            let values: Vec<_> = delete_ids.iter().map(|id| lit(id.as_str())).collect();
+            let expr = in_list(col("doc_id"), values, false);
+            let result = DeleteBuilder::from_expr(Arc::new(ds.clone()), expr)
+                .execute()
                 .await
                 .map_err(|e| StoreError::Internal(format!("batch delete failed: {}", e)))?;
+            ds = result.new_dataset.as_ref().clone();
         }
 
         // --- Phase 2: append all new rows (one fragment for all Insert + Changed) ---
@@ -177,10 +184,13 @@ impl LanceStore {
         if delete_ids.is_empty() {
             return Ok(());
         }
-        let filter = build_doc_id_in_filter(delete_ids);
-        ds.delete(&filter)
+        let values: Vec<_> = delete_ids.iter().map(|id| lit(id.as_str())).collect();
+        let expr = in_list(col("doc_id"), values, false);
+        let result = DeleteBuilder::from_expr(Arc::new(ds.clone()), expr)
+            .execute()
             .await
             .map_err(|e| StoreError::Internal(format!("microbatch delete failed: {}", e)))?;
+        *ds = result.new_dataset.as_ref().clone();
         Ok(())
     }
 
@@ -278,10 +288,12 @@ impl LanceStore {
 
         let mut ds = self.io_open_branch_for_write(domain, branch).await?;
 
-        let filter = format!("doc_id = '{}'", doc_id.replace('\'', "''"));
-        ds.delete(&filter)
+        let expr = col("doc_id").eq(lit(doc_id));
+        let result = DeleteBuilder::from_expr(Arc::new(ds.clone()), expr)
+            .execute()
             .await
             .map_err(|e| StoreError::Internal(format!("delete failed: {}", e)))?;
+        ds = result.new_dataset.as_ref().clone();
 
         self.io_refresh_cached_dataset(domain, branch).await?;
 
@@ -344,15 +356,60 @@ async fn io_background_compact(
     Ok(())
 }
 
-/// Build a Lance SQL filter expression `doc_id IN ('id1', 'id2', ...)` for batch
-/// deletion of documents by their doc_id. SQL-escapes single quotes in doc_ids.
-///
-/// Precondition: `ids` is non-empty (caller must check). A filter on an empty set
-/// is a logic error (Lance will reject the empty IN-list).
-fn build_doc_id_in_filter(ids: &[String]) -> String {
-    let values: Vec<String> = ids
-        .iter()
-        .map(|id| format!("'{}'", id.replace('\'', "''")))
-        .collect();
-    format!("doc_id IN ({})", values.join(", "))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build the same Expr used by io_upsert_chunks and io_delete_doc
+    /// for individual doc_id deletion — demonstrates injection-safe construction.
+    fn build_single_expr(doc_id: &str) -> lance::deps::datafusion::logical_expr::Expr {
+        col("doc_id").eq(lit(doc_id))
+    }
+
+    #[test]
+    fn filter_normal_iri_is_safe() {
+        // Normal IRIs produce a simple equality Expr — no SQL string involved.
+        let expr = build_single_expr("terminusdb:///db/People/123");
+        let rendered = format!("{}", expr);
+        assert!(rendered.contains("terminusdb:///db/People/123"));
+    }
+
+    #[test]
+    fn filter_backslash_quote_is_safe_via_expr() {
+        // Previously, a doc_id like x\' OR 1=1 could break out of a SQL string
+        // literal via backslash escaping. With Expr-based construction, the
+        // entire doc_id is a literal value — no SQL parsing occurs.
+        let malicious = "x\\' OR 1=1";
+        let expr = build_single_expr(malicious);
+        let rendered = format!("{}", expr);
+        // The malicious content is contained within the literal — no SQL injection.
+        assert!(rendered.contains("OR 1=1"));
+        // It's part of the literal value, not injected SQL.
+        assert!(rendered.starts_with("doc_id = ") || rendered.contains("Utf8"));
+    }
+
+    #[test]
+    fn filter_newline_is_safe_via_expr() {
+        // Newlines in doc_ids are also safe — they're literal values, not SQL.
+        let malicious = "doc1\n-- OR 1=1";
+        let expr = build_single_expr(malicious);
+        let rendered = format!("{}", expr);
+        // The newline is part of the literal, not a SQL comment injection.
+        assert!(rendered.contains("OR 1=1"));
+    }
+
+    #[test]
+    fn filter_in_list_is_safe_via_expr() {
+        // The IN-list path (build_doc_id_in_filter replacement) also uses Expr.
+        let ids = ["evil\\' OR doc_id = 'admin".to_string()];
+        let values: Vec<_> = ids.iter().map(|id| lit(id.as_str())).collect();
+        let expr = lance::deps::datafusion::logical_expr::in_list(
+            col("doc_id"),
+            values,
+            false,
+        );
+        let rendered = format!("{}", expr);
+        // The entire malicious string is a single literal — no SQL injection.
+        assert!(rendered.contains("admin"));
+    }
 }

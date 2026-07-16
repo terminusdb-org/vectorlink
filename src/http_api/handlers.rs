@@ -286,6 +286,14 @@ fn extract_repeated_param(raw_query: Option<&str>, name: &str) -> Vec<String> {
         .collect()
 }
 
+/// Maximum number of results a single search/duplicates request can return.
+/// Prevents overflow in `k = (start + count) * 3` and bounds scan cost.
+const MAX_RESULT_COUNT: i64 = 200;
+
+/// Maximum `start` offset. Prevents integer overflow in `k = (start + count) * 3`
+/// when `start` is cast to `usize` and added to `count`.
+const MAX_START: i64 = 1_000_000;
+
 /// Validate pagination parameters.
 #[allow(clippy::result_large_err)]
 fn validate_pagination(start: Option<i64>, count: Option<i64>) -> Result<(), Response> {
@@ -296,12 +304,24 @@ fn validate_pagination(start: Option<i64>, count: Option<i64>) -> Result<(), Res
                 "invalid start: must be >= 0".to_owned(),
             ));
         }
+        if s > MAX_START {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid start: must be <= {}", MAX_START),
+            ));
+        }
     }
     if let Some(c) = count {
         if c < 1 {
             return Err(error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid count: must be >= 1".to_owned(),
+            ));
+        }
+        if c > MAX_RESULT_COUNT {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid count: must be <= {}", MAX_RESULT_COUNT),
             ));
         }
     }
@@ -473,9 +493,24 @@ async fn handle_push(
                 }
 
                 // Read the next chunk from the stream.
+                // FAIL-LOUD: invalid UTF-8 in the push body is a data corruption
+                // issue — reject it rather than silently replacing bytes with
+                // U+FFFD, which would corrupt doc_ids and text content.
                 match stream.next().await {
                     Some(Ok(chunk)) => {
-                        buf.push_str(&String::from_utf8_lossy(&chunk));
+                        match std::str::from_utf8(&chunk) {
+                            Ok(s) => buf.push_str(s),
+                            Err(e) => {
+                                let error_msg = format!(
+                                    "invalid UTF-8 in push body at byte offset {}: {}",
+                                    e.valid_up_to(),
+                                    e
+                                );
+                                state.service.record_error_task(&task_id, error_msg).await;
+                                drop(op_tx);
+                                return;
+                            }
+                        }
                     }
                     Some(Err(_)) => {
                         drop(op_tx);
@@ -581,9 +616,22 @@ async fn handle_push(
         }
 
         // Read the next chunk from the stream.
+        // FAIL-LOUD: invalid UTF-8 in the push body is a data corruption
+        // issue — reject it rather than silently replacing bytes with
+        // U+FFFD, which would corrupt doc_ids and text content.
         match stream.next().await {
             Some(Ok(chunk)) => {
-                buf.push_str(&String::from_utf8_lossy(&chunk));
+                match std::str::from_utf8(&chunk) {
+                    Ok(s) => buf.push_str(s),
+                    Err(e) => {
+                        stream_error = Some(format!(
+                            "invalid UTF-8 in push body at byte offset {}: {}",
+                            e.valid_up_to(),
+                            e
+                        ));
+                        break;
+                    }
+                }
             }
             Some(Err(e)) => {
                 stream_error = Some(format!("broken stream: {}", e));
@@ -953,6 +1001,7 @@ async fn handle_similar(
 async fn handle_similar_post(
     State(state): State<AppState>,
     headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
     Query(params): Query<SimilarParams>,
     Json(body): Json<SimilarRequestBody>,
 ) -> Response {
@@ -992,7 +1041,9 @@ async fn handle_similar_post(
         let doc_type_filter = body.doc_type.unwrap_or_default();
         let doc_id_filter = body.doc_id.unwrap_or_default();
         let snippet = body.snippet.unwrap_or(false);
-        let ancestors = body.ancestors.unwrap_or_default();
+        let ancestors = body.ancestors.clone().unwrap_or_else(|| {
+            extract_repeated_param(raw_query.as_deref(), "ancestor")
+        });
 
         match state
             .service
@@ -1029,7 +1080,9 @@ async fn handle_similar_post(
         let doc_type_filter = body.doc_type.unwrap_or_default();
         let doc_id_filter = body.doc_id.unwrap_or_default();
         let snippet = body.snippet.unwrap_or(false);
-        let ancestors = body.ancestors.unwrap_or_default();
+        let ancestors = body.ancestors.clone().unwrap_or_else(|| {
+            extract_repeated_param(raw_query.as_deref(), "ancestor")
+        });
 
         match state
             .service
@@ -1134,8 +1187,17 @@ async fn handle_statistics(
         }
         _ => {
             // No domain filter — global statistics (admin/internal use only).
+            // Includes internal instrumentation (data structure sizes) for
+            // memory leak monitoring.
             match state.service.statistics().await {
-                Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
+                Ok(stats) => {
+                    let internal = state.service.internal_stats().await;
+                    let mut body = serde_json::to_value(&stats).unwrap_or(serde_json::json!({}));
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert("internal".to_owned(), serde_json::to_value(&internal).unwrap_or(serde_json::json!({})));
+                    }
+                    (StatusCode::OK, Json(body)).into_response()
+                }
                 Err(e) => service_error_to_response(e),
             }
         }
@@ -1251,7 +1313,7 @@ async fn handle_embeddings_stream(
                         .unwrap_or_default()
                 },
             );
-            let ndjson_stream = futures::StreamExt::map(mapped, |line| Ok::<_, std::convert::Infallible>(line));
+            let ndjson_stream = futures::StreamExt::map(mapped, Ok::<_, std::convert::Infallible>);
 
             let body = Body::from_stream(ndjson_stream);
 
@@ -1458,7 +1520,7 @@ async fn embeddings_stream_response(
                         .unwrap_or_default()
                 },
             );
-            let ndjson_stream = futures::StreamExt::map(mapped, |line| Ok::<_, std::convert::Infallible>(line));
+            let ndjson_stream = futures::StreamExt::map(mapped, Ok::<_, std::convert::Infallible>);
 
             let body = Body::from_stream(ndjson_stream);
 

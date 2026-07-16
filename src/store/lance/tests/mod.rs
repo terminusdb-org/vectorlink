@@ -7,7 +7,7 @@ use crate::kernel::model::{BranchName, Domain, DuplicateGroup, SearchMode};
 
 fn make_test_store(dim: usize) -> (LanceStore, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("create temp dir");
-    let store = LanceStore::new(tmp.path(), dim);
+    let store = LanceStore::new(tmp.path(), dim, 256 * 1024 * 1024, 128 * 1024 * 1024);
     (store, tmp)
 }
 
@@ -808,7 +808,7 @@ async fn different_commits_different_versions() {
 /// Helper: open a SECOND store over the same dir — simulates a restart with
 /// cold in-memory state but warm disk.
 fn reopen_store(tmp: &tempfile::TempDir, dim: usize) -> LanceStore {
-    LanceStore::new(tmp.path(), dim)
+    LanceStore::new(tmp.path(), dim, 256 * 1024 * 1024, 128 * 1024 * 1024)
 }
 
 /// Helper: build a validated `Domain` from a "org/db" string (test-only).
@@ -3653,4 +3653,26 @@ async fn suggest_substring_fallback_finds_partial_word_matches() {
     let ids: Vec<&str> = result.hits.iter().map(|h| h.id.as_str()).collect();
     assert!(ids.contains(&"doc1"), "should find 'electrical' via substring");
     assert!(ids.contains(&"doc2"), "should find 'electronic' via substring");
+}
+
+#[test]
+fn encode_decode_domain_path_roundtrip() {
+    let cases = vec![
+        "admin/product_assortment",
+        "admin/my_db",
+        "org/team/sub_db",
+        "a/b",
+    ];
+    for domain in &cases {
+        let encoded = encode_domain_path(domain);
+        let decoded = decode_domain_path(&encoded);
+        assert_eq!(
+            decoded.as_deref(),
+            Some(*domain),
+            "round-trip failed for '{}': encoded='{}', decoded={:?}",
+            domain,
+            encoded,
+            decoded
+        );
+    }
 }
