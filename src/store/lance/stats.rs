@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 //! Statistics and domain deletion.
 
 use arrow_array::{Array, RecordBatch, StringArray};

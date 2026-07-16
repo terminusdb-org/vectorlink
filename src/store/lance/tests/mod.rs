@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 use super::*;
 use super::search::{batches_to_vector_hits, rrf_merge};
 use crate::kernel::model::{BranchName, Domain, DuplicateGroup, SearchMode};

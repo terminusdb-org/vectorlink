@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 #![forbid(unsafe_code)]
 
 //! tdb-search library — shared modules for server and CLI binaries.

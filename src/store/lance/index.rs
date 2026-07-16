@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 //! Index maintenance: FTS index creation/optimization and data compaction.
 
 use lance::dataset::Dataset;

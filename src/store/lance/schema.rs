@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 //! Types and constants for the Lance store schema.
 
 use crate::kernel::model::SearchMode;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 //! Search: vector, FTS, hybrid, snapshot resolution, doc-chunk lookup.
 
 use arrow_array::{
