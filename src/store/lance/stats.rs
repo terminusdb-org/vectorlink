@@ -3,29 +3,102 @@
 
 //! Statistics and domain deletion.
 
-use arrow_array::{Array, RecordBatch, StringArray};
-use futures::TryStreamExt;
-
 use crate::kernel::error::StoreError;
-use crate::kernel::model::Statistics;
+use crate::kernel::model::{InternalStats, Statistics};
+
+use arrow_array::{Array, RecordBatch, StringArray};
+use futures::TryStreamExt as _;
+use lance::dataset::Dataset;
 
 use super::{BranchKey, LanceStore};
 
 impl LanceStore {
+    /// Discover on-disk datasets by scanning `base_dir` for `*.lance` directories.
+    /// Returns a list of decoded domain strings (e.g. "admin/product_assortment").
+    fn discover_on_disk_datasets(&self) -> Vec<String> {
+        let mut found = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&self.base_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with(".lance") && path.is_dir() {
+                        let stem = &name[..name.len() - ".lance".len()];
+                        if let Some(domain) = super::decode_domain_path(stem) {
+                            found.push(domain);
+                        }
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Count live chunks from a single dataset using manifest metadata only.
+    /// live = sum(physical_rows) - sum(fast_num_deletions).
+    /// No data file I/O — reads fragment metadata from the manifest.
+    async fn count_dataset_rows(&self, uri: &str) -> u64 {
+        let ds = match self.io_open_fresh(uri).await {
+            Ok(ds) => ds,
+            Err(_) => return 0,
+        };
+
+        let mut physical = 0u64;
+        let mut deleted = 0u64;
+        for frag in ds.get_fragments() {
+            if let Some(rows) = frag.metadata().physical_rows {
+                physical += rows as u64;
+            }
+            if let Ok(n) = frag.fast_num_deletions() {
+                deleted += n as u64;
+            }
+        }
+        physical.saturating_sub(deleted)
+    }
+
+    /// Count distinct doc_id values in a dataset by scanning only the doc_id
+    /// column (no embedding data read). Used for the per-domain statistics
+    /// endpoint so the UI shows an accurate "Searchable Documents" count.
+    async fn count_distinct_doc_ids(&self, ds: &Dataset) -> u64 {
+        let mut scanner = ds.scan();
+        if scanner.project(&["doc_id"]).is_err() {
+            return 0;
+        }
+        let stream = match scanner.try_into_stream().await {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        let batches: Vec<RecordBatch> = match stream.try_collect().await {
+            Ok(b) => b,
+            Err(_) => return 0,
+        };
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for batch in &batches {
+            if let Some(ids) = batch
+                .column_by_name("doc_id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            {
+                for i in 0..ids.len() {
+                    seen.insert(ids.value(i).to_owned());
+                }
+            }
+        }
+        seen.len() as u64
+    }
+
     /// Count total rows across all datasets (for statistics).
+    /// Discovers on-disk datasets in addition to the in-memory cache, so
+    /// statistics remain accurate after a server restart.
     pub async fn statistics(&self) -> Statistics {
         let datasets = self.datasets.read().await;
         let indexes = self.branch_indexes.read().await;
 
-        // Layout A: each cache entry is one domain dataset. Branch count comes
-        // from the per-(domain, branch) index map, not the dataset count.
         let mut domains = std::collections::HashSet::new();
         let mut distinct_branches: std::collections::HashSet<BranchKey> =
             std::collections::HashSet::new();
         let mut indexed_commits = 0u64;
         let mut chunks = 0u64;
-        let mut distinct_docs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+        // Collect domains from in-memory caches.
         for domain in datasets.keys() {
             domains.insert(domain.clone());
         }
@@ -37,35 +110,24 @@ impl LanceStore {
                 indexed_commits += 1;
             }
         }
-        let branches = distinct_branches.len() as u64;
 
-        // Count rows and distinct doc_ids from datasets (best-effort).
+        // Count live chunks from cached datasets using manifest metadata only.
+        // live = sum(physical_rows) - sum(fast_num_deletions). No data I/O.
+        let mut deleted_total = 0u64;
+        let mut physical_total = 0u64;
         for ds_arc in datasets.values() {
             let ds = ds_arc.read().await;
-            if let Ok(count) = ds.count_rows(None).await {
-                chunks += count as u64;
-            }
-            // Scan doc_id column for distinct count.
-            let mut scanner = ds.scan();
-            if scanner.project(&["doc_id"]).is_ok() {
-                if let Ok(stream) = scanner.try_into_stream().await {
-                    if let Ok(batches) = stream.try_collect::<Vec<RecordBatch>>().await {
-                        for batch in &batches {
-                            if let Some(ids) = batch
-                                .column_by_name("doc_id")
-                                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                            {
-                                for i in 0..ids.len() {
-                                    distinct_docs.insert(ids.value(i).to_owned());
-                                }
-                            }
-                        }
-                    }
+            for frag in ds.get_fragments() {
+                if let Some(rows) = frag.metadata().physical_rows {
+                    physical_total += rows as u64;
+                }
+                if let Ok(n) = frag.fast_num_deletions() {
+                    deleted_total += n as u64;
                 }
             }
         }
 
-        // Count pending index fragments across all datasets.
+        // Count pending index fragments across all cached datasets.
         let mut pending_index_fragments: u64 = 0;
         for ds_arc in datasets.values() {
             let ds = ds_arc.read().await;
@@ -74,11 +136,61 @@ impl LanceStore {
             }
         }
 
+        // Release locks before doing fresh I/O for on-disk discovery.
+        drop(datasets);
+        drop(indexes);
+
+        // Discover on-disk datasets not in the cache (e.g. after restart).
+        let on_disk = self.discover_on_disk_datasets();
+        for domain in &on_disk {
+            domains.insert(domain.clone());
+        }
+
+        // Track which domains were already counted from the cache to avoid
+        // double-counting when iterating on-disk datasets.
+        let cached_domains: std::collections::HashSet<String> = {
+            let datasets = self.datasets.read().await;
+            datasets.keys().cloned().collect()
+        };
+
+        // For on-disk datasets not in the cache, open and cache the handle.
+        for domain in &on_disk {
+            if cached_domains.contains(domain) {
+                continue;
+            }
+            if let Ok(Some(ds_arc)) = self.io_open_dataset_readonly(domain).await {
+                let ds = ds_arc.read().await;
+                for frag in ds.get_fragments() {
+                    if let Some(rows) = frag.metadata().physical_rows {
+                        physical_total += rows as u64;
+                    }
+                    if let Ok(n) = frag.fast_num_deletions() {
+                        deleted_total += n as u64;
+                    }
+                }
+                if let Ok(tags) = ds.tags().list().await {
+                    indexed_commits += tags.len() as u64;
+                }
+            } else {
+                let path = self.dataset_path(domain);
+                let uri = path.to_string_lossy().to_string();
+                chunks += self.count_dataset_rows(&uri).await;
+            }
+        }
+
+        // Live chunks = physical - soft-deleted.
+        chunks += physical_total.saturating_sub(deleted_total);
+
+        // Document count is not available in the global statistics path
+        // (would require scanning all datasets' doc_id columns). The
+        // per-domain endpoint provides accurate counts.
+        let documents = 0;
+
         Statistics {
             domains: domains.len() as u64,
-            branches,
+            branches: distinct_branches.len() as u64,
             indexed_commits,
-            documents: distinct_docs.len() as u64,
+            documents,
             chunks,
             pending_index_fragments,
             store_clustering: None,
@@ -87,7 +199,7 @@ impl LanceStore {
 
     /// Domain-scoped statistics — aggregates ONLY the named domain's footprint.
     /// The `domain` parameter is the normalised org/db key (e.g. "admin/abt_buy_e2e").
-    /// Uses cached handles (no fresh opens) — FD-safe.
+    /// Uses cached handles when available, falls back to on-disk discovery.
     pub async fn statistics_for_domain(&self, domain: &str) -> Statistics {
         let datasets = self.datasets.read().await;
         let indexes = self.branch_indexes.read().await;
@@ -97,7 +209,6 @@ impl LanceStore {
             std::collections::HashSet::new();
         let mut indexed_commits = 0u64;
         let mut chunks = 0u64;
-        let mut distinct_docs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Check if this domain exists in datasets.
         if datasets.contains_key(domain) {
@@ -118,28 +229,17 @@ impl LanceStore {
         }
         let branches = distinct_branches.len() as u64;
 
-        // Count rows and distinct doc_ids from this domain's dataset only.
+        // Count live chunks from this domain's cached dataset using manifest metadata only.
+        let mut deleted_total = 0u64;
+        let mut physical_total = 0u64;
         if let Some(ds_arc) = datasets.get(domain) {
             let ds = ds_arc.read().await;
-            if let Ok(count) = ds.count_rows(None).await {
-                chunks += count as u64;
-            }
-            // Scan doc_id column for distinct count.
-            let mut scanner = ds.scan();
-            if scanner.project(&["doc_id"]).is_ok() {
-                if let Ok(stream) = scanner.try_into_stream().await {
-                    if let Ok(batches) = stream.try_collect::<Vec<RecordBatch>>().await {
-                        for batch in &batches {
-                            if let Some(ids) = batch
-                                .column_by_name("doc_id")
-                                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                            {
-                                for i in 0..ids.len() {
-                                    distinct_docs.insert(ids.value(i).to_owned());
-                                }
-                            }
-                        }
-                    }
+            for frag in ds.get_fragments() {
+                if let Some(rows) = frag.metadata().physical_rows {
+                    physical_total += rows as u64;
+                }
+                if let Ok(n) = frag.fast_num_deletions() {
+                    deleted_total += n as u64;
                 }
             }
         }
@@ -153,6 +253,68 @@ impl LanceStore {
             }
         }
 
+        // Release locks before doing fresh I/O.
+        drop(datasets);
+        drop(indexes);
+
+        // If the domain wasn't in the cache, check on disk (e.g. after restart).
+        let path = self.dataset_path(domain);
+        if path.exists() && domains_count == 0 {
+            domains_count = 1;
+        }
+
+        // If we didn't get data from the cache, open from disk and cache it.
+        if physical_total == 0 && path.exists() {
+            if let Ok(Some(ds_arc)) = self.io_open_dataset_readonly(domain).await {
+                let ds = ds_arc.read().await;
+                for frag in ds.get_fragments() {
+                    if let Some(rows) = frag.metadata().physical_rows {
+                        physical_total += rows as u64;
+                    }
+                    if let Ok(n) = frag.fast_num_deletions() {
+                        deleted_total += n as u64;
+                    }
+                }
+                if let Ok(tags) = ds.tags().list().await {
+                    indexed_commits = tags.len() as u64;
+                }
+            } else {
+                let uri = path.to_string_lossy().to_string();
+                chunks = self.count_dataset_rows(&uri).await;
+
+                // Count tagged commits from the on-disk dataset.
+                if let Ok(ds) = self.io_open_fresh(&uri).await {
+                    if let Ok(tags) = ds.tags().list().await {
+                        indexed_commits = tags.len() as u64;
+                    }
+                }
+            }
+        }
+
+        // Live chunks = physical - soft-deleted (add to any fallback count).
+        chunks += physical_total.saturating_sub(deleted_total);
+
+        // Count distinct documents by scanning the doc_id column.
+        // This is accurate even after a server restart (unlike the pipeline
+        // counter). The scan reads only the doc_id column — no embedding data.
+        let documents = if chunks > 0 {
+            // Try cached dataset first, then fall back to a fresh open.
+            let cached = self.datasets.read().await.get(domain).cloned();
+            if let Some(ds_arc) = cached {
+                let ds = ds_arc.read().await;
+                self.count_distinct_doc_ids(&ds).await
+            } else {
+                let uri = path.to_string_lossy().to_string();
+                if let Ok(ds) = self.io_open_fresh(&uri).await {
+                    self.count_distinct_doc_ids(&ds).await
+                } else {
+                    0
+                }
+            }
+        } else {
+            0
+        };
+
         // Surface clustering flag for this domain.
         let store_clustering = self.domain_settings.store_clustering(domain).await;
 
@@ -160,7 +322,7 @@ impl LanceStore {
             domains: domains_count,
             branches,
             indexed_commits,
-            documents: distinct_docs.len() as u64,
+            documents,
             chunks,
             pending_index_fragments,
             store_clustering: Some(store_clustering),
@@ -216,13 +378,61 @@ impl LanceStore {
             locks.retain(|(d, _b), _| d != domain);
         }
         {
+            // Cancel and purge any in-flight pipeline tasks for this domain.
+            let mut cancel_tokens = self.pipeline_cancel_tokens.write().await;
+            let keys_to_remove: Vec<_> = cancel_tokens.keys().filter(|(d, _b)| d == domain).cloned().collect();
+            for key in keys_to_remove {
+                if let Some(token) = cancel_tokens.remove(&key) {
+                    token.cancel();
+                }
+            }
+        }
+        {
             // Purge any in-flight reservations for this domain so a delete +
             // re-push of the same commit is not wrongly 409'd by a stale
             // reservation left over from a push that the delete superseded.
             let mut inflight = self.inflight_commits.write().await;
             inflight.retain(|(d, _b, _c)| d != domain);
         }
+        {
+            // Purge the domain guard entry. The guard itself was held during
+            // this deletion (acquired above), but the map entry persists —
+            // remove it so domains created/deleted many times don't leak.
+            let mut guards = self.domain_guards.write().await;
+            guards.remove(domain);
+        }
 
         Ok(())
+    }
+
+    /// Internal instrumentation: sizes of all in-memory data structures.
+    /// Used by the global /statistics endpoint for leak monitoring.
+    pub async fn internal_stats(&self) -> InternalStats {
+        let cached_datasets = self.datasets.read().await.len();
+        let tasks = self.tasks.read().await.len();
+        let branch_indexes = self.branch_indexes.read().await.len();
+        let pipeline_locks = self.pipeline_locks.read().await.len();
+        let domain_guards = self.domain_guards.read().await.len();
+        let inflight_commits = self.inflight_commits.read().await.len();
+        let compaction_in_progress = self.compaction_in_progress.read().await.len();
+
+        InternalStats {
+            cached_datasets,
+            tasks,
+            branch_indexes,
+            pipeline_locks,
+            domain_guards,
+            inflight_commits,
+            compaction_in_progress,
+            pipeline_pending_chunks: self.pipeline_pending_chunks.load(std::sync::atomic::Ordering::Relaxed),
+            pipeline_embedded_chunks: self.pipeline_embedded_chunks.load(std::sync::atomic::Ordering::Relaxed),
+            pipeline_written_chunks: self.pipeline_written_chunks.load(std::sync::atomic::Ordering::Relaxed),
+            pipeline_active_tasks: self.pipeline_active_tasks.load(std::sync::atomic::Ordering::Relaxed),
+            fresh_open_count: self.fresh_open_count.load(std::sync::atomic::Ordering::Relaxed),
+            embed_cache_entries: 0,
+            embed_cache_size_bytes: 0,
+            lance_index_cache_capacity_bytes: self.lance_index_cache_capacity,
+            lance_metadata_cache_capacity_bytes: self.lance_metadata_cache_capacity,
+        }
     }
 }

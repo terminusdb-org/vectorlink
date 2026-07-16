@@ -252,6 +252,8 @@ pub struct Statistics {
     pub branches: u64,
     pub indexed_commits: u64,
     pub documents: u64,
+    /// Live chunks (excludes soft-deleted rows). This is the accurate count
+    /// of searchable text segments.
     pub chunks: u64,
     /// Number of data fragments not yet covered by the vector ANN index.
     /// Reflects the indexing backlog — higher values mean more fragments are
@@ -261,6 +263,45 @@ pub struct Statistics {
     /// Whether clustering embeddings are stored for this domain (domain-scoped only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store_clustering: Option<bool>,
+}
+
+/// Internal instrumentation stats — sizes of in-memory data structures.
+/// Exposed via the global /statistics endpoint (no domain filter) for
+/// memory leak monitoring. Not included in domain-scoped stats.
+#[derive(Debug, Clone, Serialize)]
+pub struct InternalStats {
+    /// Number of cached dataset handles (Lance Dataset objects).
+    pub cached_datasets: usize,
+    /// Number of tracked tasks in the tasks HashMap.
+    pub tasks: usize,
+    /// Number of per-(domain, branch) branch index entries.
+    pub branch_indexes: usize,
+    /// Number of per-(domain, branch) pipeline locks.
+    pub pipeline_locks: usize,
+    /// Number of per-domain guard mutexes.
+    pub domain_guards: usize,
+    /// Number of in-flight commit reservations.
+    pub inflight_commits: usize,
+    /// Number of domains with compaction in progress.
+    pub compaction_in_progress: usize,
+    /// Pipeline progress: chunks chunked but not yet embedded.
+    pub pipeline_pending_chunks: u64,
+    /// Pipeline progress: chunks embedded but not yet written to Lance.
+    pub pipeline_embedded_chunks: u64,
+    /// Pipeline progress: chunks written to Lance (append committed).
+    pub pipeline_written_chunks: u64,
+    /// Number of pipeline tasks currently running (spawned but not completed).
+    pub pipeline_active_tasks: u64,
+    /// Total count of fresh Dataset::open calls (cumulative counter).
+    pub fresh_open_count: u64,
+    /// Number of entries in the embedding cache.
+    pub embed_cache_entries: usize,
+    /// Approximate memory usage of the embedding cache in bytes.
+    pub embed_cache_size_bytes: usize,
+    /// Configured Lance index cache capacity in bytes.
+    pub lance_index_cache_capacity_bytes: usize,
+    /// Configured Lance metadata cache capacity in bytes.
+    pub lance_metadata_cache_capacity_bytes: usize,
 }
 
 /// A single member of a near-duplicate group: the document id, and its chunk

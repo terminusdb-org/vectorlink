@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatchIterator;
+use lance::dataset::Dataset;
 
 use crate::kernel::error::StoreError;
 
@@ -142,6 +143,45 @@ impl LanceStore {
         self.io_refresh_cached_dataset(domain, branch).await?;
 
         Ok(version)
+    }
+
+    /// Append a micro-batch of rows to an already-open write handle.
+    /// Used by the streaming pipeline to write incrementally without
+    /// accumulating all rows in memory. Each call produces one Lance fragment.
+    /// The caller MUST hold the pipeline lock and the domain guard.
+    pub async fn io_microbatch_append(
+        &self,
+        ds: &mut Dataset,
+        rows: &[ChunkRow],
+    ) -> Result<(), StoreError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let batch = self.rows_to_batch(rows)?;
+        let schema = self.chunk_schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        ds.append(reader, None)
+            .await
+            .map_err(|e| StoreError::Internal(format!("microbatch append failed: {}", e)))?;
+        Ok(())
+    }
+
+    /// Delete old chunks for a set of doc_ids on an already-open write handle.
+    /// Used by the streaming pipeline to do the delete phase once at the start
+    /// before micro-batch appends begin.
+    pub async fn io_microbatch_delete(
+        &self,
+        ds: &mut Dataset,
+        delete_ids: &[String],
+    ) -> Result<(), StoreError> {
+        if delete_ids.is_empty() {
+            return Ok(());
+        }
+        let filter = build_doc_id_in_filter(delete_ids);
+        ds.delete(&filter)
+            .await
+            .map_err(|e| StoreError::Internal(format!("microbatch delete failed: {}", e)))?;
+        Ok(())
     }
 
     /// Probabilistic background compaction trigger (BUG-FD24).

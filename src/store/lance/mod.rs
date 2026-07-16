@@ -55,6 +55,10 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
+use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::cleanup::CleanupPolicyBuilder;
+use lance::session::Session;
+use lance::io::ObjectStoreRegistry;
 use tokio::sync::RwLock;
 
 use crate::config::DomainSettingsMap;
@@ -81,12 +85,18 @@ pub struct LanceStore {
     pub(super) datasets: RwLock<HashMap<String, Arc<RwLock<Dataset>>>>,
     /// Per-(domain, branch) index tracking (branch-precise).
     pub(super) branch_indexes: RwLock<HashMap<BranchKey, BranchIndex>>,
-    /// Tasks by task ID.
-    pub(super) tasks: RwLock<HashMap<String, crate::kernel::model::TaskStatus>>,
+    /// Tasks by task ID, with insertion timestamp for TTL-based eviction.
+    pub(super) tasks: RwLock<HashMap<String, (crate::kernel::model::TaskStatus, std::time::Instant)>>,
     /// Per-(domain, branch) pipeline serialisation lock.
     /// Ensures concurrent pushes to the same branch are serialised so that
     /// commit→version tags are correctly isolated.
     pub(super) pipeline_locks: RwLock<HashMap<BranchKey, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-(domain, branch) cancellation token for the currently-running pipeline task.
+    /// When a new push arrives for a branch that already has an active pipeline,
+    /// the previous task's token is cancelled so it can send a proper Error
+    /// progress update before exiting. This prevents stale chunks from polluting
+    /// the new index and gives the client (TerminusDB) a clean error message.
+    pub(super) pipeline_cancel_tokens: RwLock<HashMap<BranchKey, tokio_util::sync::CancellationToken>>,
     /// Per-DOMAIN guard serialising dataset CREATE (write path) against
     /// `DELETE /domain` (BLOCKER-2 / #6). A delete holds this for the whole
     /// remove-then-purge sequence; a write that must create the domain dataset
@@ -134,11 +144,32 @@ pub struct LanceStore {
     /// Per-domain settings (clustering, etc.). Loaded from
     /// `domain_settings.json` at startup.
     pub domain_settings: DomainSettingsMap,
+    /// Shared Lance session — all Dataset::open calls reuse this session,
+    /// sharing the index cache, metadata cache, and object store registry.
+    /// This prevents memory accumulation from N independent sessions (each
+    /// with its own 6 GiB index cache + 1 GiB metadata cache by default).
+    /// Configured with reduced cache sizes: 512 MiB index + 256 MiB metadata.
+    pub(super) lance_session: Arc<Session>,
+    /// Pipeline progress: chunks read from channel but not yet written to Lance.
+    /// Reset to 0 at the start of each pipeline run, incremented as chunks are
+    /// produced by the chunker, decremented as they are written.
+    pub pipeline_pending_chunks: std::sync::atomic::AtomicU64,
+    /// Pipeline progress: chunks that have been embedded (embedding result received).
+    pub pipeline_embedded_chunks: std::sync::atomic::AtomicU64,
+    /// Pipeline progress: chunks that have been written to Lance (append committed).
+    pub pipeline_written_chunks: std::sync::atomic::AtomicU64,
+    /// Number of pipeline tasks currently running (spawned but not yet completed).
+    /// Incremented in push_stream's tokio::spawn, decremented on completion/error/panic.
+    pub pipeline_active_tasks: std::sync::atomic::AtomicU64,
+    /// Configured Lance index cache capacity (for stats reporting).
+    pub(super) lance_index_cache_capacity: usize,
+    /// Configured Lance metadata cache capacity (for stats reporting).
+    pub(super) lance_metadata_cache_capacity: usize,
 }
 
 impl LanceStore {
     /// Create a new LanceStore backed by the given directory.
-    pub fn new(base_dir: &Path, dim: usize) -> Self {
+    pub fn new(base_dir: &Path, dim: usize, lance_index_cache_bytes: usize, lance_metadata_cache_bytes: usize) -> Self {
         let domain_settings = DomainSettingsMap::load(base_dir);
         let vector_index_config = VectorIndexConfig::default_for_dim(dim);
         Self {
@@ -149,6 +180,7 @@ impl LanceStore {
             branch_indexes: RwLock::new(HashMap::new()),
             tasks: RwLock::new(HashMap::new()),
             pipeline_locks: RwLock::new(HashMap::new()),
+            pipeline_cancel_tokens: RwLock::new(HashMap::new()),
             domain_guards: RwLock::new(HashMap::new()),
             inflight_commits: RwLock::new(std::collections::HashSet::new()),
             reservation_lock: tokio::sync::Mutex::new(()),
@@ -156,6 +188,17 @@ impl LanceStore {
             compaction_in_progress: RwLock::new(std::collections::HashSet::new()),
             auto_compaction_enabled: std::sync::atomic::AtomicBool::new(true),
             domain_settings,
+            lance_session: Arc::new(Session::new(
+                lance_index_cache_bytes,
+                lance_metadata_cache_bytes,
+                Arc::new(ObjectStoreRegistry::default()),
+            )),
+            pipeline_pending_chunks: std::sync::atomic::AtomicU64::new(0),
+            pipeline_embedded_chunks: std::sync::atomic::AtomicU64::new(0),
+            pipeline_written_chunks: std::sync::atomic::AtomicU64::new(0),
+            pipeline_active_tasks: std::sync::atomic::AtomicU64::new(0),
+            lance_index_cache_capacity: lance_index_cache_bytes,
+            lance_metadata_cache_capacity: lance_metadata_cache_bytes,
         }
     }
 
@@ -186,7 +229,9 @@ impl LanceStore {
     pub(super) async fn io_open_fresh(&self, uri: &str) -> Result<Dataset, StoreError> {
         self.fresh_open_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Dataset::open(uri)
+        DatasetBuilder::from_uri(uri)
+            .with_session(self.lance_session.clone())
+            .load()
             .await
             .map_err(|e| StoreError::Internal(format!("dataset open failed: {}", e)))
     }
@@ -202,7 +247,7 @@ impl LanceStore {
     /// Acquire the per-domain create/delete guard (BLOCKER-2 / #6). Held by a
     /// dataset-creating write across the create, and by `DELETE /domain` across
     /// the whole remove-then-purge — so the two never interleave.
-    pub(super) async fn acquire_domain_guard(&self, domain: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    pub async fn acquire_domain_guard(&self, domain: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let guards = self.domain_guards.read().await;
             if let Some(l) = guards.get(domain) {
@@ -386,7 +431,7 @@ impl LanceStore {
     ///
     /// Returns an error if the dataset or the branch does not exist — callers
     /// must ensure the dataset (and any non-main branch) exists first.
-    pub(super) async fn io_open_branch_for_write(
+    pub async fn io_open_branch_for_write(
         &self,
         domain: &str,
         branch: &str,
@@ -583,6 +628,11 @@ impl LanceStore {
     ///
     /// `_branch` is accepted for signature stability; the cache is domain-keyed
     /// and always reflects the dataset's default branch (layout A).
+    ///
+    /// In-flight readers hold an `Arc::clone` of the old `Dataset`, so it
+    /// stays alive until those operations complete. Lance's own internal
+    /// caches (manifest, fragment metadata) may retain memory after drop —
+    /// that is a Lance library issue, not fixable here.
     pub async fn io_refresh_cached_dataset(
         &self,
         domain: &str,
@@ -601,6 +651,37 @@ impl LanceStore {
         let arc_ds = Arc::new(RwLock::new(ds));
         let mut datasets = self.datasets.write().await;
         datasets.insert(domain.to_owned(), arc_ds);
+        Ok(())
+    }
+
+    /// Prune old untagged intermediate versions created by micro-batch appends.
+    /// Called after each commit is tagged to prevent manifest growth across
+    /// many commits. Retains the last 3 versions (for rollback safety) plus
+    /// all tagged versions. Uses delete_unverified=true since we know no other
+    /// operations are in progress (pipeline lock is held).
+    pub async fn io_cleanup_old_versions(
+        &self,
+        domain: &str,
+        _branch: &str,
+    ) -> Result<(), StoreError> {
+        let path = self.dataset_path(domain);
+        if !path.exists() {
+            return Ok(());
+        }
+        let uri = path.to_string_lossy().to_string();
+        let ds = self.io_open_fresh(&uri).await?;
+
+        let policy = CleanupPolicyBuilder::default()
+            .retain_n_versions(&ds, 3).await
+            .map_err(|e| StoreError::Internal(format!("cleanup policy build failed: {}", e)))?
+            .delete_unverified(true)
+            .error_if_tagged_old_versions(false)
+            .build();
+
+        ds.cleanup_with_policy(policy)
+            .await
+            .map_err(|e| StoreError::Internal(format!("version cleanup failed: {}", e)))?;
+
         Ok(())
     }
 
@@ -708,4 +789,46 @@ pub fn encode_domain_path(domain: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("__")
+}
+
+/// Decode a filesystem-safe domain path back to the original domain string.
+/// Reverses `encode_domain_path`: splits by `__`, percent-decodes each segment,
+/// joins with `/`. Returns `None` if any segment fails to decode.
+pub fn decode_domain_path(encoded: &str) -> Option<String> {
+    use form_urlencoded::parse;
+    let segments: Vec<Option<String>> = encoded
+        .split("__")
+        .map(|seg| {
+            if seg.is_empty() {
+                Some(String::new())
+            } else {
+                let decoded = parse(seg.as_bytes())
+                    .map(|(key, val)| {
+                        if val.is_empty() {
+                            key.into_owned()
+                        } else {
+                            format!("{}={}", key, val)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if decoded.is_empty() {
+                    None
+                } else {
+                    Some(decoded.join(""))
+                }
+            }
+        })
+        .collect();
+
+    if segments.iter().any(|s| s.is_none()) {
+        return None;
+    }
+
+    Some(
+        segments
+            .into_iter()
+            .map(|s| s.unwrap())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }

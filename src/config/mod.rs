@@ -126,6 +126,19 @@ pub struct Config {
     /// `None` disables the cache (passthrough to embedding provider).
     /// Configurable via `TDB_SEARCH_EMBED_CACHE_SIZE`; default 20,000.
     pub embed_cache_size: Option<usize>,
+    /// Optional Prometheus metrics endpoint port. When set, a separate HTTP
+    /// server listens on this port and exposes `/metrics` in Prometheus text
+    /// exposition format. When `None`, no metrics server is started.
+    /// Configurable via `TDB_SEARCH_PROMETHEUS_PORT`; default None (disabled).
+    pub prometheus_port: Option<u16>,
+    /// Lance index cache capacity in bytes. Controls how much RAM Lance uses
+    /// to cache vector index data for fast ANN queries.
+    /// Configurable via `TDB_SEARCH_LANCE_INDEX_CACHE_BYTES`; default 256 MiB.
+    pub lance_index_cache_bytes: usize,
+    /// Lance metadata cache capacity in bytes. Controls how much RAM Lance
+    /// uses to cache dataset metadata (manifests, fragment info).
+    /// Configurable via `TDB_SEARCH_LANCE_METADATA_CACHE_BYTES`; default 128 MiB.
+    pub lance_metadata_cache_bytes: usize,
 }
 
 impl Config {
@@ -192,6 +205,17 @@ impl Config {
                 Ok(s) => Some(s.parse::<usize>().unwrap_or(20_000)),
                 Err(_) => Some(20_000),
             },
+            prometheus_port: std::env::var("TDB_SEARCH_PROMETHEUS_PORT")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok()),
+            lance_index_cache_bytes: std::env::var("TDB_SEARCH_LANCE_INDEX_CACHE_BYTES")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(256 * 1024 * 1024),
+            lance_metadata_cache_bytes: std::env::var("TDB_SEARCH_LANCE_METADATA_CACHE_BYTES")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(128 * 1024 * 1024),
         }
     }
 
@@ -210,6 +234,9 @@ impl Config {
             tokenizer_path: "spikes/tokenizer/tokenizer.json".to_owned(),
             embed_batch_size: DEFAULT_EMBED_BATCH_SIZE,
             embed_cache_size: None,
+            prometheus_port: None,
+            lance_index_cache_bytes: 256 * 1024 * 1024,
+            lance_metadata_cache_bytes: 128 * 1024 * 1024,
         }
     }
 }
@@ -229,6 +256,9 @@ impl Default for Config {
             tokenizer_path: "spikes/tokenizer/tokenizer.json".to_owned(),
             embed_batch_size: DEFAULT_EMBED_BATCH_SIZE,
             embed_cache_size: None,
+            prometheus_port: None,
+            lance_index_cache_bytes: 256 * 1024 * 1024,
+            lance_metadata_cache_bytes: 128 * 1024 * 1024,
         }
     }
 }

@@ -9,7 +9,6 @@
 //! All metrics are unauthenticated (the port should be firewalled from
 //! external access). The endpoint exposes:
 //! - Internal data structure sizes (tasks, datasets, branch_indexes, etc.)
-//! - Process RSS and max RSS (from getrusage)
 //! - Engine statistics (domains, branches, documents, chunks, etc.)
 
 use axum::{routing::get, Router};
@@ -102,15 +101,6 @@ async fn render_metrics(service: &SearchService) -> String {
     out.push_str("# TYPE tdb_search_pipeline_written_chunks gauge\n");
     out.push_str(&format!("tdb_search_pipeline_written_chunks {}\n", internal.pipeline_written_chunks));
 
-    // ── Process memory ──
-    out.push_str("# HELP tdb_search_rss_bytes Process resident set size in bytes\n");
-    out.push_str("# TYPE tdb_search_rss_bytes gauge\n");
-    out.push_str(&format!("tdb_search_rss_bytes {}\n", internal.rss_bytes));
-
-    out.push_str("# HELP tdb_search_max_rss_bytes Process max resident set size in bytes\n");
-    out.push_str("# TYPE tdb_search_max_rss_bytes gauge\n");
-    out.push_str(&format!("tdb_search_max_rss_bytes {}\n", internal.max_rss_bytes));
-
     // ── Pipeline task tracking ──
     out.push_str("# HELP tdb_search_pipeline_active_tasks Number of pipeline tasks currently running (spawned but not completed)\n");
     out.push_str("# TYPE tdb_search_pipeline_active_tasks gauge\n");
@@ -178,9 +168,9 @@ mod tests {
         // We can't easily construct a SearchService in a unit test, but we can
         // verify the format of a minimal render. This test is a smoke test
         // for the format structure.
-        let text = "# HELP tdb_search_rss_bytes Process resident set size in bytes\n# TYPE tdb_search_rss_bytes gauge\ntdb_search_rss_bytes 12345\n";
+        let text = "# HELP tdb_search_domains Total number of indexed domains\n# TYPE tdb_search_domains gauge\ntdb_search_domains 5\n";
         assert!(text.contains("# HELP"));
         assert!(text.contains("# TYPE"));
-        assert!(text.contains("tdb_search_rss_bytes"));
+        assert!(text.contains("tdb_search_domains"));
     }
 }
