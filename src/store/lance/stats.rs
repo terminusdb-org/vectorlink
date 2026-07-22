@@ -10,12 +10,12 @@ use arrow_array::{Array, RecordBatch, StringArray};
 use futures::TryStreamExt as _;
 use lance::dataset::Dataset;
 
-use super::{BranchKey, LanceStore};
+use super::{BranchKey, LanceStore, MAIN_BRANCH};
 
 impl LanceStore {
     /// Discover on-disk datasets by scanning `base_dir` for `*.lance` directories.
     /// Returns a list of decoded domain strings (e.g. "admin/product_assortment").
-    fn discover_on_disk_datasets(&self) -> Vec<String> {
+    pub(crate) fn discover_on_disk_datasets(&self) -> Vec<String> {
         let mut found = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.base_dir) {
             for entry in entries.flatten() {
@@ -127,12 +127,14 @@ impl LanceStore {
             }
         }
 
-        // Count pending index fragments across all cached datasets.
+        // Count pending index fragments and documents across all cached datasets.
         let mut pending_index_fragments: u64 = 0;
+        let mut pending_index_documents: u64 = 0;
         for ds_arc in datasets.values() {
             let ds = ds_arc.read().await;
-            if let Ok(pending) = crate::store::vector_index::count_unindexed_fragments(&ds).await {
-                pending_index_fragments += pending;
+            if let Ok((frags, rows)) = crate::store::vector_index::count_unindexed_rows(&ds).await {
+                pending_index_fragments += frags;
+                pending_index_documents += rows;
             }
         }
 
@@ -193,6 +195,7 @@ impl LanceStore {
             documents,
             chunks,
             pending_index_fragments,
+            pending_index_documents,
             store_clustering: None,
         }
     }
@@ -244,12 +247,14 @@ impl LanceStore {
             }
         }
 
-        // Count pending index fragments for this domain only.
+        // Count pending index fragments and documents for this domain only.
         let mut pending_index_fragments: u64 = 0;
+        let mut pending_index_documents: u64 = 0;
         if let Some(ds_arc) = datasets.get(domain) {
             let ds = ds_arc.read().await;
-            if let Ok(pending) = crate::store::vector_index::count_unindexed_fragments(&ds).await {
-                pending_index_fragments += pending;
+            if let Ok((frags, rows)) = crate::store::vector_index::count_unindexed_rows(&ds).await {
+                pending_index_fragments += frags;
+                pending_index_documents += rows;
             }
         }
 
@@ -325,6 +330,7 @@ impl LanceStore {
             documents,
             chunks,
             pending_index_fragments,
+            pending_index_documents,
             store_clustering: Some(store_clustering),
         }
     }
@@ -354,6 +360,11 @@ impl LanceStore {
         // 1. Drop the on-disk dataset directory first.
         let path = self.dataset_path(domain);
         if path.exists() {
+            assert!(
+                path.extension().is_some_and(|ext| ext == "lance"),
+                "refusing to delete non-.lance path: {}",
+                path.display()
+            );
             tokio::fs::remove_dir_all(&path).await.map_err(|e| {
                 StoreError::Internal(format!(
                     "failed to remove dataset directory {}: {}",
@@ -400,6 +411,86 @@ impl LanceStore {
             // remove it so domains created/deleted many times don't leak.
             let mut guards = self.domain_guards.write().await;
             guards.remove(domain);
+        }
+
+        Ok(())
+    }
+
+    /// Delete all Lance tags belonging to a specific (domain, branch) pair,
+    /// and purge the in-memory caches for that branch only. Other branches
+    /// sharing the same domain dataset are left intact.
+    ///
+    /// IDEMPOTENT: deleting an unknown/already-removed branch succeeds.
+    /// Does NOT touch the on-disk dataset directory or sled.
+    pub async fn io_delete_branch_index(
+        &self,
+        domain: &str,
+        branch: &str,
+    ) -> Result<(), StoreError> {
+        let key: BranchKey = (domain.to_owned(), branch.to_owned());
+
+        // 1. Cancel any in-flight pipeline task for this branch.
+        {
+            let mut cancel_tokens = self.pipeline_cancel_tokens.write().await;
+            if let Some(token) = cancel_tokens.remove(&key) {
+                token.cancel();
+            }
+        }
+
+        // 2. Acquire the pipeline lock — this waits for any in-flight push
+        //    to finish (the cancel token above ensures it stops ASAP, but
+        //    it only checks between sub-batches, so we must wait).
+        //    This prevents a race where we delete tags while the pipeline
+        //    is still writing new ones.
+        let _pipeline_guard = self.acquire_pipeline_lock(domain, branch).await;
+
+        // 3. Delete all Lance tags belonging to this branch.
+        if let Some(ds_arc) = self.io_open_dataset_readonly(domain).await? {
+            let ds = ds_arc.read().await;
+            let tags = ds
+                .tags()
+                .list()
+                .await
+                .map_err(|e| StoreError::Internal(format!("tag list failed: {}", e)))?;
+
+            let want_branch: Option<&str> =
+                if branch == MAIN_BRANCH { None } else { Some(branch) };
+
+            let tags_to_delete: Vec<String> = tags
+                .into_iter()
+                .filter(|(_, contents)| contents.branch.as_deref() == want_branch)
+                .map(|(tag_name, _)| tag_name)
+                .collect();
+
+            drop(ds);
+
+            for tag_name in &tags_to_delete {
+                ds_arc.read()
+                    .await
+                    .tags()
+                    .delete(tag_name)
+                    .await
+                    .map_err(|e| {
+                        StoreError::Internal(format!("tag delete failed: {}", e))
+                    })?;
+            }
+        }
+
+        // 4. Purge in-memory state for this (domain, branch) only.
+        //    Do NOT remove the pipeline_lock entry — the lock itself is
+        //    released when _pipeline_guard drops, and removing the map
+        //    entry could race with a concurrent acquire_pipeline_lock.
+        {
+            let mut indexes = self.branch_indexes.write().await;
+            indexes.remove(&key);
+        }
+        {
+            let mut inflight = self.inflight_commits.write().await;
+            inflight.retain(|(d, b, _c)| !(*d == domain && *b == branch));
+        }
+        {
+            let mut compaction = self.compaction_in_progress.write().await;
+            compaction.remove(&key);
         }
 
         Ok(())

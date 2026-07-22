@@ -379,7 +379,10 @@ async fn io_materialise_candidate_embeddings(
 
     // Reuse the shared filter builder (same escaping as /search, /duplicates paths).
     let t_filter = Instant::now();
-    let filter = build_filter_expr(&[], candidate_doc_ids);
+    let filter = build_filter_expr(&[], candidate_doc_ids)
+        .ok_or_else(|| StoreError::Internal(
+            "candidate filter unexpectedly empty (non-empty doc_ids list produced no Expr)".to_owned()
+        ))?;
     perf_mark!(t_filter, "materialise_build_filter", "ids={}", candidate_doc_ids.len());
 
     let t_scan_setup = Instant::now();
@@ -387,7 +390,7 @@ async fn io_materialise_candidate_embeddings(
     scanner
         .project(&["doc_id", "embedding"])
         .map_err(|e| StoreError::Internal(format!("candidate scan projection failed: {}", e)))?;
-    scanner.filter_expr(filter.expect("candidate filter should be non-empty"));
+    scanner.filter_expr(filter);
     perf_mark!(t_scan_setup, "materialise_scanner_setup");
 
     let t_stream = Instant::now();
