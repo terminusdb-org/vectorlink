@@ -1150,12 +1150,6 @@ components:
         for the given `branch` (defaulting to `main`).
       schema: { type: string }
       example: admin/star_wars
-    Branch:
-      name: branch
-      in: query
-      required: true
-      description: Branch name.
-      schema: { type: string, default: main }
     BranchOptional:
       name: branch
       in: query
