@@ -17,6 +17,7 @@ mod index;
 pub mod integrity;
 mod search;
 mod resolve;
+mod rollup;
 pub mod dedup;
 mod stats;
 
@@ -34,7 +35,10 @@ pub use self::schema::{
     COMPACT_REBUILD_PREFIX, compact_rebuild_branch_name, is_compact_rebuild_branch,
 };
 pub use self::dedup::{dedup_chunks_to_documents, pairs_from_neighbours};
-pub use self::index::{io_compact_data, io_ensure_fts_index_on_dataset};
+pub use self::index::{io_compact_data, io_ensure_fts_index_on_dataset, io_merge_indices};
+pub(crate) use self::write::io_background_compact;
+pub use self::rollup::{io_exponential_rollup, io_incremental_cascade, merges_needed, rollup_partitions};
+pub use self::commit::VersionDelta;
 
 /// Cleanup mode controls how aggressive version cleanup interacts with
 /// rebuild-branch index files. The default (`CurrentCode`) preserves the
@@ -63,6 +67,13 @@ impl CleanupMode {
         matches!(self, CleanupMode::CurrentCode)
     }
 
+    /// Returns true if `clean_referenced_branches` should be set to false
+    /// (i.e., do NOT clean referenced branches, preserving rebuild-branch files).
+    pub fn disable_clean_referenced_branches(self) -> bool {
+        matches!(self, CleanupMode::TargetNoPatch | CleanupMode::TargetWithPatch)
+    }
+}
+
 /// A single embedding record for streaming. Contains the doc_id, the document
 /// embedding, and optionally the clustering embedding (when store_clustering
 /// is true).
@@ -86,6 +97,7 @@ use arrow_schema::{DataType, Field, Schema};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::CleanupPolicyBuilder;
+// DatasetIndexExt is used in the integrity submodule.
 use lance::session::Session;
 use lance::io::ObjectStoreRegistry;
 use tokio::sync::RwLock;
@@ -248,6 +260,49 @@ impl LanceStore {
     pub fn set_auto_compaction_enabled(&self, enabled: bool) {
         self.auto_compaction_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set the cleanup mode. Controls how version cleanup interacts with
+    /// rebuild-branch index files. See `CleanupMode` for details.
+    pub fn set_cleanup_mode(&self, mode: CleanupMode) {
+        self.cleanup_mode
+            .store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Get the current cleanup mode.
+    pub fn cleanup_mode(&self) -> CleanupMode {
+        let raw = self.cleanup_mode.load(std::sync::atomic::Ordering::Relaxed);
+        match raw {
+            0 => CleanupMode::CurrentCode,
+            1 => CleanupMode::TargetNoPatch,
+            2 => CleanupMode::TargetWithPatch,
+            _ => CleanupMode::CurrentCode,
+        }
+    }
+
+    /// Get the index delta count for a (domain, branch) — the number of delta
+    /// indices created since last compaction. Used by the cascade to determine
+    /// how many merge(3) calls are needed.
+    pub async fn io_get_delta_count(&self, domain: &str, branch: &str) -> u64 {
+        let key = (domain.to_owned(), branch.to_owned());
+        let counts = self.index_delta_counts.read().await;
+        *counts.get(&key).unwrap_or(&0)
+    }
+
+    /// Increment the index delta count for a (domain, branch) after a push
+    /// creates a new delta index via `optimize_indices(append())`.
+    pub async fn io_increment_delta_count(&self, domain: &str, branch: &str) {
+        let key = (domain.to_owned(), branch.to_owned());
+        let mut counts = self.index_delta_counts.write().await;
+        *counts.entry(key).or_insert(0) += 1;
+    }
+
+    /// Reset the index delta count for a (domain, branch) to 0. Called after
+    /// compaction drops and recreates indices (the delta count restarts).
+    pub async fn io_reset_delta_count(&self, domain: &str, branch: &str) {
+        let key = (domain.to_owned(), branch.to_owned());
+        let mut counts = self.index_delta_counts.write().await;
+        counts.insert(key, 0);
     }
 
     /// Open the domain dataset FRESH from disk, tracking the open for FD/perf
@@ -819,72 +874,6 @@ impl LanceStore {
         Ok(())
     }
 
-    /// Remove empty index UUID directories left behind by LanceDB's
-    /// `cleanup_with_policy`. LanceDB deletes index files inside
-    /// `_indices/<uuid>/` but leaves the empty `<uuid>` directories.
-    /// Over many push/compaction cycles, hundreds of empty directories
-    /// accumulate. This function scans `_indices/` and removes any
-    /// directory that contains no files (recursively empty).
-    ///
-    /// Returns the count of directories removed.
-    pub fn io_prune_empty_index_dirs(&self, domain: &str) -> Result<usize, StoreError> {
-        let path = self.dataset_path(domain);
-        let indices_dir = path.join("_indices");
-
-        if !indices_dir.exists() {
-            return Ok(0);
-        }
-
-        let mut removed = 0usize;
-        for entry in std::fs::read_dir(&indices_dir)
-            .map_err(|e| StoreError::Internal(format!("prune: read_dir failed: {}", e)))?
-        {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("[cleanup] prune: skipping unreadable entry: {}", e);
-                    continue;
-                }
-            };
-
-            let dir_path = entry.path();
-            if !dir_path.is_dir() {
-                continue;
-            }
-
-            // Check if the directory contains any files (recursively).
-            let has_files = std::fs::read_dir(&dir_path)
-                .map(|mut it| it.any(|e| e.map(|e| e.path().is_file()).unwrap_or(false)))
-                .unwrap_or(false);
-
-            // Also check subdirectories for files (LanceDB index dirs
-            // may have nested structure like <uuid>/0/index.lance).
-            let has_files_recursive = if !has_files {
-                dir_has_files_recursive(&dir_path)
-            } else {
-                true
-            };
-
-            if !has_files_recursive {
-                match std::fs::remove_dir_all(&dir_path) {
-                    Ok(_) => removed += 1,
-                    Err(e) => {
-                        eprintln!(
-                            "[cleanup] prune: failed to remove empty dir {:?}: {}",
-                            dir_path, e
-                        );
-                    }
-                }
-            }
-        }
-
-        if removed > 0 {
-            eprintln!("[cleanup] pruned {} empty index directories", removed);
-        }
-
-        Ok(removed)
-    }
-
     /// Aggressive cleanup that retains only the current version plus tagged
     /// versions. Used after compaction to reclaim disk space from orphaned
     /// index files created by index rebuilds (drop_index + create_index).
@@ -991,6 +980,157 @@ impl LanceStore {
         Ok(())
     }
 
+    /// Remove empty index UUID directories left behind by LanceDB's
+    /// `cleanup_with_policy`. LanceDB deletes index files inside
+    /// `_indices/<uuid>/` but leaves the empty `<uuid>` directories.
+    /// Over many push/compaction cycles, hundreds of empty directories
+    /// accumulate. This function scans `_indices/` and removes any
+    /// directory that contains no files (recursively empty).
+    ///
+    /// Returns the count of directories removed.
+    pub fn io_prune_empty_index_dirs(&self, domain: &str) -> Result<usize, StoreError> {
+        let path = self.dataset_path(domain);
+        let indices_dir = path.join("_indices");
+
+        if !indices_dir.exists() {
+            return Ok(0);
+        }
+
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(&indices_dir)
+            .map_err(|e| StoreError::Internal(format!("prune: read_dir failed: {}", e)))?
+        {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("[cleanup] prune: skipping unreadable entry: {}", e);
+                    continue;
+                }
+            };
+
+            let dir_path = entry.path();
+            if !dir_path.is_dir() {
+                continue;
+            }
+
+            // Check if the directory contains any files (recursively).
+            let has_files = std::fs::read_dir(&dir_path)
+                .map(|mut it| it.any(|e| e.map(|e| e.path().is_file()).unwrap_or(false)))
+                .unwrap_or(false);
+
+            // Also check subdirectories for files (LanceDB index dirs
+            // may have nested structure like <uuid>/0/index.lance).
+            let has_files_recursive = if !has_files {
+                dir_has_files_recursive(&dir_path)
+            } else {
+                true
+            };
+
+            if !has_files_recursive {
+                match std::fs::remove_dir_all(&dir_path) {
+                    Ok(_) => removed += 1,
+                    Err(e) => {
+                        eprintln!(
+                            "[cleanup] prune: failed to remove empty dir {:?}: {}",
+                            dir_path, e
+                        );
+                    }
+                }
+            }
+        }
+
+        if removed > 0 {
+            eprintln!("[cleanup] pruned {} empty index directories", removed);
+        }
+
+        Ok(removed)
+    }
+
+    /// Remove stale index UUID directories that are not referenced by any
+    /// live index on any tagged version across all branches. Unlike
+    /// `io_prune_empty_index_dirs`, this also removes directories that
+    /// still contain files — they are stale index files from prior
+    /// compaction cycles that `cleanup_with_policy` failed to delete.
+    ///
+    /// This function collects live index UUIDs by scanning ALL tagged
+    /// versions across ALL branches (not just HEAD). This is critical
+    /// because boundary commits retain their original manifests, which
+    /// may reference index UUIDs that differ from HEAD's indices.
+    /// Deleting a UUID referenced only by a non-HEAD tagged manifest
+    /// would silently break historical search at that boundary.
+    ///
+    /// MUST be called under the compaction lock — there is a TOCTOU race
+    /// between `load_indices()` and the directory scan if a concurrent
+    /// index creation produces a new UUID dir not yet in any manifest.
+    ///
+    /// Returns the count of directories removed.
+    pub async fn io_prune_stale_index_dirs(
+        &self,
+        domain: &str,
+        _branch: &str,
+    ) -> Result<usize, StoreError> {
+        let path = self.dataset_path(domain);
+        let indices_dir = path.join("_indices");
+
+        if !indices_dir.exists() {
+            return Ok(0);
+        }
+
+        // Collect live index UUIDs from ALL tagged versions across ALL branches.
+        // MUST use the strict (fail-closed) variant — if collection is incomplete
+        // for any reason, we must NOT prune, or we risk deleting live index dirs.
+        let live_uuids = self.io_collect_all_live_index_uuids_strict(domain).await?;
+
+        eprintln!(
+            "[cleanup] prune stale: {} live index UUIDs from all tagged versions",
+            live_uuids.len(),
+        );
+
+        // Scan _indices and remove any directory not in the live set.
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(&indices_dir)
+            .map_err(|e| StoreError::Internal(format!("prune stale: read_dir failed: {}", e)))?
+        {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("[cleanup] prune stale: skipping unreadable entry: {}", e);
+                    continue;
+                }
+            };
+
+            let dir_path = entry.path();
+            if !dir_path.is_dir() {
+                continue;
+            }
+
+            let dir_name = entry.file_name();
+            let dir_uuid = dir_name.to_string_lossy().to_string();
+
+            if !live_uuids.contains(&dir_uuid) {
+                eprintln!(
+                    "[cleanup] prune stale: removing stale index dir {} (not in live set of {} UUIDs)",
+                    dir_uuid, live_uuids.len()
+                );
+                match std::fs::remove_dir_all(&dir_path) {
+                    Ok(_) => removed += 1,
+                    Err(e) => {
+                        eprintln!(
+                            "[cleanup] prune stale: failed to remove dir {:?}: {}",
+                            dir_path, e
+                        );
+                    }
+                }
+            }
+        }
+
+        if removed > 0 {
+            eprintln!("[cleanup] pruned {} stale index directories", removed);
+        }
+
+        Ok(removed)
+    }
+
     /// Create an empty RecordBatch with the chunk schema (for dataset initialization).
     pub(super) fn empty_batch(&self) -> RecordBatch {
         let schema = self.chunk_schema();
@@ -1095,91 +1235,6 @@ pub fn encode_domain_path(domain: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("__")
-
-    /// Remove stale index UUID directories that are not referenced by any
-    /// live index on any tagged version across all branches. Unlike
-    /// `io_prune_empty_index_dirs`, this also removes directories that
-    /// still contain files — they are stale index files from prior
-    /// compaction cycles that `cleanup_with_policy` failed to delete.
-    ///
-    /// This function collects live index UUIDs by scanning ALL tagged
-    /// versions across ALL branches (not just HEAD). This is critical
-    /// because boundary commits retain their original manifests, which
-    /// may reference index UUIDs that differ from HEAD's indices.
-    /// Deleting a UUID referenced only by a non-HEAD tagged manifest
-    /// would silently break historical search at that boundary.
-    ///
-    /// MUST be called under the compaction lock — there is a TOCTOU race
-    /// between `load_indices()` and the directory scan if a concurrent
-    /// index creation produces a new UUID dir not yet in any manifest.
-    ///
-    /// Returns the count of directories removed.
-    pub async fn io_prune_stale_index_dirs(
-        &self,
-        domain: &str,
-        _branch: &str,
-    ) -> Result<usize, StoreError> {
-        let path = self.dataset_path(domain);
-        let indices_dir = path.join("_indices");
-
-        if !indices_dir.exists() {
-            return Ok(0);
-        }
-
-        // Collect live index UUIDs from ALL tagged versions across ALL branches.
-        // MUST use the strict (fail-closed) variant — if collection is incomplete
-        // for any reason, we must NOT prune, or we risk deleting live index dirs.
-        let live_uuids = self.io_collect_all_live_index_uuids_strict(domain).await?;
-
-        eprintln!(
-            "[cleanup] prune stale: {} live index UUIDs from all tagged versions",
-            live_uuids.len(),
-        );
-
-        // Scan _indices and remove any directory not in the live set.
-        let mut removed = 0usize;
-        for entry in std::fs::read_dir(&indices_dir)
-            .map_err(|e| StoreError::Internal(format!("prune stale: read_dir failed: {}", e)))?
-        {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("[cleanup] prune stale: skipping unreadable entry: {}", e);
-                    continue;
-                }
-            };
-
-            let dir_path = entry.path();
-            if !dir_path.is_dir() {
-                continue;
-            }
-
-            let dir_name = entry.file_name();
-            let dir_uuid = dir_name.to_string_lossy().to_string();
-
-            if !live_uuids.contains(&dir_uuid) {
-                eprintln!(
-                    "[cleanup] prune stale: removing stale index dir {} (not in live set of {} UUIDs)",
-                    dir_uuid, live_uuids.len()
-                );
-                match std::fs::remove_dir_all(&dir_path) {
-                    Ok(_) => removed += 1,
-                    Err(e) => {
-                        eprintln!(
-                            "[cleanup] prune stale: failed to remove dir {:?}: {}",
-                            dir_path, e
-                        );
-                    }
-                }
-            }
-        }
-
-        if removed > 0 {
-            eprintln!("[cleanup] pruned {} stale index directories", removed);
-        }
-
-        Ok(removed)
-    }
 }
 
 /// Decode a filesystem-safe domain path back to the original domain string.

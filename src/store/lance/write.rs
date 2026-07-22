@@ -13,6 +13,7 @@ use lance::deps::datafusion::logical_expr::{col, lit, in_list};
 use crate::kernel::error::StoreError;
 
 use super::{BranchKey, ChunkRow, LanceStore};
+
 use super::index::io_compact_data;
 
 impl LanceStore {
@@ -305,22 +306,31 @@ impl LanceStore {
 /// Called by the 5%-probability trigger from the write path.
 /// Runs on an uncached handle so it does NOT block concurrent reads.
 ///
-/// INVARIANT (snapshot isolation): historical commit tags are NEVER repointed.
-/// Each commit tag points to the version created by its own push — that version
-/// has a bounded fragment count (typically 1-2 fragments from its single write
-/// cycle), so searches at historical versions open a bounded number of FDs
-/// regardless of how many total pushes the dataset has received. Compaction
-/// benefits only HEAD (which accumulates fragments across many pushes); there is
-/// no FD pressure on historical tags that would justify repointing them.
+/// Delta-fork retags intermediate commits to new indexed versions on a temp
+/// branch (transactional within the compaction flow). This unpins old versions
+/// so aggressive cleanup can delete their orphaned index files while preserving
+/// snapshot isolation at every commit.
 ///
-/// The retag-all-stale-tags loop was removed because it violated snapshot
-/// isolation: repointing iso_c0's tag to the post-iso_c1 compacted version
-/// caused `checkout_version(iso_c0)` to return data from iso_c1.
-async fn io_background_compact(
+/// Background auto-compaction: compacts data fragments, delta-fork retags
+/// intermediate commits, and runs aggressive cleanup to delete old index files.
+/// Triggered probabilistically after each push.
+pub(crate) async fn io_background_compact(
     store: &LanceStore,
     domain: &str,
     branch: &str,
 ) -> Result<(), String> {
+    use lance::index::DatasetIndexExt;
+    use crate::store::vector_index::{io_ensure_vector_index, VECTOR_INDEX_NAME};
+    use crate::store::lance::io_ensure_fts_index_on_dataset;
+    use crate::store::lance::io_incremental_cascade;
+
+    // Acquire the per-branch pipeline lock. This serializes compaction
+    // with pipeline pushes. Compaction runs after a push completes, so
+    // the lock should be free. If a new push arrives during compaction,
+    // it will be rejected with 503 Service Unavailable by push_stream
+    // (which uses try_acquire_pipeline_lock).
+    let _pipeline_guard = store.acquire_pipeline_lock(domain, branch).await;
+
     let ds = store
         .io_open_dataset_uncached(domain, branch)
         .await
@@ -334,8 +344,41 @@ async fn io_background_compact(
     let fragments_before = ds.get_fragments().len();
     let version_before = ds.version().version;
 
-    // Compact (threshold-gated: no-op if fragments <= 16).
-    io_compact_data(&mut ds)
+    // Step 1: Drop existing vector + FTS indices BEFORE compacting data.
+    // LanceDB's DefaultCompactionPlanner groups fragments by index set. If
+    // fragments have different index UUIDs (e.g. after incremental pushes
+    // that each created a delta index), they go into separate bins and
+    // cannot be merged. Dropping indices first ensures all fragments share
+    // the same (empty) index set, allowing full consolidation.
+    let indices = ds
+        .load_indices()
+        .await
+        .map_err(|e| format!("load indices for compaction failed: {}", e))?;
+    let has_vector_idx = indices.iter().any(|idx| idx.name == VECTOR_INDEX_NAME);
+    let has_fts_idx = indices.iter().any(|idx| idx.name == "content_fts");
+
+    if has_vector_idx {
+        ds.drop_index(VECTOR_INDEX_NAME)
+            .await
+            .map_err(|e| format!("drop vector index failed: {}", e))?;
+        eprintln!("[compaction] domain={} branch={} dropped vector index before compaction", domain, branch);
+    }
+    if has_fts_idx {
+        ds.drop_index("content_fts")
+            .await
+            .map_err(|e| format!("drop FTS index failed: {}", e))?;
+        eprintln!("[compaction] domain={} branch={} dropped FTS index before compaction", domain, branch);
+    }
+    if has_vector_idx || has_fts_idx {
+        if let Err(e) = store.io_cleanup_aggressive(domain, branch).await {
+            eprintln!("[compaction] cleanup after index drop failed (soft): {}", e);
+        }
+    }
+
+    // Step 2: Compact data fragments (threshold-gated: no-op if fragments <= 16).
+    // Now all fragments share the same (empty) index set, so the compaction
+    // planner can merge them into fewer large fragments.
+    io_compact_data(&mut ds, false)
         .await
         .map_err(|e| format!("compaction failed: {}", e))?;
 
@@ -346,6 +389,78 @@ async fn io_background_compact(
         "[compaction] domain={} branch={} version {}→{} fragments {}→{}",
         domain, branch, version_before, version_after, fragments_before, fragments_after
     );
+
+    // Step 3: Aggressive cleanup of old untagged versions.
+    if let Err(e) = store.io_cleanup_aggressive(domain, branch).await {
+        eprintln!("[compaction] aggressive cleanup failed (soft): {}", e);
+    }
+
+    // Step 4: Recreate fresh vector + FTS indices covering the compacted
+    // fragments. Without this, the old indices are stale (reference deleted
+    // fragment IDs) and search degrades to flat-scan over all rows.
+    // force=true skips the 256-row IVF training minimum since data already exists.
+    let vector_config = store.vector_index_config().clone();
+    io_ensure_vector_index(&mut ds, &vector_config, true)
+        .await
+        .map_err(|e| format!("vector index recreation failed: {}", e))?;
+    io_ensure_fts_index_on_dataset(&mut ds)
+        .await
+        .map_err(|e| format!("FTS index recreation failed: {}", e))?;
+    eprintln!(
+        "[compaction] domain={} branch={} recreated vector + FTS indices after compaction",
+        domain, branch
+    );
+
+    // Reset delta count — compaction dropped all deltas and recreated fresh indices.
+    store.io_reset_delta_count(domain, branch).await;
+
+    if let Err(e) = store.io_cleanup_aggressive(domain, branch).await {
+        eprintln!("[compaction] cleanup after index recreate failed (soft): {}", e);
+    }
+
+    // Step 5: Run incremental cascade to consolidate any remaining index deltas.
+    let delta_count = store.io_get_delta_count(domain, branch).await;
+    if let Err(e) = io_incremental_cascade(&mut ds, delta_count).await {
+        eprintln!("[compaction] incremental cascade failed (soft): {}", e);
+    }
+    let merge_version = ds.version().version;
+
+    // Step 6: Delta-fork retag intermediate commits to new indexed versions
+    // on a temp branch. This unpins old versions so their index files can be
+    // deleted while preserving snapshot isolation at every commit.
+    if merge_version != version_before {
+        match store.io_retag_with_delta_forks(domain, branch, merge_version).await {
+            Ok((total, retagged)) => {
+                eprintln!(
+                    "[compaction] delta-fork retagged {}/{} tags",
+                    retagged, total
+                );
+            }
+            Err(e) => {
+                eprintln!("[compaction] delta-fork retagging failed (soft): {}", e);
+            }
+        }
+    }
+
+    // Step 7: Final aggressive cleanup after retagging.
+    if let Err(e) = store.io_cleanup_aggressive(domain, branch).await {
+        eprintln!("[compaction] final cleanup failed (soft): {}", e);
+    }
+
+    // Step 8: Clean up orphaned tags and stale rebuild branches.
+    if let Err(e) = store.io_cleanup_orphaned_tags_and_stale_branches(domain).await {
+        eprintln!("[compaction] orphaned tag/stale branch cleanup failed (soft): {}", e);
+    }
+
+    // Step 9: Prune stale index directories (not just empty ones).
+    if let Err(e) = store.io_prune_stale_index_dirs(domain, branch).await {
+        eprintln!("[compaction] prune stale dirs failed (soft): {}", e);
+    }
+
+    // Step 10: Prune empty index directories left by LanceDB cleanup.
+    if let Err(e) = store.io_prune_empty_index_dirs(domain) {
+        eprintln!("[compaction] prune empty dirs failed (soft): {}", e);
+    }
 
     // Refresh the cached handle so subsequent reads use compacted fragments.
     store

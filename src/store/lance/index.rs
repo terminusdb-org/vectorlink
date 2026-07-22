@@ -158,3 +158,26 @@ pub async fn io_compact_data(ds: &mut Dataset, force: bool) -> Result<(), StoreE
 
     Ok(())
 }
+
+/// Merge index deltas into consolidated indices at the current head version
+/// using exponential roll-up (base 3).
+///
+/// Each push calls `optimize_indices(append())` which creates a new delta index
+/// with `num_indices_to_merge=0` — it never merges. Over many pushes this
+/// accumulates hundreds of tiny index deltas that vector search must probe
+/// sequentially, causing linear latency growth.
+///
+/// This function uses exponential roll-up (base 3, analogous to TerminusDB's
+/// `exponential_rollup_strategy/1`) to merge deltas in power-of-3 groups:
+/// 3 deltas → 1, 3 groups → 1, etc. This reduces O(N) index probes to
+/// O(log₃(N)) at HEAD. It operates at the HEAD version only — historical
+/// tagged versions retain their original index state (temporal search
+/// contract: searching at a past commit returns results as they were at
+/// that point in time).
+///
+/// Should be called after data compaction (POST /compact).
+///
+/// Returns (indices_before, indices_after) for observability.
+pub async fn io_merge_indices(ds: &mut Dataset) -> Result<(usize, usize), StoreError> {
+    super::rollup::io_exponential_rollup(ds, 3).await
+}

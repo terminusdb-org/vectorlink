@@ -19,9 +19,11 @@ use crate::kernel::model::SearchMode;
 use super::{ChunkHit, DistanceKind, EmbeddingRecord, LanceStore, SearchQuery, SuggestQuery, SuggestResult, SuggestHit, MAIN_BRANCH};
 
 impl LanceStore {
-    /// Vector/FTS/hybrid search over chunk rows at a given version.
+    /// Vector/FTS/hybrid search over chunk rows.
     /// Returns chunk-level hits (caller dedups to documents).
-    /// INVARIANT: searches the snapshot at the commit's tagged version, NOT the latest.
+    /// Searches the current head of the cached dataset for responsiveness.
+    /// The head is a superset of all tagged commits, so results are correct
+    /// (may include in-flight rows from active indexing).
     pub async fn io_search(
         &self,
         domain: &str,
@@ -310,6 +312,12 @@ impl LanceStore {
             scanner.refine(rf);
         }
 
+        // Project only the columns needed for search results — skip the large
+        // `embedding` and `clustering_embedding` columns (768 floats each = 3KB/row).
+        // Those are only needed for /similar lookups, not ranked search.
+        scanner.project(&["doc_id", "chunk_index", "chunk_count", "chunk_token_start", "doc_token_len", "content"])
+            .map_err(|e| StoreError::Internal(format!("project failed: {}", e)))?;
+
         // Apply filters if present.
         if !query.doc_type_filter.is_empty() || !query.doc_id_filter.is_empty() {
             if let Some(expr) = build_filter_expr(&query.doc_type_filter, &query.doc_id_filter) {
@@ -317,11 +325,13 @@ impl LanceStore {
             }
         }
 
-        let batches: Vec<RecordBatch> = scanner
+        let stream = scanner
             .try_into_stream()
             .await
-            .map_err(|e| StoreError::Internal(format!("scan stream failed: {}", e)))?
-            .try_collect()
+            .map_err(|e| StoreError::Internal(format!("scan stream failed: {}", e)))?;
+
+        let batches: Vec<RecordBatch> = stream
+            .try_collect::<Vec<RecordBatch>>()
             .await
             .map_err(|e| StoreError::Internal(format!("batch collect failed: {}", e)))?;
 
@@ -347,6 +357,10 @@ impl LanceStore {
         scanner
             .limit(Some(k as i64), None)
             .map_err(|e| StoreError::Internal(format!("limit failed: {}", e)))?;
+
+        // Project only needed columns — skip embedding columns (3KB/row).
+        scanner.project(&["doc_id", "chunk_index", "chunk_count", "chunk_token_start", "doc_token_len", "content"])
+            .map_err(|e| StoreError::Internal(format!("project failed: {}", e)))?;
 
         // Apply filters if present.
         if !query.doc_type_filter.is_empty() || !query.doc_id_filter.is_empty() {
@@ -374,31 +388,43 @@ impl LanceStore {
             }
         };
 
-        match stream.try_collect::<Vec<RecordBatch>>().await {
-            Ok(batches) => Ok(batches_to_fts_hits(&batches)),
+        let batches: Vec<RecordBatch> = match stream.try_collect::<Vec<RecordBatch>>().await {
+            Ok(b) => b,
             Err(e) => {
                 let msg = e.to_string();
-                // WHY/INVARIANT/CONSEQUENCE: same as above — historical snapshot
-                // may lack the INVERTED index; hybrid degrades to vector-only.
+                // WHY: FTS is called from hybrid_search, which fuses vector + FTS.
+                // At historical versions (checkout_version), the INVERTED index may
+                // not yet exist (created after that version was tagged). Returning
+                // empty degrades hybrid to vector-only — still useful and correct.
+                // INVARIANT: the vector side of hybrid always runs (vector_search is
+                // called independently); hybrid is never empty solely because FTS is.
+                // CONSEQUENCE: search returns vector-only results at versions that
+                // predate FTS index creation. No data loss; ranking is less rich.
                 if msg.contains("INVERTED index") || msg.contains("full text search") {
                     return Ok(Vec::new());
                 }
-                Err(StoreError::Internal(format!("FTS collect failed: {}", msg)))
+                return Err(StoreError::Internal(format!("FTS collect failed: {}", msg)));
             }
-        }
+        };
+
+        Ok(batches_to_fts_hits(&batches))
     }
 
     /// Hybrid search: Reciprocal Rank Fusion (RRF) over vector + FTS ranked lists.
     /// Deterministic given deterministic inputs.
     /// RRF score = sum over lists of 1/(k + rank_in_list) where k=60 (standard).
+    ///
+    /// Vector and FTS run concurrently via `tokio::join!` to minimise latency.
     async fn hybrid_search(
         &self,
         ds: &Dataset,
         query: &SearchQuery,
     ) -> Result<Vec<ChunkHit>, StoreError> {
-        let vector_hits = self.vector_search(ds, query).await?;
-        let fts_hits = self.fts_search(ds, query).await?;
-        Ok(rrf_merge(vector_hits, fts_hits))
+        let (vector_hits, fts_hits) = tokio::join!(
+            self.vector_search(ds, query),
+            self.fts_search(ds, query),
+        );
+        Ok(rrf_merge(vector_hits?, fts_hits?))
     }
 
     /// Look up a document's chunks by doc_id at the head of `branch` (indexed
@@ -491,7 +517,7 @@ impl LanceStore {
     pub(super) async fn io_snapshot_from_cache(
         &self,
         domain: &str,
-        branch: &str,
+        _branch: &str,
         commit: &str,
     ) -> Result<Dataset, StoreError> {
         let cached = match self.io_open_dataset_readonly(domain).await? {
@@ -511,26 +537,45 @@ impl LanceStore {
             guard.clone()
         };
 
-        let owned_branch_ds;
-        let base: &Dataset = if branch == MAIN_BRANCH {
-            &base
-        } else {
-            owned_branch_ds = base.checkout_branch(branch).await.map_err(|e| {
-                StoreError::Internal(format!("checkout '{}' for snapshot failed: {}", branch, e))
-            })?;
-            &owned_branch_ds
-        };
-
         let tag = crate::layeridx::encode_commit_tag(commit);
-        let version = base
-            .tags()
-            .get_version(&tag)
-            .await
-            .map_err(|e| StoreError::Internal(format!("commit not indexed: {}", e)))?;
 
-        base.checkout_version(version).await.map_err(|e| {
-            StoreError::Internal(format!("checkout version {} failed: {}", version, e))
-        })
+        // Use tags().list() to get full TagContents (including branch field).
+        // Version numbers are branch-scoped, so we must check out the owning
+        // branch before checkout_version when the tag lives on a rebuild branch.
+        let tags = base
+            .tags()
+            .list()
+            .await
+            .map_err(|e| StoreError::Internal(format!("tag list failed: {}", e)))?;
+
+        let tag_contents = tags
+            .get(&tag)
+            .ok_or_else(|| StoreError::Internal(format!("commit not indexed: tag '{}' not found", tag)))?;
+
+        let version = tag_contents.version;
+
+        match &tag_contents.branch {
+            None => {
+                // Tag on main: checkout_version from the base (main) handle.
+                base.checkout_version(version).await.map_err(|e| {
+                    StoreError::Internal(format!("checkout version {} failed: {}", version, e))
+                })
+            }
+            Some(branch_name) => {
+                // Tag on a non-main branch (e.g. a rebuild branch).
+                // Must checkout that branch first, then the version within it.
+                let ds_branch = base.checkout_branch(branch_name).await.map_err(|e| {
+                    StoreError::Internal(format!(
+                        "checkout branch '{}' for snapshot failed: {}", branch_name, e
+                    ))
+                })?;
+                ds_branch.checkout_version(version).await.map_err(|e| {
+                    StoreError::Internal(format!(
+                        "checkout version {} on branch '{}' failed: {}", version, branch_name, e
+                    ))
+                })
+            }
+        }
     }
 
     /// Resolve `commit` on `branch` to its versioned, read-only snapshot.
