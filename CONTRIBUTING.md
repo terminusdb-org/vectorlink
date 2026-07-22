@@ -6,6 +6,18 @@ A standalone semantic search engine in Rust on LanceDB with version history and 
 
 Borrows some concepts from the original VectorLink implementation.
 
+### Temporal vector search
+
+tdb-search is a **temporal vector search database**. Every commit that TerminusDB pushes is tagged at the Lance dataset version it was indexed at. Searching at a specific commit checks out that exact version, returning results as they were at that point in time — not the current head. This means all historical commits are retained in sync with the TerminusDB instance, enabling time-travel queries: "what did search return for this query at commit X?"
+
+This has important architectural consequences:
+
+- **Historical tags are immutable.** Compaction and index merging operate at the HEAD version only. They must never retag historical commits to newer versions, as this would break snapshot isolation (the `post_compaction_snapshot_isolation_regression_guard` test enforces this).
+- **Index fragmentation is the tradeoff.** Each push creates a small index delta via `optimize_indices(append())`. Over many pushes, deltas accumulate. Searches at recent versions benefit from periodic roll-up merges, but searches at old tagged versions use the indices that existed at that version — which may be fragmented. This is acceptable: historical queries are less frequent and correctness matters more than latency for them.
+- **Roll-up optimization.** When the per-push delta count reaches the roll-up base (3), exponential roll-up merges deltas in power-of-3 groups: 3 deltas → 1, 3 groups → 1, etc. This reduces O(N) index probes at HEAD to O(log₃(N)). This is directly analogous to TerminusDB's `exponential_rollup_strategy` with `rollup_base(3)` (see `src/core/api/api_optimize.pl`). Newer commits get consolidated indices while old tagged versions still reference their own original index files. The roll-up base is defined in `src/store/lance/rollup.rs`.
+- **Compaction endpoint.** `POST /compact` triggers data fragment compaction plus exponential index roll-up at HEAD. After roll-up, `io_cleanup_old_versions` removes old untagged index files from disk. Tagged versions are preserved (temporal search contract). This is the most thorough consolidation but only benefits searches at or near the head version.
+- **Cache configuration.** Lance's index cache defaults to 6 GiB; we use 2 GiB as a balanced default (`TDB_SEARCH_LANCE_INDEX_CACHE_BYTES`). The metadata cache defaults to 1 GiB in Lance; we use 512 MiB (`TDB_SEARCH_LANCE_METADATA_CACHE_BYTES`). With fragmented indices (many small deltas), a larger cache allows more index data to stay in memory, reducing disk I/O during search. If search latency is high after compaction, increasing the index cache is the first knob to turn.
+
 ## Build
 
 Builds run inside a pinned Docker image (`Dockerfile.build`) with all Rust deps pre-baked. No local toolchain needed beyond Docker and Make.
@@ -80,7 +92,6 @@ src/
   layeridx/          Commit→layer index (Lance tags per domain)
   resolve/           Entity resolution (flat-KNN candidate materialization)
   ingest/            NDJSON push parsing
-  indexqueue/        Phase-3 placeholder (unused, retained for future parallel indexing)
 ```
 
 ## Configuration
