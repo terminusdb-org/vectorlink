@@ -35,3 +35,6 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# Vendor sources
+vendor/

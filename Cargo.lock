@@ -4794,7 +4794,6 @@ dependencies = [
  "lance",
  "lance-index",
  "lance-linalg",
- "libc",
  "rand",
  "reqwest",
  "roaring",
