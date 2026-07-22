@@ -28,7 +28,7 @@ TOKENIZER_PATH="${TDB_SEARCH_TOKENIZER_PATH:-$PROJECT_ROOT/assets/tokenizer.json
 EMBED_URL="${TDB_SEARCH_EMBED_URL:-http://127.0.0.1:11434}"
 MODEL="${TDB_SEARCH_MODEL:-nomic-embed-text-v2-moe}"
 DIM="${TDB_SEARCH_DIM:-768}"
-BINARY="$PROJECT_ROOT/target/debug/tdb-search"
+BINARY="${TDB_SEARCH_BINARY:-$PROJECT_ROOT/target/release/tdb-search}"
 
 function start_server() {
     # Check if already running
@@ -52,9 +52,9 @@ function start_server() {
 
     # Build if binary doesn't exist
     if [ ! -f "$BINARY" ]; then
-        echo "Building tdb-search (debug)..."
+        echo "Building tdb-search (release)..."
         cd "$PROJECT_ROOT"
-        cargo build
+        cargo build --release
     fi
 
     echo "Starting tdb-search server..."
@@ -68,6 +68,7 @@ function start_server() {
     export TDB_SEARCH_EMBED_URL="$EMBED_URL"
     export TDB_SEARCH_MODEL="$MODEL"
     export TDB_SEARCH_DIM="$DIM"
+    export TDB_SEARCH_EMBED_CACHE_SIZE="${TDB_SEARCH_EMBED_CACHE_SIZE:-3000000}"
 
     # Start in a new session so it survives the script exiting
     python3 -c "
@@ -138,7 +139,7 @@ function stop_server() {
         echo "Stopping tdb-search (PID: $pid)..."
         kill "$pid"
 
-        local max_wait=10
+        local max_wait=130
         local waited=0
         while ps -p "$pid" > /dev/null 2>&1 && [ $waited -lt $max_wait ]; do
             sleep 1
@@ -184,6 +185,7 @@ function stop_terminusdb() {
     if [ -z "$TDB_REPO_ROOT" ] || [ ! -f "$TDB_SCRIPT" ]; then
         return 0
     fi
+    export TERMINUSDB_SERVER_PORT="${TERMINUSDB_SERVER_PORT:-7373}"
     "$TDB_SCRIPT" stop 2>/dev/null || true
 }
 
@@ -212,6 +214,7 @@ function status() {
         echo "tdb-search is not running"
     fi
     if [ -n "$TDB_REPO_ROOT" ] && [ -f "$TDB_SCRIPT" ]; then
+        export TERMINUSDB_SERVER_PORT="${TERMINUSDB_SERVER_PORT:-7373}"
         "$TDB_SCRIPT" status 2>/dev/null || true
     fi
 }

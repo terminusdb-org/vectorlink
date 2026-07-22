@@ -108,4 +108,9 @@ The engine targets **fast cold-start for KEDA-style scale-from-zero**: a fresh p
 
 ## License
 
-Apache-2.0 (see `LICENSE`).
+Most of `tdb-search` is licensed under the Apache License, Version 2.0 (see
+`LICENSE`). Enterprise Edition modules are licensed under the Business Source
+License 1.1 (see `LICENSE-EE`) and convert to Apache-2.0 on the Change Date.
+
+All source files carry SPDX-License-Identifier headers indicating their
+license. Files without an explicit EE marker are Apache-2.0.
