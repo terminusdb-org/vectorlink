@@ -132,12 +132,14 @@ pub struct Config {
     /// Configurable via `TDB_SEARCH_PROMETHEUS_PORT`; default None (disabled).
     pub prometheus_port: Option<u16>,
     /// Lance index cache capacity in bytes. Controls how much RAM Lance uses
-    /// to cache vector index data for fast ANN queries.
-    /// Configurable via `TDB_SEARCH_LANCE_INDEX_CACHE_BYTES`; default 256 MiB.
+    /// to cache vector index data for fast ANN queries. Lance's own default is
+    /// 6 GiB; we use 2 GiB as a balanced default for typical deployments.
+    /// Configurable via `TDB_SEARCH_LANCE_INDEX_CACHE_BYTES`; default 2 GiB.
     pub lance_index_cache_bytes: usize,
     /// Lance metadata cache capacity in bytes. Controls how much RAM Lance
-    /// uses to cache dataset metadata (manifests, fragment info).
-    /// Configurable via `TDB_SEARCH_LANCE_METADATA_CACHE_BYTES`; default 128 MiB.
+    /// uses to cache dataset metadata (manifests, fragment info). Lance's own
+    /// default is 1 GiB; we use 512 MiB as a balanced default.
+    /// Configurable via `TDB_SEARCH_LANCE_METADATA_CACHE_BYTES`; default 512 MiB.
     pub lance_metadata_cache_bytes: usize,
 }
 
@@ -211,11 +213,11 @@ impl Config {
             lance_index_cache_bytes: std::env::var("TDB_SEARCH_LANCE_INDEX_CACHE_BYTES")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(256 * 1024 * 1024),
+                .unwrap_or(2 * 1024 * 1024 * 1024),
             lance_metadata_cache_bytes: std::env::var("TDB_SEARCH_LANCE_METADATA_CACHE_BYTES")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(128 * 1024 * 1024),
+                .unwrap_or(512 * 1024 * 1024),
         }
     }
 
@@ -235,8 +237,8 @@ impl Config {
             embed_batch_size: DEFAULT_EMBED_BATCH_SIZE,
             embed_cache_size: None,
             prometheus_port: None,
-            lance_index_cache_bytes: 256 * 1024 * 1024,
-            lance_metadata_cache_bytes: 128 * 1024 * 1024,
+            lance_index_cache_bytes: 2 * 1024 * 1024 * 1024,
+            lance_metadata_cache_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -257,8 +259,8 @@ impl Default for Config {
             embed_batch_size: DEFAULT_EMBED_BATCH_SIZE,
             embed_cache_size: None,
             prometheus_port: None,
-            lance_index_cache_bytes: 256 * 1024 * 1024,
-            lance_metadata_cache_bytes: 128 * 1024 * 1024,
+            lance_index_cache_bytes: 2 * 1024 * 1024 * 1024,
+            lance_metadata_cache_bytes: 512 * 1024 * 1024,
         }
     }
 }

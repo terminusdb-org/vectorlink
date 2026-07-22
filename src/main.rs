@@ -68,10 +68,25 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[config] auto-compaction DISABLED (TDB_SEARCH_DISABLE_AUTO_COMPACTION=1)");
     }
 
+    // Startup cleanup: delete any stale __compact_rebuild branches left by
+    // a crashed compaction. This is a critical safety check — a lingering
+    // rebuild branch indicates a crashed compaction and should not be served.
+    let cleaned = lance_store.io_cleanup_compaction_branches().await?;
+    if !cleaned.is_empty() {
+        eprintln!(
+            "[startup] cleaned {} stale {} branch(es) from crashed compaction(s)",
+            cleaned.len(),
+            tdb_search::store::lance::COMPACT_REBUILD_PREFIX
+        );
+    }
+
     let port = config.port;
     let data_dir = config.data_dir.clone();
     let model_name = config.embed_provider.model_name().to_owned();
     let prometheus_port = config.prometheus_port;
+    // Clone the store Arc for the shutdown handler (before it's moved into SearchService).
+    let store_for_shutdown = Arc::clone(&lance_store);
+
     let service = SearchService::new(lance_store, config.clone(), tokenizer);
     let app = http_api::router(service.clone(), config);
 
@@ -88,8 +103,46 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[tdb-search] starting on port {} | data_dir={} | model={}", port, data_dir, model_name);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("[tdb-search] listening on {}", addr);
+
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+
+            // Disable auto-compaction immediately — no new compaction should start
+            // during shutdown. This ensures we can exit quickly once pipeline tasks
+            // finish their current batch.
+            store_for_shutdown.set_auto_compaction_enabled(false);
+            eprintln!("[shutdown] auto-compaction disabled, waiting for in-flight pipeline tasks...");
+
+            // Wait for all in-flight pipeline tasks to complete.
+            // These tasks are tokio::spawn'd background tasks that write data to
+            // Lance. Killing them mid-write loses data (versions get lost).
+            // We poll every 200ms with a timeout.
+            let wait_start = std::time::Instant::now();
+            let max_wait = std::time::Duration::from_secs(120);
+            loop {
+                let active = store_for_shutdown
+                    .pipeline_active_tasks
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if active == 0 {
+                    eprintln!("[shutdown] all pipeline tasks complete, exiting gracefully");
+                    break;
+                }
+                if wait_start.elapsed() > max_wait {
+                    eprintln!(
+                        "[shutdown] WARNING: {} pipeline task(s) still active after {}s, forcing exit",
+                        active, max_wait.as_secs()
+                    );
+                    break;
+                }
+                eprintln!(
+                    "[shutdown] waiting for {} pipeline task(s)... ({}s elapsed)",
+                    active,
+                    wait_start.elapsed().as_secs()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        })
         .await?;
     Ok(())
 }

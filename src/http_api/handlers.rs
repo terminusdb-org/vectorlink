@@ -286,17 +286,22 @@ fn extract_repeated_param(raw_query: Option<&str>, name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Maximum number of results a single search/duplicates request can return.
+/// Maximum number of results a single search/similar request can return.
 /// Prevents overflow in `k = (start + count) * 3` and bounds scan cost.
-const MAX_RESULT_COUNT: i64 = 200;
+const MAX_RESULT_COUNT: i64 = 1000;
+
+/// Maximum number of duplicate groups a /duplicates request can return.
+/// Same as MAX_RESULT_COUNT — the scan is bounded by `max_points` separately.
+const MAX_DUPLICATE_COUNT: i64 = 1000;
 
 /// Maximum `start` offset. Prevents integer overflow in `k = (start + count) * 3`
 /// when `start` is cast to `usize` and added to `count`.
 const MAX_START: i64 = 1_000_000;
 
 /// Validate pagination parameters.
+/// `max_count` is the endpoint-specific upper bound for `count`.
 #[allow(clippy::result_large_err)]
-fn validate_pagination(start: Option<i64>, count: Option<i64>) -> Result<(), Response> {
+fn validate_pagination_with(start: Option<i64>, count: Option<i64>, max_count: i64) -> Result<(), Response> {
     if let Some(s) = start {
         if s < 0 {
             return Err(error_response(
@@ -318,14 +323,20 @@ fn validate_pagination(start: Option<i64>, count: Option<i64>) -> Result<(), Res
                 "invalid count: must be >= 1".to_owned(),
             ));
         }
-        if c > MAX_RESULT_COUNT {
+        if c > max_count {
             return Err(error_response(
                 StatusCode::BAD_REQUEST,
-                format!("invalid count: must be <= {}", MAX_RESULT_COUNT),
+                format!("invalid count: must be <= {}", max_count),
             ));
         }
     }
     Ok(())
+}
+
+/// Validate pagination parameters for search endpoints (MAX_RESULT_COUNT).
+#[allow(clippy::result_large_err)]
+fn validate_pagination(start: Option<i64>, count: Option<i64>) -> Result<(), Response> {
+    validate_pagination_with(start, count, MAX_RESULT_COUNT)
 }
 
 // ─────────────────────────── Handlers ─────────────────────────────────────
@@ -669,9 +680,9 @@ async fn handle_push(
     drop(op_tx);
 
     if let Some(err) = stream_error {
-        // The pipeline task will record its own error when the channel closes.
-        // We still return the task_id so the client can check the task status.
-        let _ = err; // logged via the task error
+        // Record the error on the task so TerminusDB polling /check sees it
+        // (the pipeline task itself has no way to know why the channel closed).
+        state.service.record_error_task(&task_id, err).await;
         return (StatusCode::OK, task_id).into_response();
     }
 
@@ -1126,7 +1137,7 @@ async fn handle_duplicates(
         Err(e) => return service_error_to_response(e),
     };
 
-    if let Err(r) = validate_pagination(params.start, params.count) {
+    if let Err(r) = validate_pagination_with(params.start, params.count, MAX_DUPLICATE_COUNT) {
         return r;
     }
 
@@ -1171,6 +1182,11 @@ async fn handle_duplicates(
 
 #[derive(Debug, Deserialize)]
 pub struct StatisticsParams {
+    pub domain: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IntegrityParams {
     pub domain: Option<String>,
 }
 
@@ -1571,6 +1587,44 @@ async fn handle_delete_domain(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DeleteBranchIndexParams {
+    pub domain: Option<String>,
+    pub branch: Option<String>,
+}
+
+/// DELETE /branch-index?domain=<org/db>&branch=<branch> — remove a single
+/// branch's index tags and in-memory caches without affecting other branches.
+/// Admin-secret gated. Idempotent.
+async fn handle_delete_branch_index(
+    State(state): State<AppState>,
+    Query(params): Query<DeleteBranchIndexParams>,
+) -> Response {
+    let domain = match params.domain {
+        Some(d) if !d.is_empty() => d,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing required query parameter: domain".to_owned(),
+            );
+        }
+    };
+    let branch = match params.branch {
+        Some(b) if !b.is_empty() => b,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing required query parameter: branch".to_owned(),
+            );
+        }
+    };
+
+    match state.service.delete_branch_index(&domain, &branch).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => service_error_to_response(e),
+    }
+}
+
 async fn handle_health_live() -> Response {
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
@@ -1590,6 +1644,32 @@ async fn handle_health_ready(State(state): State<AppState>) -> Response {
         (StatusCode::OK, Json(body)).into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    }
+}
+
+/// GET /integrity?domain=<org/db> — run a store integrity check on a domain.
+///
+/// Read-only. Compares on-disk state (index dirs, data files, manifests)
+/// against live references from all tagged manifests across all branches.
+/// Reports stale index dirs, dangling index references, and rebuild branch
+/// count. Does not modify the store.
+async fn handle_integrity(
+    State(state): State<AppState>,
+    Query(params): Query<IntegrityParams>,
+) -> Response {
+    let domain = match params.domain {
+        Some(ref d) if !d.is_empty() => d.clone(),
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing required query parameter: domain".to_owned(),
+            );
+        }
+    };
+
+    match state.service.integrity_check(&domain).await {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(e) => service_error_to_response(e),
     }
 }
 
@@ -1876,8 +1956,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/compact", post(handle_compact))
         .route("/compare", post(handle_compare))
         .route("/statistics", get(handle_statistics))
+        .route("/integrity", get(handle_integrity))
         .route("/embeddings", get(handle_embeddings).post(handle_embeddings_post))
         .route("/domain", delete(handle_delete_domain))
+        .route("/branch-index", delete(handle_delete_branch_index))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Unauthenticated routes (health probes).

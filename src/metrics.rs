@@ -28,6 +28,7 @@ async fn render_metrics(service: &SearchService) -> String {
             documents: 0,
             chunks: 0,
             pending_index_fragments: 0,
+            pending_index_documents: 0,
             store_clustering: None,
         });
     let internal = service.internal_stats().await;
@@ -58,6 +59,10 @@ async fn render_metrics(service: &SearchService) -> String {
     out.push_str("# HELP tdb_search_pending_index_fragments Fragments not yet covered by vector ANN index\n");
     out.push_str("# TYPE tdb_search_pending_index_fragments gauge\n");
     out.push_str(&format!("tdb_search_pending_index_fragments {}\n", stats.pending_index_fragments));
+
+    out.push_str("# HELP tdb_search_pending_index_documents Rows in fragments not yet covered by vector ANN index\n");
+    out.push_str("# TYPE tdb_search_pending_index_documents gauge\n");
+    out.push_str(&format!("tdb_search_pending_index_documents {}\n", stats.pending_index_documents));
 
     // ── Internal data structure sizes ──
     out.push_str("# HELP tdb_search_cached_datasets Number of cached Lance Dataset handles\n");
