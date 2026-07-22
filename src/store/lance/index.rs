@@ -116,6 +116,9 @@ pub async fn io_ensure_fts_index_on_dataset(ds: &mut Dataset) -> Result<u64, Sto
         .await
         .map_err(|e| StoreError::Internal(format!("FTS index creation failed: {}", e)))?;
     } else {
+        // Index exists: incrementally index only new (unindexed) fragments.
+        // Per-push uses append() — the incremental merge(3) cascade
+        // (io_incremental_cascade) consolidates deltas after each push.
         ds.optimize_indices(&OptimizeOptions::append())
             .await
             .map_err(|e| StoreError::Internal(format!("FTS index optimize failed: {}", e)))?;
@@ -135,15 +138,16 @@ pub async fn io_ensure_fts_index_on_dataset(ds: &mut Dataset) -> Result<u64, Sto
 /// Called by the background index worker AFTER index optimization. Idempotent:
 /// if the dataset already has a reasonable number of fragments (<= target), this
 /// is effectively a no-op (returns quickly without rewriting data).
-pub async fn io_compact_data(ds: &mut Dataset) -> Result<(), StoreError> {
+pub async fn io_compact_data(ds: &mut Dataset, force: bool) -> Result<(), StoreError> {
     use lance::dataset::optimize::{compact_files, CompactionOptions};
 
     // Only compact if fragment count is above the threshold — avoids needless
-    // I/O when the dataset is already well-compacted.
+    // I/O when the dataset is already well-compacted. When `force` is true
+    // (manual API compaction), the threshold is skipped.
     const COMPACT_FRAGMENT_THRESHOLD: usize = 16;
 
     let fragment_count = ds.get_fragments().len();
-    if fragment_count <= COMPACT_FRAGMENT_THRESHOLD {
+    if !force && fragment_count <= COMPACT_FRAGMENT_THRESHOLD {
         return Ok(());
     }
 
