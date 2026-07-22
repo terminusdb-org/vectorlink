@@ -356,6 +356,22 @@ impl SearchService {
 
         // Clone what we need for the background task.
         let store = Arc::clone(&self.store);
+
+        // Try to acquire the pipeline lock before spawning. If compaction is
+        // running, reject the push with 503 so TerminusDB retries.
+        let pipeline_guard = match store.try_acquire_pipeline_lock(&domain_str, &branch).await {
+            Some(g) => g,
+            None => {
+                self.store
+                    .io_release_commit_reservation(&domain_str, &branch, &commit)
+                    .await;
+                return Err(ServiceError::Unavailable(format!(
+                    "compaction in progress for {}/{}, retry later",
+                    domain_str, branch
+                )));
+            }
+        };
+
         let tokenizer = Arc::clone(&self.tokenizer);
         let chunk_params = self.chunk_params.clone();
         let provider = self.config.embed_provider.clone();
@@ -375,6 +391,7 @@ impl SearchService {
         let task_id_for_panic = task_id.clone();
         let reservation_coords = (domain_str.clone(), branch.clone(), commit.clone());
         let handle = tokio::spawn(async move {
+            let _pipeline_guard = pipeline_guard;
             store.pipeline_active_tasks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let ctx = PipelineCtx {
                 store: &store,
@@ -546,7 +563,29 @@ impl SearchService {
             .await;
 
         let cancel_token_for_task = cancel_token.clone();
+
+        // Try to acquire the pipeline lock before spawning. If compaction is
+        // running, reject the push with 503 so TerminusDB retries. This prevents
+        // the dead man's switch from firing (no document progress while waiting
+        // for the lock).
+        let pipeline_guard = match store.try_acquire_pipeline_lock(&domain_str, &branch).await {
+            Some(g) => g,
+            None => {
+                self.store
+                    .io_release_commit_reservation(&domain_str, &branch, &commit)
+                    .await;
+                self.store
+                    .cancel_previous_pipeline_and_register(&cancel_domain, &cancel_branch, cancel_token.clone())
+                    .await;
+                return Err(ServiceError::Unavailable(format!(
+                    "compaction in progress for {}/{}, retry later",
+                    domain_str, branch
+                )));
+            }
+        };
+
         let handle = tokio::spawn(async move {
+            let _pipeline_guard = pipeline_guard;
             store.pipeline_active_tasks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let ctx = PipelineCtx {
                 store: &store,
@@ -1597,6 +1636,24 @@ impl SearchService {
         Ok(self.store.statistics_for_domain(&domain_str).await)
     }
 
+    /// Run a store integrity check on a domain. Read-only — compares on-disk
+    /// state against live references from all tagged manifests. Exposed via
+    /// `GET /integrity?domain=...` for operator troubleshooting.
+    pub async fn integrity_check(
+        &self,
+        domain_raw: &str,
+    ) -> Result<crate::store::lance::integrity::IntegrityReport, ServiceError> {
+        let rp =
+            parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
+        let domain = Domain::from_resource_path(&rp);
+        let domain_str = domain.as_str().to_owned();
+
+        self.store
+            .io_integrity_check(&domain_str)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))
+    }
+
     /// Fetch stored embeddings for a set of doc IDs and/or doc types.
     /// Returns both document and clustering embeddings (clustering only when enabled).
     /// When both doc_ids and doc_types are empty, all embeddings are returned.
@@ -1717,6 +1774,27 @@ impl SearchService {
         Ok(())
     }
 
+    /// Delete a single branch's index (tags + in-memory caches) without
+    /// affecting other branches in the same domain dataset. Used by
+    /// TerminusDB when re-indexing a branch from scratch.
+    pub async fn delete_branch_index(
+        &self,
+        domain_raw: &str,
+        branch: &str,
+    ) -> Result<(), ServiceError> {
+        let rp =
+            parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
+        let domain = Domain::from_resource_path(&rp);
+        let domain_str = domain.as_str().to_owned();
+
+        self.store
+            .io_delete_branch_index(&domain_str, branch)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Trigger data compaction for a domain's dataset on a given branch.
     /// Merges small fragments (one per push) into fewer large fragments, reducing
     /// the FD count for full-table scans at HEAD. Returns before/after fragment
@@ -1760,7 +1838,7 @@ impl SearchService {
         let fragments_before = ds.get_fragments().len();
         let version_before = ds.version().version;
 
-        crate::store::lance::io_compact_data(&mut ds)
+        crate::store::lance::io_compact_data(&mut ds, true)
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
@@ -2224,12 +2302,8 @@ async fn io_run_index_pipeline(
     // the empty commit and subsequent normal commits cannot be reached.
     let has_work = !all_rows.is_empty() || !delete_ids.is_empty();
 
-    // Acquire the per-branch lock. Held for the entire write→optimize→tag sequence.
-    // This ensures at most one unindexed commit per branch and prevents snapshot
-    // isolation violations (a later commit's data cannot leak into an earlier tag).
-    // Acquired unconditionally: even a no-op commit must be tagged under the lock
-    // to maintain ordering (a concurrent push must not interleave tags).
-    let _guard = ctx.store.acquire_pipeline_lock(ctx.domain, ctx.branch).await;
+    // The pipeline lock was acquired in push before spawning and is held
+    // by _pipeline_guard in the spawned task. No need to acquire here.
 
     if has_work {
         // Batched write (Option B): two-version delete-then-append under pipeline lock.
@@ -2325,6 +2399,32 @@ async fn io_run_index_pipeline(
 ///   2. Micro-batch loop: read N docs → chunk → embed → delete old (Changed) → append → drop
 ///   3. After all ops: optimize indices + tag commit
 ///
+// ─── Inline optimize trigger logic ──────────────────────────────────
+/// Safety-net threshold: if unindexed docs or micro-batches exceed these
+/// limits, trigger an inline cascade optimization. The primary cascade runs
+/// after every push (post-write), so this threshold only fires if the primary
+/// cascade silently failed or if a very large push accumulates many deltas.
+const UNINDEXED_DOCS_THRESHOLD: u64 = 30_000;
+const UNINDEXED_FRAGMENT_GUARD: u32 = 30;
+
+#[derive(Debug, PartialEq)]
+enum OptimizeAction {
+    None,
+    OptimizeWithCascade,
+}
+
+fn should_optimize(
+    docs_since_last_index: u64,
+    microbatch_count_since_index: u32,
+) -> OptimizeAction {
+    if docs_since_last_index > UNINDEXED_DOCS_THRESHOLD
+        || microbatch_count_since_index > UNINDEXED_FRAGMENT_GUARD
+    {
+        return OptimizeAction::OptimizeWithCascade;
+    }
+    OptimizeAction::None
+}
+
 /// The pipeline lock is held for the entire loop (still one commit at a time).
 /// Multiple appends produce multiple fragments — compaction merges them later.
 /// The commit is untagged until the end, so no search sees partial data.
@@ -2355,10 +2455,8 @@ async fn io_run_index_pipeline_stream(
     const MICRO_BATCH_DOCS: usize = 2000;
     let mut batch_docs: Vec<DocToEmbed> = Vec::with_capacity(MICRO_BATCH_DOCS);
 
-    // Acquire the per-branch lock upfront — held for the entire micro-batch loop
-    // plus the final optimize+tag. This ensures at most one unindexed commit per
-    // branch and prevents snapshot isolation violations.
-    let _guard = ctx.store.acquire_pipeline_lock(ctx.domain, ctx.branch).await;
+    // The pipeline lock was acquired in push_stream before spawning and is
+    // held by _pipeline_guard in the spawned task. No need to acquire here.
 
     // Acquire domain guard to serialise against DELETE /domain.
     let _domain_guard = ctx.store.acquire_domain_guard(ctx.domain).await;
@@ -2374,6 +2472,10 @@ async fn io_run_index_pipeline_stream(
         .map_err(|e| format!("failed to open write handle: {}", e))?;
 
     let store_clustering = ctx.store.domain_settings.store_clustering(ctx.domain).await;
+
+    // Inline optimize counters — track docs and micro-batches since last optimize.
+    let mut docs_since_last_index: u64 = 0;
+    let mut microbatch_count_since_index: u32 = 0;
 
     // ─── Micro-batch flush helper ───────────────────────────────────────
     // Embeds, deletes old chunks (for Changed docs), appends new rows,
@@ -2520,15 +2622,21 @@ async fn io_run_index_pipeline_stream(
                 let doc_type = ingest::extract_doc_type(&doc.id);
 
                 // For Changed docs: delete old chunks BEFORE appending new ones.
+                // FAIL-LOUD: a failed delete leaves stale chunks alongside new
+                // ones (data corruption). Abort the pipeline rather than silently
+                // appending on top of old data.
                 if doc.is_changed {
                     let expr = lance::deps::datafusion::logical_expr::col("doc_id")
                         .eq(lance::deps::datafusion::logical_expr::lit(doc.id.as_str()));
-                    if let Ok(result) = lance::dataset::write::DeleteBuilder::from_expr(
+                    let result = lance::dataset::write::DeleteBuilder::from_expr(
                         std::sync::Arc::new(ds.clone()),
                         expr,
-                    ).execute().await {
-                        *ds = result.new_dataset.as_ref().clone();
-                    }
+                    ).execute().await
+                        .map_err(|e| format!(
+                            "Changed doc delete failed for {}: {} (aborting to prevent stale+new chunk corruption)",
+                            doc.id, e
+                        ))?;
+                    *ds = result.new_dataset.as_ref().clone();
                     all_delete_ids.push(doc.id.clone());
                 }
 
@@ -2643,12 +2751,65 @@ async fn io_run_index_pipeline_stream(
 
         // Flush when the micro-batch is full.
         if batch_docs.len() >= MICRO_BATCH_DOCS {
+            let batch_doc_count = batch_docs.len();
             flush_microbatch(
                 ctx, &mut ds, &mut batch_docs, &mut all_delete_ids,
                 &mut skipped, store_clustering, &progress_tx,
                 &mut total_docs_seen, &mut indexed_count,
                 cancel_token,
             ).await?;
+
+            // Inline optimize trigger — runs on the write handle directly
+            // (same execution context as the append calls, no tokio::spawn).
+            docs_since_last_index += batch_doc_count as u64;
+            microbatch_count_since_index += 1;
+
+            let action = should_optimize(
+                docs_since_last_index,
+                microbatch_count_since_index,
+            );
+
+            if action != OptimizeAction::None {
+                let vector_config = ctx.store.vector_index_config().clone();
+
+                crate::store::lance::io_ensure_fts_index_on_dataset(&mut ds)
+                    .await
+                    .map_err(|e| format!("inline FTS optimize failed: {}", e))?;
+
+                crate::store::vector_index::io_ensure_vector_index(&mut ds, &vector_config, false)
+                    .await
+                    .map_err(|e| format!("inline vector optimize failed: {}", e))?;
+
+                if store_clustering {
+                    crate::store::vector_index::io_ensure_clustering_vector_index(&mut ds, &vector_config, false)
+                        .await
+                        .map_err(|e| format!("inline clustering vector optimize failed: {}", e))?;
+                }
+
+                if action == OptimizeAction::OptimizeWithCascade {
+                    let delta_count = ctx.store.io_get_delta_count(ctx.domain, ctx.branch).await;
+                    let (idx_before, idx_after) =
+                        crate::store::lance::io_incremental_cascade(&mut ds, delta_count)
+                            .await
+                            .map_err(|e| format!("inline cascade failed: {}", e))?;
+
+                    eprintln!(
+                        "[pipeline] inline optimize: domain={} branch={} docs={} microbatches={} indices {}→{}",
+                        ctx.domain, ctx.branch, docs_since_last_index, microbatch_count_since_index,
+                        idx_before, idx_after
+                    );
+
+                    if let Err(e) = ctx.store.io_cleanup_aggressive(ctx.domain, ctx.branch).await {
+                        eprintln!("[pipeline] inline aggressive cleanup failed (soft): {}", e);
+                    }
+                }
+
+                ctx.store.io_refresh_cached_dataset(ctx.domain, ctx.branch).await
+                    .map_err(|e| format!("inline cache refresh failed: {}", e))?;
+
+                docs_since_last_index = 0;
+                microbatch_count_since_index = 0;
+            }
         }
     }
 
@@ -2689,6 +2850,31 @@ async fn io_run_index_pipeline_stream(
             }
         };
 
+        // Increment delta count and run the incremental merge(3) cascade.
+        // The cascade maintains a base-3 index hierarchy at HEAD, keeping
+        // search latency at O(log₃ N) instead of O(N).
+        if indexed_version.is_some() {
+            ctx.store.io_increment_delta_count(ctx.domain, ctx.branch).await;
+            let delta_count = ctx.store.io_get_delta_count(ctx.domain, ctx.branch).await;
+
+            let ds_opt = ctx.store.io_open_dataset_uncached(ctx.domain, ctx.branch).await;
+            if let Ok(Some(mut ds_opt)) = ds_opt {
+                let (idx_before, idx_after) =
+                    crate::store::lance::io_incremental_cascade(&mut ds_opt, delta_count)
+                        .await
+                        .unwrap_or((0, 0));
+
+                if idx_after != idx_before {
+                    eprintln!(
+                        "[pipeline] cascade: domain={} branch={} delta_count={} indices {}→{}",
+                        ctx.domain, ctx.branch, delta_count, idx_before, idx_after
+                    );
+                    ctx.store.io_refresh_cached_dataset(ctx.domain, ctx.branch).await
+                        .map_err(|e| format!("cascade cache refresh failed: {}", e))?;
+                }
+            }
+        }
+
         let tag_version = indexed_version.unwrap_or(last_version);
         if let Err(e) = ctx.store.io_tag_commit(ctx.domain, ctx.branch, commit, tag_version).await {
             let msg = format!("failed to tag commit: {}", e);
@@ -2700,9 +2886,12 @@ async fn io_run_index_pipeline_stream(
 
         ctx.store.update_last_indexed(ctx.domain, ctx.branch, commit, tag_version).await;
 
-        // Prune old untagged intermediate versions to prevent manifest/memory growth.
-        if let Err(e) = ctx.store.io_cleanup_old_versions(ctx.domain, ctx.branch).await {
-            eprintln!("[pipeline] version cleanup failed (soft): {}", e);
+        // Aggressively prune untagged intermediate versions after tagging.
+        // retain_n_versions(1) keeps only the current (tagged) version plus
+        // all tagged versions. This ensures orphaned index files from
+        // append-only optimize cycles are physically deleted.
+        if let Err(e) = ctx.store.io_cleanup_aggressive(ctx.domain, ctx.branch).await {
+            eprintln!("[pipeline] aggressive cleanup failed (soft): {}", e);
         }
     } else {
         // No-op commit: tag at current version.
@@ -2750,13 +2939,6 @@ async fn io_run_index_pipeline_stream(
 /// Uses `io_open_dataset_uncached` so the write operations don't hold the shared
 /// `Arc<RwLock<Dataset>>` and block concurrent search reads (Fix #2).
 /// After optimization, refreshes the cached handle.
-///
-/// The index creation/optimization calls internally use DataFusion, which calls
-/// `Handle::current().block_on()` in some code paths (e.g. HashJoinExec). This
-/// panics when called from within a tokio::spawn context ("Cannot block the current
-/// thread from within a runtime"). To avoid this, the index operations run on a
-/// dedicated blocking thread via `spawn_blocking`, with a fresh single-threaded
-/// runtime for the async Lance calls.
 async fn io_optimize_on_uncached_handle(
     store: &LanceStore,
     domain: &str,
@@ -2773,41 +2955,24 @@ async fn io_optimize_on_uncached_handle(
         None => return Ok(None),
     };
 
-    // Run index optimization on a blocking thread with its own runtime to avoid
-    // the DataFusion "Cannot block from within a runtime" panic (see doc comment).
     let vector_config = store.vector_index_config().clone();
-    let final_version = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("failed to create optimize runtime: {}", e))?;
 
-        rt.block_on(async {
-            // FTS: create inverted index or incrementally append new fragments.
-            crate::store::lance::io_ensure_fts_index_on_dataset(&mut ds)
-                .await
-                .map_err(|e| format!("FTS optimize failed: {}", e))?;
+    crate::store::lance::io_ensure_fts_index_on_dataset(&mut ds)
+        .await
+        .map_err(|e| format!("FTS optimize failed: {}", e))?;
 
-            // Vector ANN: create IVF_PQ index (if enough rows) or incrementally append.
-            crate::store::vector_index::io_ensure_vector_index(&mut ds, &vector_config)
-                .await
-                .map_err(|e| format!("vector optimize failed: {}", e))?;
+    crate::store::vector_index::io_ensure_vector_index(&mut ds, &vector_config, false)
+        .await
+        .map_err(|e| format!("vector optimize failed: {}", e))?;
 
-            // Clustering vector ANN: only when clustering is enabled for the domain.
-            if store_clustering {
-                crate::store::vector_index::io_ensure_clustering_vector_index(&mut ds, &vector_config)
-                    .await
-                    .map_err(|e| format!("clustering vector optimize failed: {}", e))?;
-            }
+    if store_clustering {
+        crate::store::vector_index::io_ensure_clustering_vector_index(&mut ds, &vector_config, false)
+            .await
+            .map_err(|e| format!("clustering vector optimize failed: {}", e))?;
+    }
 
-            Ok::<u64, String>(ds.version().version)
-        })
-    })
-    .await
-    .map_err(|e| format!("optimize task panicked: {}", e))?
-    .map_err(|e: String| e)?;
+    let final_version = ds.version().version;
 
-    // Refresh the cached handle so subsequent reads see the optimized indices.
     store
         .io_refresh_cached_dataset(domain, branch)
         .await
@@ -4389,3 +4554,427 @@ mod tests_exact_duplicate_override {
     }
 }
 
+#[cfg(test)]
+mod tests_concurrent_search {
+    use super::*;
+    use crate::store::lance::ChunkRow;
+    use std::path::Path;
+    use std::time::Duration;
+
+    #[allow(dead_code)]
+    static DISABLED_CACHE: std::sync::LazyLock<crate::embed::cache::EmbedCache> =
+        std::sync::LazyLock::new(crate::embed::cache::EmbedCache::disabled);
+
+    #[allow(dead_code)]
+    fn test_tokenizer() -> Tokenizer {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("spikes")
+            .join("tokenizer")
+            .join("tokenizer.json");
+        crate::chunk::io_load_tokenizer(&path).expect("test tokenizer must load")
+    }
+
+    #[allow(dead_code)]
+    fn dummy_provider() -> Provider {
+        Provider::OpenAiCompatible {
+            base_url: "http://127.0.0.1:0/never-called".to_owned(),
+            model: "test-noop".to_owned(),
+            dim: 8,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn make_row(doc_id: &str, content: &str, emb: Vec<f32>) -> ChunkRow {
+        ChunkRow {
+            doc_id: doc_id.to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: emb,
+            clustering_embedding: vec![0.1; 8],
+            content: content.to_owned(),
+        }
+    }
+
+    /// Search must return results while the pipeline lock is held by an
+    /// in-flight indexing task. The search operates on an already-tagged
+    /// commit snapshot and must not block on the pipeline lock.
+    #[tokio::test]
+    async fn search_completes_while_pipeline_lock_held() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
+        let domain = "admin/concurrent_search";
+        let branch = "main";
+
+        // Seed: insert two docs and tag as c0.
+        let row_a = make_row("doc/a", "king of the hill", vec![0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let row_b = make_row("doc/b", "queen of hearts", vec![0.1, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+
+        let v0 = store
+            .io_upsert_chunks(domain, branch, "doc/a", std::slice::from_ref(&row_a))
+            .await
+            .expect("seed upsert a");
+        store
+            .io_upsert_chunks(domain, branch, "doc/b", std::slice::from_ref(&row_b))
+            .await
+            .expect("seed upsert b");
+        store.io_tag_commit(domain, branch, "c0", v0).await.expect("tag c0");
+        store.update_last_indexed(domain, branch, "c0", v0).await;
+
+        // Acquire the pipeline lock — simulating an in-flight indexing task.
+        let _pipeline_guard = store.acquire_pipeline_lock(domain, branch).await;
+
+        // While the pipeline lock is held, perform a search on the tagged
+        // commit c0. This must NOT block on the pipeline lock.
+        let query = SearchQuery {
+            query_embedding: vec![0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            query_text: "king".to_owned(),
+            mode: SearchMode::Vector,
+            start: 0,
+            count: 10,
+            doc_type_filter: vec![],
+            doc_id_filter: vec![],
+            snippet: false,
+        };
+
+        // Wrap in timeout — if search blocks on the pipeline lock, this fails.
+        let hits = tokio::time::timeout(
+            Duration::from_secs(5),
+            store.io_search(domain, branch, "c0", &query),
+        )
+        .await
+        .expect("search must not block while pipeline lock is held")
+        .expect("search must succeed");
+
+        // Should find doc/a (closest to the query embedding).
+        assert!(!hits.is_empty(), "search must return hits");
+        assert_eq!(hits[0].doc_id, "doc/a", "closest hit should be doc/a");
+
+        // Release the pipeline lock.
+        drop(_pipeline_guard);
+    }
+
+    /// Search must return results while a full indexing pipeline is running
+    /// with active operations in the channel. This tests real concurrency,
+    /// not just lock acquisition.
+    #[tokio::test]
+    async fn search_completes_during_active_indexing() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
+        let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
+        let _provider = dummy_provider();
+        let _http_client = reqwest::Client::new();
+        let domain = "admin/concurrent_active";
+        let branch = "main";
+
+        // Seed: insert one doc and tag as c0.
+        let row_seed = make_row("doc/seed", "king of the hill", vec![0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let v0 = store
+            .io_upsert_chunks(domain, branch, "doc/seed", std::slice::from_ref(&row_seed))
+            .await
+            .expect("seed upsert");
+        store.io_tag_commit(domain, branch, "c0", v0).await.expect("tag c0");
+        store.update_last_indexed(domain, branch, "c0", v0).await;
+
+        // Start a pipeline with a slow operation channel — we'll keep the
+        // channel open with a delay so the pipeline is actively running
+        // (holding the pipeline lock) when we search.
+        let (tx, rx) = mpsc::channel::<Operation>(16);
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+
+        let store_arc = Arc::new(store);
+        let store_for_pipeline = Arc::clone(&store_arc);
+        let tokenizer_clone = test_tokenizer();
+        let chunk_params_clone = chunk_params.clone();
+        let provider_clone = _provider.clone();
+        let http_client_clone = _http_client.clone();
+        let cancel_for_pipeline = cancel_token.clone();
+
+        let pipeline_handle = tokio::spawn(async move {
+            let ctx = PipelineCtx {
+                store: &store_for_pipeline,
+                tokenizer: &tokenizer_clone,
+                chunk_params: &chunk_params_clone,
+                provider: &provider_clone,
+                http_client: &http_client_clone,
+                embed_cache: &DISABLED_CACHE,
+                domain,
+                branch,
+                embed_batch_size: 32,
+            };
+            let _ = io_run_index_pipeline_stream(
+                &ctx, "c1", rx, None, &cancel_for_pipeline,
+            ).await;
+        });
+
+        // Give the pipeline a moment to acquire the pipeline lock.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // While the pipeline is running, search on the tagged commit c0.
+        let query = SearchQuery {
+            query_embedding: vec![0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            query_text: "king".to_owned(),
+            mode: SearchMode::Vector,
+            start: 0,
+            count: 10,
+            doc_type_filter: vec![],
+            doc_id_filter: vec![],
+            snippet: false,
+        };
+
+        let hits = tokio::time::timeout(
+            Duration::from_secs(10),
+            store_arc.io_search(domain, branch, "c0", &query),
+        )
+        .await
+        .expect("search must not block during active indexing")
+        .expect("search must succeed");
+
+        assert!(!hits.is_empty(), "search must return hits during indexing");
+        assert_eq!(hits[0].doc_id, "doc/seed", "closest hit should be doc/seed");
+
+        // Clean up: cancel the pipeline and wait for it to finish.
+        cancel_token.cancel();
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), pipeline_handle)
+            .await
+            .expect("pipeline must finish after cancel");
+    }
+
+    /// FTS search must also work concurrently with indexing.
+    #[tokio::test]
+    async fn fts_search_completes_while_pipeline_lock_held() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
+        let domain = "admin/concurrent_fts";
+        let branch = "main";
+
+        // Seed: insert a doc with searchable text.
+        let row = make_row("doc/a", "the king is in the castle", vec![0.1; 8]);
+        let _v0 = store
+            .io_upsert_chunks(domain, branch, "doc/a", std::slice::from_ref(&row))
+            .await
+            .expect("seed upsert");
+
+        // Create the FTS inverted index BEFORE tagging so the tagged
+        // version includes the index.
+        store
+            .io_ensure_fts_index_created(domain, branch)
+            .await
+            .expect("FTS index creation");
+
+        // Now tag the version that includes the FTS index.
+        // Re-read the head version since FTS index creation may have advanced it.
+        let v_after_fts = {
+            let ds_arc = store.io_open_dataset(domain, branch).await.expect("open dataset");
+            let ds = ds_arc.read().await;
+            ds.version().version
+        };
+        store.io_tag_commit(domain, branch, "c0", v_after_fts).await.expect("tag c0");
+        store.update_last_indexed(domain, branch, "c0", v_after_fts).await;
+
+        // Acquire the pipeline lock — simulating an in-flight indexing task.
+        let _pipeline_guard = store.acquire_pipeline_lock(domain, branch).await;
+
+        // FTS search while pipeline lock is held.
+        let query = SearchQuery {
+            query_embedding: vec![],
+            query_text: "king".to_owned(),
+            mode: SearchMode::Fts,
+            start: 0,
+            count: 10,
+            doc_type_filter: vec![],
+            doc_id_filter: vec![],
+            snippet: true,
+        };
+
+        let hits = tokio::time::timeout(
+            Duration::from_secs(5),
+            store.io_search(domain, branch, "c0", &query),
+        )
+        .await
+        .expect("FTS search must not block while pipeline lock is held")
+        .expect("FTS search must succeed");
+
+        assert!(!hits.is_empty(), "FTS search must return hits");
+        assert_eq!(hits[0].doc_id, "doc/a", "FTS hit should be doc/a");
+
+        drop(_pipeline_guard);
+    }
+
+    /// Search must return results when the latest indexed commit has indices.
+    /// This verifies that io_search on a properly indexed commit returns results,
+    /// which is the core requirement for parallel search and indexing.
+    #[tokio::test]
+    async fn search_returns_results_when_snapshot_lacks_indices() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
+        let domain = "admin/index_fallback";
+        let branch = "main";
+
+        // Seed: insert a doc.
+        let row = make_row("doc/a", "the king is in the castle", vec![0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let _v0 = store
+            .io_upsert_chunks(domain, branch, "doc/a", std::slice::from_ref(&row))
+            .await
+            .expect("seed upsert");
+
+        // Create the FTS index BEFORE tagging so the tagged version includes it.
+        store
+            .io_ensure_fts_index_created(domain, branch)
+            .await
+            .expect("FTS index creation");
+
+        // Tag at the version that includes the FTS index.
+        let v_after_fts = {
+            let ds_arc = store.io_open_dataset(domain, branch).await.expect("open dataset");
+            let ds = ds_arc.read().await;
+            ds.version().version
+        };
+        store.io_tag_commit(domain, branch, "c0", v_after_fts).await.expect("tag c0");
+        store.update_last_indexed(domain, branch, "c0", v_after_fts).await;
+
+        // Add more data after tagging (simulates pipeline advancing the head).
+        let row2 = make_row("doc/b", "queen of hearts", vec![0.1, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        store
+            .io_upsert_chunks(domain, branch, "doc/b", std::slice::from_ref(&row2))
+            .await
+            .expect("upsert b");
+
+        // Search FTS on the tagged commit c0. Since c0 has the FTS index,
+        // the search should return results quickly.
+        let query = SearchQuery {
+            query_embedding: vec![],
+            query_text: "king".to_owned(),
+            mode: SearchMode::Fts,
+            start: 0,
+            count: 10,
+            doc_type_filter: vec![],
+            doc_id_filter: vec![],
+            snippet: true,
+        };
+
+        let hits = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.io_search(domain, branch, "c0", &query),
+        )
+        .await
+        .expect("FTS search must not hang when indices are present")
+        .expect("FTS search must succeed");
+
+        assert!(
+            !hits.is_empty(),
+            "FTS search must return results when indices are present"
+        );
+        assert_eq!(hits[0].doc_id, "doc/a", "FTS hit should be doc/a");
+    }
+
+    /// Vector search must return results when the latest indexed commit has
+    /// the IVF vector index. This verifies that vector search works on a
+    /// properly indexed commit, which is the core requirement for parallel
+    /// search and indexing.
+    #[tokio::test]
+    async fn vector_search_returns_results_when_snapshot_lacks_indices() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
+        let domain = "admin/vector_fallback";
+        let branch = "main";
+
+        // Seed: insert enough docs to meet IVF minimum training threshold.
+        let row = make_row("doc/a", "king of the hill", vec![0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let _v0 = store
+            .io_upsert_chunks(domain, branch, "doc/a", std::slice::from_ref(&row))
+            .await
+            .expect("seed upsert");
+
+        for i in 0..300 {
+            let emb = vec![0.1 * (i as f32 / 300.0), 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            let r = make_row(&format!("doc/b{}", i), &format!("doc number {}", i), emb);
+            store
+                .io_upsert_chunks(domain, branch, &format!("doc/b{}", i), std::slice::from_ref(&r))
+                .await
+                .expect("upsert");
+        }
+
+        // Create vector index on the current head (enough rows now).
+        {
+            let ds_arc = store.io_open_dataset(domain, branch).await.expect("open dataset");
+            let mut ds = ds_arc.write().await;
+            crate::store::vector_index::io_ensure_vector_index(&mut ds, store.vector_index_config(), false)
+                .await
+                .expect("vector index creation");
+        }
+
+        // Tag at the version that includes the vector index.
+        let v_after_vec = {
+            let ds_arc = store.io_open_dataset(domain, branch).await.expect("open dataset");
+            let ds = ds_arc.read().await;
+            ds.version().version
+        };
+        store.io_tag_commit(domain, branch, "c0", v_after_vec).await.expect("tag c0");
+        store.update_last_indexed(domain, branch, "c0", v_after_vec).await;
+
+        // Add more data after tagging (simulates pipeline advancing the head).
+        let row2 = make_row("doc/c", "queen of hearts", vec![0.1, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        store
+            .io_upsert_chunks(domain, branch, "doc/c", std::slice::from_ref(&row2))
+            .await
+            .expect("upsert c");
+
+        // Vector search on the tagged commit c0 (has vector index).
+        let query = SearchQuery {
+            query_embedding: vec![0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            query_text: "king".to_owned(),
+            mode: SearchMode::Vector,
+            start: 0,
+            count: 10,
+            doc_type_filter: vec![],
+            doc_id_filter: vec![],
+            snippet: false,
+        };
+
+        let hits = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.io_search(domain, branch, "c0", &query),
+        )
+        .await
+        .expect("vector search must not hang when indices are present")
+        .expect("vector search must succeed");
+
+        assert!(
+            !hits.is_empty(),
+            "vector search must return results when indices are present"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_index_trigger {
+    use super::*;
+
+    #[test]
+    fn threshold_triggers_optimize_with_cascade() {
+        let action = should_optimize(30_001, 5);
+        assert_eq!(action, OptimizeAction::OptimizeWithCascade);
+    }
+
+    #[test]
+    fn fragment_guard_triggers_optimize_with_cascade() {
+        let action = should_optimize(1000, 31);
+        assert_eq!(action, OptimizeAction::OptimizeWithCascade);
+    }
+
+    #[test]
+    fn below_threshold_returns_none() {
+        let action = should_optimize(5000, 5);
+        assert_eq!(action, OptimizeAction::None);
+    }
+
+    #[test]
+    fn exact_threshold_returns_none() {
+        let action = should_optimize(30_000, 30);
+        assert_eq!(action, OptimizeAction::None);
+    }
+}
