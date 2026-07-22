@@ -1795,17 +1795,15 @@ impl SearchService {
         Ok(())
     }
 
-    /// Trigger data compaction for a domain's dataset on a given branch.
-    /// Merges small fragments (one per push) into fewer large fragments, reducing
-    /// the FD count for full-table scans at HEAD. Returns before/after fragment
-    /// counts.
+    /// Trigger data compaction and index cascade for a domain's dataset on a
+    /// given branch. Merges small data fragments (one per push) into fewer
+    /// large fragments, then runs the incremental cascade to consolidate
+    /// accumulated index deltas via exponential roll-up (base 3).
     ///
     /// INVARIANT (snapshot isolation): historical commit tags are NEVER repointed.
-    /// Each commit tag points to the version created by its own push — that
-    /// version has a bounded fragment count (typically 1-2 fragments from its
-    /// single write cycle), so searches at historical versions open a bounded
-    /// number of FDs regardless of total push count. Compaction benefits HEAD
-    /// only; historical tags do not suffer FD pressure.
+    /// Each commit tag points to the version created by its own push. Compaction
+    /// benefits HEAD only; historical tags retain their original fragments and
+    /// index state.
     ///
     /// Admin-only, idempotent: re-running on an already-compacted dataset is fast
     /// (the threshold check short-circuits if fragments <= 16).
@@ -1838,6 +1836,12 @@ impl SearchService {
         let fragments_before = ds.get_fragments().len();
         let version_before = ds.version().version;
 
+        // ── Step 1/3: Compact data fragments ────────────────────────────
+        eprintln!(
+            "[compaction] step 1/3: domain={} branch={} compacting data fragments (before={})",
+            domain_raw, branch, fragments_before
+        );
+
         crate::store::lance::io_compact_data(&mut ds, true)
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
@@ -1846,15 +1850,59 @@ impl SearchService {
         let compacted_version = ds.version().version;
 
         eprintln!(
-            "[compaction] domain={} branch={} version {}→{} fragments {}→{}",
-            domain_raw, branch, version_before, compacted_version, fragments_before, fragments_after
+            "[compaction] step 1/3: done, fragments {}→{}",
+            fragments_before, fragments_after
         );
 
-        // Refresh the cached handle so subsequent reads use the compacted data.
+        // Clean up old unreferenced fragments from data compaction.
+        if let Err(e) = self.store.io_cleanup_aggressive(&domain_str, branch).await {
+            eprintln!("[compaction] step 1/3: aggressive cleanup failed (soft): {}", e);
+        }
+
+        tokio::task::yield_now().await;
+
         self.store
             .io_refresh_cached_dataset(&domain_str, branch)
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        // ── Step 2/3: Merge index deltas via cascade ───────────────────
+        // Consolidates accumulated index deltas using exponential roll-up
+        // (base 3), reducing O(N) index probes to O(log₃(N)) at HEAD.
+        eprintln!(
+            "[compaction] step 2/3: domain={} branch={} running index cascade",
+            domain_raw, branch
+        );
+
+        let delta_count = self.store.io_get_delta_count(&domain_str, branch).await;
+        let (indices_before, indices_after) =
+            crate::store::lance::io_incremental_cascade(&mut ds, delta_count)
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        eprintln!(
+            "[compaction] step 2/3: done, indices {}→{}",
+            indices_before, indices_after
+        );
+
+        // ── Step 3/3: Final cleanup + refresh ──────────────────────────
+        if let Err(e) = self.store.io_cleanup_aggressive(&domain_str, branch).await {
+            eprintln!("[compaction] step 3/3: aggressive cleanup failed (soft): {}", e);
+        }
+
+        if let Err(e) = self.store.io_prune_empty_index_dirs(&domain_str) {
+            eprintln!("[compaction] step 3/3: prune empty dirs failed (soft): {}", e);
+        }
+
+        self.store
+            .io_refresh_cached_dataset(&domain_str, branch)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        eprintln!(
+            "[compaction] complete: domain={} branch={} version {}→{} fragments {}→{} indices {}→{}",
+            domain_raw, branch, version_before, compacted_version, fragments_before, fragments_after, indices_before, indices_after
+        );
 
         Ok(serde_json::json!({
             "domain": domain_raw,
@@ -1862,7 +1910,10 @@ impl SearchService {
             "fragments_before": fragments_before,
             "fragments_after": fragments_after,
             "compacted": fragments_before != fragments_after,
-            "compacted_version": compacted_version
+            "compacted_version": compacted_version,
+            "indices_before": indices_before,
+            "indices_after": indices_after,
+            "indices_merged": indices_before != indices_after,
         }))
     }
 
