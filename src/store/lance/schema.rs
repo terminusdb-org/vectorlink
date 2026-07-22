@@ -111,13 +111,18 @@ pub struct ChunkHit {
 /// the Lance dataset's native default branch.
 pub const MAIN_BRANCH: &str = "main";
 
+/// Reserved prefix for internal tdb-search branches. The `.-` namespace is
+/// reserved for internal use and must not be accepted from external requests
+/// (push, search, compact, etc.).
+pub const RESERVED_PREFIX: &str = ".-";
+
 /// Reserved prefix for rebuild branches used by delta-fork retagging during
 /// compaction. Each compaction creates a fresh branch named
-/// `__compact_rebuild_<epoch>` to avoid colliding with the previous
+/// `.-compact_rebuild_<epoch>` to avoid colliding with the previous
 /// compaction's branch (which still owns live tagged versions). After
 /// retagging, older epoch branches are deleted. If the process crashes,
 /// an unreferenced branch lingers until startup cleanup.
-pub const COMPACT_REBUILD_PREFIX: &str = "__compact_rebuild_";
+pub const COMPACT_REBUILD_PREFIX: &str = ".-compact_rebuild_";
 
 /// Generate a rebuild branch name with an epoch component.
 pub fn compact_rebuild_branch_name(epoch: u64) -> String {
@@ -127,6 +132,13 @@ pub fn compact_rebuild_branch_name(epoch: u64) -> String {
 /// Check whether a branch name belongs to the reserved rebuild namespace.
 pub fn is_compact_rebuild_branch(branch: &str) -> bool {
     branch.starts_with(COMPACT_REBUILD_PREFIX)
+}
+
+/// Check whether a branch name is in the reserved `.-` namespace.
+/// Branch names starting with `.-` are internal to tdb-search and must not
+/// be accepted from external requests.
+pub fn is_reserved_branch_name(branch: &str) -> bool {
+    branch.starts_with(RESERVED_PREFIX)
 }
 
 /// Hard upper bound on the number of indexed points (chunk vectors) the

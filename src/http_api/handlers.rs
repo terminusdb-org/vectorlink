@@ -339,6 +339,26 @@ fn validate_pagination(start: Option<i64>, count: Option<i64>) -> Result<(), Res
     validate_pagination_with(start, count, MAX_RESULT_COUNT)
 }
 
+/// Validate that a branch name is not a reserved internal compaction branch.
+/// Branch names starting with `.-compact_rebuild_` are internal to tdb-search
+/// (used by delta-fork retagging during compaction) and must not be accepted
+/// from external requests. Accepting them would allow a malicious user to
+/// create branches that collide with internal compaction branches, causing
+/// data loss during cleanup.
+#[allow(clippy::result_large_err)]
+fn validate_branch_name(branch: &str) -> Result<(), Response> {
+    if crate::store::lance::is_compact_rebuild_branch(branch) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "branch name '{}' is a reserved internal compaction branch and cannot be used externally",
+                branch
+            ),
+        ));
+    }
+    Ok(())
+}
+
 // ─────────────────────────── Handlers ─────────────────────────────────────
 
 async fn handle_last_indexed(
@@ -355,6 +375,9 @@ async fn handle_last_indexed(
         }
     };
     let branch = params.branch.unwrap_or_else(|| "main".to_owned());
+    if let Err(r) = validate_branch_name(&branch) {
+        return r;
+    }
 
     match state.service.last_indexed(&domain, &branch).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
@@ -377,6 +400,9 @@ async fn handle_push(
         }
     };
     let branch = params.branch.unwrap_or_else(|| "main".to_owned());
+    if let Err(r) = validate_branch_name(&branch) {
+        return r;
+    }
     let target_commit = match params.target_commit {
         Some(c) if !c.is_empty() => c,
         _ => {
@@ -774,6 +800,11 @@ async fn handle_search_get(
     };
     let commit_raw = params.commit.as_deref().unwrap_or("");
     let branch = params.branch.as_deref();
+    if let Some(b) = branch {
+        if let Err(r) = validate_branch_name(b) {
+            return r;
+        }
+    }
     let commit = match state.service.resolve_commit_or_branch(&domain, commit_raw, branch).await {
         Ok(c) => c,
         Err(e) => return service_error_to_response(e),
@@ -842,6 +873,11 @@ async fn handle_search_post(
     let domain = body.domain.or(params.domain).unwrap_or_default();
     let commit_raw = body.commit.or(params.commit).unwrap_or_default();
     let branch = body.branch.or(params.branch);
+    if let Some(ref b) = branch {
+        if let Err(r) = validate_branch_name(b) {
+            return r;
+        }
+    }
     let q = body.q.or(params.q).unwrap_or_default();
     let mode = body.mode.or(params.mode);
     let start = body.start.or(params.start);
@@ -961,6 +997,11 @@ async fn handle_similar(
     };
     let commit_raw = params.commit.as_deref().unwrap_or("");
     let branch = params.branch.as_deref();
+    if let Some(b) = branch {
+        if let Err(r) = validate_branch_name(b) {
+            return r;
+        }
+    }
     let commit = match state.service.resolve_commit_or_branch(&domain, commit_raw, branch).await {
         Ok(c) => c,
         Err(e) => return service_error_to_response(e),
@@ -1024,6 +1065,11 @@ async fn handle_similar_post(
     let domain = body.domain.or(params.domain).unwrap_or_default();
     let commit_raw = body.commit.or(params.commit).unwrap_or_default();
     let branch = body.branch.or(params.branch);
+    if let Some(ref b) = branch {
+        if let Err(r) = validate_branch_name(b) {
+            return r;
+        }
+    }
     let id = body.id.or(params.id).unwrap_or_default();
     let start = body.start.or(params.start);
     let count = body.count.or(params.count);
@@ -1132,6 +1178,11 @@ async fn handle_duplicates(
     };
     let commit_raw = params.commit.as_deref().unwrap_or("");
     let branch = params.branch.as_deref();
+    if let Some(b) = branch {
+        if let Err(r) = validate_branch_name(b) {
+            return r;
+        }
+    }
     let commit = match state.service.resolve_commit_or_branch(&domain, commit_raw, branch).await {
         Ok(c) => c,
         Err(e) => return service_error_to_response(e),
@@ -1249,6 +1300,11 @@ async fn handle_embeddings(
 
     let commit_raw = params.commit.as_deref().unwrap_or("");
     let branch = params.branch.as_deref();
+    if let Some(b) = branch {
+        if let Err(r) = validate_branch_name(b) {
+            return r;
+        }
+    }
     let commit = match state.service.resolve_commit_or_branch(&params.domain, commit_raw, branch).await {
         Ok(c) => c,
         Err(e) => return service_error_to_response(e),
@@ -1422,6 +1478,11 @@ async fn handle_embeddings_post(
 
     let commit_raw = params.commit.as_deref().unwrap_or("");
     let branch = params.branch.as_deref();
+    if let Some(b) = branch {
+        if let Err(r) = validate_branch_name(b) {
+            return r;
+        }
+    }
     let commit = match state.service.resolve_commit_or_branch(&params.domain, commit_raw, branch).await {
         Ok(c) => c,
         Err(e) => return service_error_to_response(e),
@@ -1618,6 +1679,9 @@ async fn handle_delete_branch_index(
             );
         }
     };
+    if let Err(r) = validate_branch_name(&branch) {
+        return r;
+    }
 
     match state.service.delete_branch_index(&domain, &branch).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1789,6 +1853,9 @@ async fn handle_compact(
         }
     };
     let branch = params.branch.unwrap_or_else(|| "main".to_owned());
+    if let Err(r) = validate_branch_name(&branch) {
+        return r;
+    }
 
     match state.service.compact_domain(&domain, &branch).await {
         Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
@@ -1823,6 +1890,11 @@ async fn handle_suggest(
     };
     let commit_raw = params.commit.as_deref().unwrap_or("");
     let branch = params.branch.as_deref();
+    if let Some(b) = branch {
+        if let Err(r) = validate_branch_name(b) {
+            return r;
+        }
+    }
     let commit = match state.service.resolve_commit_or_branch(&domain, commit_raw, branch).await {
         Ok(c) => c,
         Err(e) => return service_error_to_response(e),
@@ -2117,5 +2189,43 @@ mod tests {
         let op: Operation = serde_json::from_str(remaining).unwrap();
         assert!(matches!(op, Operation::Inserted { .. }));
         buf.clear();
+    }
+
+    // ─────────────────── Reserved branch name validation ───────────────────
+
+    #[test]
+    fn validate_branch_name_rejects_compact_rebuild_prefix() {
+        // A user must not be able to push to or search on a .-compact_rebuild_
+        // branch. If allowed, the branch would collide with internal compaction
+        // branches and could be silently deleted by startup or post-compaction
+        // cleanup (io_cleanup_compaction_branches deletes unreferenced
+        // .-compact_rebuild_* branches).
+        let result = validate_branch_name(".-compact_rebuild_1234567890");
+        assert!(result.is_err(), "reserved .-compact_rebuild_ prefix must be rejected");
+        assert_eq!(result.unwrap_err().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_branch_name_accepts_other_dot_dash_prefixes() {
+        // Only .-compact_rebuild_ is reserved, not the entire .- namespace.
+        // Other .- prefixed branch names are allowed from external requests.
+        assert!(validate_branch_name(".-anything").is_ok());
+        assert!(validate_branch_name(".-my-branch").is_ok());
+        assert!(validate_branch_name(".-").is_ok());
+    }
+
+    #[test]
+    fn validate_branch_name_accepts_normal_branch_names() {
+        assert!(validate_branch_name("main").is_ok());
+        assert!(validate_branch_name("feature/foo").is_ok());
+        assert!(validate_branch_name("dev").is_ok());
+        assert!(validate_branch_name("branch_with_underscores").is_ok());
+    }
+
+    #[test]
+    fn validate_branch_name_accepts_double_underscore_prefix() {
+        // The old __ prefix is NOT reserved — only .-compact_rebuild_ is.
+        assert!(validate_branch_name("__compact_rebuild_123").is_ok());
+        assert!(validate_branch_name("__my_branch").is_ok());
     }
 }

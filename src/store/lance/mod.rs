@@ -33,6 +33,7 @@ pub use self::schema::{
     ResolveNeighbourMaps, SearchQuery, SuggestHit, SuggestQuery, SuggestResult,
     DEFAULT_DUPLICATE_MAX_PAIRS, DEFAULT_DUPLICATE_MAX_POINTS, MAIN_BRANCH,
     COMPACT_REBUILD_PREFIX, compact_rebuild_branch_name, is_compact_rebuild_branch,
+    is_reserved_branch_name,
 };
 pub use self::dedup::{dedup_chunks_to_documents, pairs_from_neighbours};
 pub use self::index::{io_compact_data, io_ensure_fts_index_on_dataset, io_merge_indices};

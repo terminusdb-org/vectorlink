@@ -104,7 +104,7 @@ impl LanceStore {
         inflight.remove(&key);
     }
 
-    /// Scan all on-disk datasets for stale `__compact_rebuild_*` branches left
+    /// Scan all on-disk datasets for stale `.-compact_rebuild_*` branches left
     /// behind by a crashed compaction. A rebuild branch is stale if no commit
     /// tag references it (the crash happened during Phase 1, before retagging
     /// moved tags onto the branch). Branches that ARE referenced by commit tags
@@ -793,7 +793,7 @@ impl LanceStore {
     /// commits to their new indexed versions on the rebuild branch handle.
     /// Boundary commits keep their original versions (no retagging).
     ///
-    /// Uses epoch-based branch names (`__compact_rebuild_<epoch>`) so each
+    /// Uses epoch-based branch names (`.-compact_rebuild_<epoch>`) so each
     /// compaction creates a fresh branch. After retagging, older epoch branches
     /// are deleted (no tags reference them). The latest epoch branch is kept
     /// because its versions back the retagged intermediate commit snapshots.
