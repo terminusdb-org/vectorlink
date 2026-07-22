@@ -260,9 +260,10 @@ verify: lint test
 	@echo "✓ verify passed"
 
 # pr: the full pre-PR gate. Mirrors TerminusDB's `pr` target. Must be green
-# before opening a PR. Runs lint + unit tests + integration tests (debug) +
-# production release build + docs. The release build proves the production
-# binary compiles cleanly but is NOT used for tests (debug binary is used).
+# before opening a PR. Runs lint (incl. clippy -D warnings) + unit tests +
+# integration tests (debug) + production release build + docs. The release
+# build proves the production binary compiles cleanly but is NOT used for
+# tests (debug binary is used).
 .PHONY: pr
 pr: lint test test-integration build-release docs
 	@echo "✓ PR gate passed — review $(DOCS_OUT), then commit (GPG-signed)"
