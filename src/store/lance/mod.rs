@@ -30,9 +30,37 @@ pub use self::schema::{
     ChunkHit, ChunkRow, DistanceKind, DuplicateScope, NeighbourObservation,
     ResolveNeighbourMaps, SearchQuery, SuggestHit, SuggestQuery, SuggestResult,
     DEFAULT_DUPLICATE_MAX_PAIRS, DEFAULT_DUPLICATE_MAX_POINTS, MAIN_BRANCH,
+    COMPACT_REBUILD_PREFIX, compact_rebuild_branch_name, is_compact_rebuild_branch,
 };
 pub use self::dedup::{dedup_chunks_to_documents, pairs_from_neighbours};
 pub use self::index::{io_compact_data, io_ensure_fts_index_on_dataset};
+
+/// Cleanup mode controls how aggressive version cleanup interacts with
+/// rebuild-branch index files. The default (`CurrentCode`) preserves the
+/// existing FIX-B behaviour (hiding `_indices/` during cleanup when rebuild
+/// branches exist). `TargetNoPatch` removes the hiding and relies on
+/// `clean_referenced_branches(false)` to protect rebuild-branch files.
+/// `TargetWithPatch` is identical to `TargetNoPatch` — a LanceDB patch was
+/// originally planned but found to be incorrect (all-branch tag protection
+/// caused version number collisions between main and rebuild branches).
+/// The enum variant is retained for future experimentation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CleanupMode {
+    /// Mode 0: current behaviour — hide `_indices/` when rebuild branches exist.
+    #[default]
+    CurrentCode,
+    /// Mode A: remove hiding, set `clean_referenced_branches(false)`.
+    TargetNoPatch,
+    /// Mode B: identical to Mode A (no LanceDB patch needed).
+    TargetWithPatch,
+}
+
+impl CleanupMode {
+    /// Returns true if the FIX-B `_indices/` hiding should be active.
+    pub fn hide_indices(self) -> bool {
+        matches!(self, CleanupMode::CurrentCode)
+    }
 
 /// A single embedding record for streaming. Contains the doc_id, the document
 /// embedding, and optionally the clustering embedding (when store_clustering
@@ -165,6 +193,16 @@ pub struct LanceStore {
     pub(super) lance_index_cache_capacity: usize,
     /// Configured Lance metadata cache capacity (for stats reporting).
     pub(super) lance_metadata_cache_capacity: usize,
+    /// Per-(domain, branch) count of index deltas created since last compaction.
+    /// Incremented after each push that creates a delta via `optimize_indices(append())`.
+    /// Used by `io_incremental_cascade` to determine how many `merge(3)` calls
+    /// are needed to maintain the base-3 hierarchy. Reset to 0 on compaction
+    /// (when indices are dropped and recreated).
+    pub(super) index_delta_counts: RwLock<HashMap<BranchKey, u64>>,
+    /// Cleanup mode controlling how version cleanup interacts with
+    /// rebuild-branch index files. Default is `CurrentCode` (existing
+    /// FIX-B behaviour). Can be changed at runtime for testing.
+    pub(super) cleanup_mode: std::sync::atomic::AtomicU8,
 }
 
 impl LanceStore {
@@ -199,6 +237,8 @@ impl LanceStore {
             pipeline_active_tasks: std::sync::atomic::AtomicU64::new(0),
             lance_index_cache_capacity: lance_index_cache_bytes,
             lance_metadata_cache_capacity: lance_metadata_cache_bytes,
+            index_delta_counts: RwLock::new(HashMap::new()),
+            cleanup_mode: std::sync::atomic::AtomicU8::new(CleanupMode::CurrentCode as u8),
         }
     }
 
@@ -550,6 +590,49 @@ impl LanceStore {
         Ok(())
     }
 
+    /// Create a new Lance branch forked from a commit tag. Uses LanceDB's
+    /// `Ref::Tag` to resolve the tag's owning branch and version, so this
+    /// works correctly even when the tag lives on a rebuild branch (after
+    /// delta-fork retagging). This is the branch-aware counterpart to
+    /// `io_create_branch`, which only works for main-branch versions.
+    pub async fn io_create_branch_from_tag(
+        &self,
+        domain: &str,
+        branch: &str,
+        commit: &str,
+    ) -> Result<u64, StoreError> {
+        if branch == MAIN_BRANCH {
+            return Err(StoreError::Internal(
+                "cannot create the default 'main' branch — it always exists".to_owned(),
+            ));
+        }
+
+        let path = self.dataset_path(domain);
+        if !path.exists() {
+            return Err(StoreError::Internal(format!(
+                "cannot branch domain '{}': dataset does not exist (index the parent first)",
+                domain
+            )));
+        }
+
+        let tag = crate::layeridx::encode_commit_tag(commit);
+        let uri = path.to_string_lossy().to_string();
+        let mut ds = self.io_open_fresh(&uri).await?;
+
+        use lance::dataset::refs::Ref;
+        let created = ds
+            .create_branch(branch, Ref::Tag(tag.clone()), None)
+            .await
+            .map_err(|e| {
+                StoreError::Internal(format!(
+                    "create_branch '{}' from tag '{}' failed: {}",
+                    branch, tag, e
+                ))
+            })?;
+
+        Ok(created.version().version)
+    }
+
     /// Collect the set of physical data-file paths referenced by a branch's
     /// current head (layout A). Used to PROVE block reuse by path identity
     /// (P3-BR-1): a branch forked from a parent shares the parent's fragment
@@ -659,6 +742,9 @@ impl LanceStore {
     /// many commits. Retains the last 3 versions (for rollback safety) plus
     /// all tagged versions. Uses delete_unverified=true since we know no other
     /// operations are in progress (pipeline lock is held).
+    ///
+    /// **FIX-B**: Hides `_indices/` during cleanup to prevent Lance from
+    /// deleting index files referenced by rebuild-branch tags.
     pub async fn io_cleanup_old_versions(
         &self,
         domain: &str,
@@ -671,18 +757,131 @@ impl LanceStore {
         let uri = path.to_string_lossy().to_string();
         let ds = self.io_open_fresh(&uri).await?;
 
-        let policy = CleanupPolicyBuilder::default()
+        // FIX-B: Hide _indices/ during cleanup, but ONLY when rebuild
+        // branches exist AND we're in CurrentCode mode. In TargetNoPatch/
+        // TargetWithPatch modes, we skip hiding and instead set
+        // clean_referenced_branches(false) to protect rebuild-branch files.
+        let mode = self.cleanup_mode();
+        let has_rebuild_branches = self
+            .io_list_branches(domain)
+            .await
+            .map(|branches| branches.iter().any(|b| is_compact_rebuild_branch(b)))
+            .unwrap_or(false);
+
+        let indices_dir = path.join("_indices");
+        let indices_backup = path.join("_indices_backup_fixb");
+        let hid_indices = if mode.hide_indices() && has_rebuild_branches && indices_dir.exists() {
+            std::fs::rename(&indices_dir, &indices_backup)
+                .map_err(|e| StoreError::Internal(format!(
+                    "cleanup old: failed to move _indices to backup: {}", e
+                )))?;
+            true
+        } else {
+            false
+        };
+
+        let mut policy_builder = CleanupPolicyBuilder::default()
             .retain_n_versions(&ds, 3).await
             .map_err(|e| StoreError::Internal(format!("cleanup policy build failed: {}", e)))?
             .delete_unverified(true)
-            .error_if_tagged_old_versions(false)
-            .build();
+            .error_if_tagged_old_versions(false);
 
-        ds.cleanup_with_policy(policy)
-            .await
+        if mode.disable_clean_referenced_branches() {
+            policy_builder = policy_builder.clean_referenced_branches(false);
+        }
+
+        let policy = policy_builder.build();
+
+        let cleanup_result = ds.cleanup_with_policy(policy).await;
+
+        // Restore _indices/.
+        if hid_indices {
+            if indices_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(&indices_dir) {
+                    for entry in entries.flatten() {
+                        let entry_path = entry.path();
+                        let dest = indices_backup.join(entry.file_name());
+                        let _ = std::fs::rename(&entry_path, &dest);
+                    }
+                }
+                let _ = std::fs::remove_dir(&indices_dir);
+            }
+            std::fs::rename(&indices_backup, &indices_dir)
+                .map_err(|e| StoreError::Internal(format!(
+                    "cleanup old: failed to restore _indices from backup: {}", e
+                )))?;
+        }
+
+        cleanup_result
             .map_err(|e| StoreError::Internal(format!("version cleanup failed: {}", e)))?;
 
         Ok(())
+    }
+
+    /// Remove empty index UUID directories left behind by LanceDB's
+    /// `cleanup_with_policy`. LanceDB deletes index files inside
+    /// `_indices/<uuid>/` but leaves the empty `<uuid>` directories.
+    /// Over many push/compaction cycles, hundreds of empty directories
+    /// accumulate. This function scans `_indices/` and removes any
+    /// directory that contains no files (recursively empty).
+    ///
+    /// Returns the count of directories removed.
+    pub fn io_prune_empty_index_dirs(&self, domain: &str) -> Result<usize, StoreError> {
+        let path = self.dataset_path(domain);
+        let indices_dir = path.join("_indices");
+
+        if !indices_dir.exists() {
+            return Ok(0);
+        }
+
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(&indices_dir)
+            .map_err(|e| StoreError::Internal(format!("prune: read_dir failed: {}", e)))?
+        {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("[cleanup] prune: skipping unreadable entry: {}", e);
+                    continue;
+                }
+            };
+
+            let dir_path = entry.path();
+            if !dir_path.is_dir() {
+                continue;
+            }
+
+            // Check if the directory contains any files (recursively).
+            let has_files = std::fs::read_dir(&dir_path)
+                .map(|mut it| it.any(|e| e.map(|e| e.path().is_file()).unwrap_or(false)))
+                .unwrap_or(false);
+
+            // Also check subdirectories for files (LanceDB index dirs
+            // may have nested structure like <uuid>/0/index.lance).
+            let has_files_recursive = if !has_files {
+                dir_has_files_recursive(&dir_path)
+            } else {
+                true
+            };
+
+            if !has_files_recursive {
+                match std::fs::remove_dir_all(&dir_path) {
+                    Ok(_) => removed += 1,
+                    Err(e) => {
+                        eprintln!(
+                            "[cleanup] prune: failed to remove empty dir {:?}: {}",
+                            dir_path, e
+                        );
+                    }
+                }
+            }
+        }
+
+        if removed > 0 {
+            eprintln!("[cleanup] pruned {} empty index directories", removed);
+        }
+
+        Ok(removed)
     }
 
     /// Create an empty RecordBatch with the chunk schema (for dataset initialization).
@@ -831,4 +1030,22 @@ pub fn decode_domain_path(encoded: &str) -> Option<String> {
             .collect::<Vec<_>>()
             .join("/"),
     )
+}
+
+/// Recursively check if a directory contains any files.
+/// Returns true if at least one file is found at any depth.
+fn dir_has_files_recursive(path: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_file() {
+            return true;
+        }
+        if p.is_dir() && dir_has_files_recursive(&p) {
+            return true;
+        }
+    }
+    false
 }

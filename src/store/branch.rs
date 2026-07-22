@@ -54,23 +54,12 @@ pub async fn io_ensure_branch_forked(
         return Ok(BranchOutcome::AlreadyExists);
     }
 
-    // Branch does not exist — resolve the parent commit to a version and fork.
-    let parent_version = store
-        .io_resolve_commit(domain, MAIN_BRANCH, parent_commit)
-        .await?
-        .ok_or_else(|| {
-            StoreError::Internal(format!(
-                "cannot branch '{}' in domain '{}': parent commit '{}' is not indexed \
-                 (no tagged version to fork from)",
-                branch, domain, parent_commit
-            ))
-        })?;
-
-    // Create under the lock. Treat an "already exists" race as success
-    // (idempotent #4): even though we are lock-holder, a branch could have been
-    // created out-of-band; concurrent safety must not depend solely on our lock.
-    match store.io_create_branch(domain, branch, parent_version).await {
-        Ok(()) => Ok(BranchOutcome::Created { parent_version }),
+    // Branch does not exist — resolve the parent commit and fork.
+    // Use tag-based branch creation so that the fork works correctly
+    // even when the parent commit's tag lives on a rebuild branch
+    // (after delta-fork retagging).
+    match store.io_create_branch_from_tag(domain, branch, parent_commit).await {
+        Ok(parent_version) => Ok(BranchOutcome::Created { parent_version }),
         Err(e) if is_already_exists(&e) => Ok(BranchOutcome::AlreadyExists),
         Err(e) => Err(e),
     }
