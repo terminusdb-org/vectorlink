@@ -111,6 +111,24 @@ pub struct ChunkHit {
 /// the Lance dataset's native default branch.
 pub const MAIN_BRANCH: &str = "main";
 
+/// Reserved prefix for rebuild branches used by delta-fork retagging during
+/// compaction. Each compaction creates a fresh branch named
+/// `__compact_rebuild_<epoch>` to avoid colliding with the previous
+/// compaction's branch (which still owns live tagged versions). After
+/// retagging, older epoch branches are deleted. If the process crashes,
+/// an unreferenced branch lingers until startup cleanup.
+pub const COMPACT_REBUILD_PREFIX: &str = "__compact_rebuild_";
+
+/// Generate a rebuild branch name with an epoch component.
+pub fn compact_rebuild_branch_name(epoch: u64) -> String {
+    format!("{}{}", COMPACT_REBUILD_PREFIX, epoch)
+}
+
+/// Check whether a branch name belongs to the reserved rebuild namespace.
+pub fn is_compact_rebuild_branch(branch: &str) -> bool {
+    branch.starts_with(COMPACT_REBUILD_PREFIX)
+}
+
 /// Hard upper bound on the number of indexed points (chunk vectors) the
 /// near-duplicate scan will consider in a single snapshot. The scan issues ONE
 /// ANN `nearest(k=2)` query per point — O(n) cheap indexed queries, not O(n²) —

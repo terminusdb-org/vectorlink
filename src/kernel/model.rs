@@ -260,6 +260,11 @@ pub struct Statistics {
     /// being flat-scanned (correct but slower). Returns to 0 after
     /// `optimize_indices(append())` drains the queue.
     pub pending_index_fragments: u64,
+    /// Total rows (chunks) in fragments not yet covered by the vector ANN index.
+    /// Measures flat-scan cost in rows, complementing `pending_index_fragments`
+    /// which measures it in fragment count. Returns to 0 after
+    /// `optimize_indices(append())` drains the queue.
+    pub pending_index_documents: u64,
     /// Whether clustering embeddings are stored for this domain (domain-scoped only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store_clustering: Option<bool>,
