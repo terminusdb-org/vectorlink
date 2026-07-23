@@ -104,6 +104,44 @@ datasets["abt-buy-v2"] = {
   },
 };
 
+// ── E2E dataset (live TerminusDB data product) ──────────────────────────────
+// This entry targets the data product created by the E2E / load_to_terminusdb
+// pipeline. Unlike the bench's own datasets, the commit is fetched dynamically
+// from TerminusDB (not hardcoded). The domain matches the live indexed data.
+datasets["abt-buy-e2e"] = {
+  name: "abt-buy-e2e",
+  domain: "admin/abt_buy_e2e",
+  branch: "main",
+  commit: null, // fetched dynamically via ioFetchHeadCommit
+  iriBase: "terminusdb:///data",
+  download: datasets["abt-buy"].download,
+  dataDir: DATA_DIR,
+  sides: {
+    abt: {
+      side: "Abt",
+      docType: "Abt",
+      file: "Abt.csv",
+      encoding: DEFAULT_ENCODING,
+      idField: "id",
+      template: path.join(TEMPLATES_DIR, "abt.v2.hbs"),
+    },
+    buy: {
+      side: "Buy",
+      docType: "Buy",
+      file: "Buy.csv",
+      encoding: DEFAULT_ENCODING,
+      idField: "id",
+      template: path.join(TEMPLATES_DIR, "buy.v2.hbs"),
+    },
+  },
+  mapping: {
+    file: "abt_buy_perfectMapping.csv",
+    encoding: DEFAULT_ENCODING,
+    queryIdColumn: "idAbt",
+    corpusIdColumn: "idBuy",
+  },
+};
+
 function getDataset(key) {
   const ds = datasets[key];
   if (!ds) {

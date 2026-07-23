@@ -24,18 +24,18 @@ const { ioRenderSide } = require("./load-v2");
 const { idFromIri, isSide } = require("./iri");
 const { scoreV2 } = require("./score-v2");
 
-const ENGINE_URL = process.env.ENGINE_URL || "http://localhost:8081";
+const TERMINUSDB_URL = process.env.TERMINUSDB_URL || "http://localhost:7373";
 const ENGINE_CRED = process.env.ENGINE_CRED || "admin:root";
 const AUTH_HEADER = "Basic " + Buffer.from(ENGINE_CRED).toString("base64");
 
-// ── POST /resolve client ────────────────────────────────────────────────────
+// ── POST /api/plugin/search-resolve client ─────────────────────────────────
+// Calls the TerminusDB plugin which internally calls tdb-search /candidates
+// and runs the matching algorithm server-side.
 
-async function ioResolve({ domain, commit, setDocTypes, targetDocTypes,
+async function ioResolve({ domain, _commit, setDocTypes, targetDocTypes,
   setDocIds, targetDocIds, threshold, tauOneToOne, tauOneToMany,
-  tauManyToOne, k, ancestors }) {
+  tauManyToOne, k, _ancestors }) {
   const body = {
-    domain,
-    commit,
     set_doc_types: setDocTypes,
     set_doc_ids: setDocIds || [],
     target_doc_types: targetDocTypes,
@@ -43,17 +43,18 @@ async function ioResolve({ domain, commit, setDocTypes, targetDocTypes,
     threshold,
     tau_one_to_one: tauOneToOne,
     k,
-    ancestors: ancestors || [],
   };
-  // Only include optional tau if defined (null = disabled at the engine level).
   if (tauOneToMany !== undefined && tauOneToMany !== null) {
     body.tau_one_to_many = tauOneToMany;
   }
   if (tauManyToOne !== undefined && tauManyToOne !== null) {
     body.tau_many_to_one = tauManyToOne;
   }
-
-  const url = `${ENGINE_URL}/resolve`;
+  // The plugin endpoint is /api/plugin/search-resolve/<path>
+  // The path encodes the domain (org/db/local/branch/main).
+  // Domain and commit are resolved server-side by the plugin.
+  const path = domain;
+  const url = `${TERMINUSDB_URL}/api/plugin/search-resolve/${path}`;
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -64,7 +65,7 @@ async function ioResolve({ domain, commit, setDocTypes, targetDocTypes,
   });
   const text = await res.text();
   if (!res.ok) {
-    throw new Error(`POST /resolve -> HTTP ${res.status}: ${text.slice(0, 800)}`);
+    throw new Error(`POST /api/plugin/search-resolve -> HTTP ${res.status}: ${text.slice(0, 800)}`);
   }
   return JSON.parse(text);
 }
@@ -157,7 +158,7 @@ function shortDomain(domain) {
 
 async function ioFetchHeadCommit(domain) {
   // TerminusDB log API: GET /api/log/<org>/<db>/local/branch/main?count=1
-  const tdbUrl = process.env.TDB_URL || "http://localhost:6365";
+  const tdbUrl = process.env.TDB_URL || "http://localhost:7373";
   const tdbCred = process.env.TDB_CRED || "admin:root";
   const tdbAuth = "Basic " + Buffer.from(tdbCred).toString("base64");
   const dbPath = shortDomain(domain);
@@ -261,7 +262,7 @@ async function ioBenchResolve(config) {
     k: config.k,
   };
 
-  log("calling POST /resolve (single batch call)...");
+  log("calling POST /api/plugin/search-resolve (TerminusDB plugin)...");
   log(`  params: threshold=${config.threshold}, tau_1:1=${config.tauOneToOne}, ` +
       `tau_1:M=${config.tauOneToMany ?? "disabled"}, tau_M:1=${config.tauManyToOne ?? "disabled"}, k=${config.k}`);
 
@@ -269,7 +270,7 @@ async function ioBenchResolve(config) {
   const result = await ioResolve(resolveArgs);
   const benchMs = Number(process.hrtime.bigint() - benchStart) / 1e6;
 
-  log(`/resolve returned: matched=${result.matched.length}, set_only=${result.set_only.length}, target_only=${result.target_only.length}`);
+  log(`plugin returned: matched=${result.matched.length}, set_only=${result.set_only.length}, target_only=${result.target_only.length}`);
   log(`engine elapsed_ms=${result.stats.elapsed_ms}, bench end-to-end=${benchMs.toFixed(0)}ms`);
 
   // Map to scorer format (strip IRIs to raw ids).

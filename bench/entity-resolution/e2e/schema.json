@@ -2,7 +2,12 @@
   {
     "@type": "@context",
     "@base": "terminusdb:///data/",
-    "@schema": "terminusdb:///schema#"
+    "@schema": "terminusdb:///schema#",
+    "@metadata": {
+      "terminusdb": {
+        "options": ["store_clustering"]
+      }
+    }
   },
   {
     "@id": "Abt",
