@@ -1303,6 +1303,58 @@ impl LanceStore {
         Ok(best.map(|(commit, contents)| (commit, contents.version)))
     }
 
+    /// Count the number of tagged commits on a specific branch.
+    ///
+    /// Like `io_derive_last_indexed` but returns the count of tagged commits
+    /// filtered by branch, rather than the latest one. Used by the boundary-aware
+    /// indexing logic to determine the commit position (0-indexed) for deciding
+    /// whether to create indices at every 3rd commit.
+    ///
+    /// READ-ONLY: an absent dataset → 0 (never auto-creates — resurrection guard).
+    pub async fn io_count_branch_commits(
+        &self,
+        domain: &str,
+        branch: &str,
+    ) -> Result<usize, StoreError> {
+        let cached = match self.io_open_dataset_readonly(domain).await? {
+            Some(ds) => ds,
+            None => return Ok(0),
+        };
+        let ds = cached.read().await;
+        let tags = ds
+            .tags()
+            .list()
+            .await
+            .map_err(|e| StoreError::Internal(format!("tag list failed: {}", e)))?;
+        drop(ds);
+
+        let want_branch: Option<&str> = if branch == MAIN_BRANCH {
+            None
+        } else {
+            Some(branch)
+        };
+
+        let count = tags
+            .into_iter()
+            .filter_map(|(tag_name, contents)| {
+                layeridx::decode_commit_tag(&tag_name)
+                    .ok()
+                    .map(|_| contents)
+            })
+            .filter(|contents| {
+                if contents.branch.as_deref() == want_branch {
+                    true
+                } else if branch == MAIN_BRANCH {
+                    contents.branch.as_deref().is_some_and(is_compact_rebuild_branch)
+                } else {
+                    false
+                }
+            })
+            .count();
+
+        Ok(count)
+    }
+
     /// Get last-indexed for a (domain, branch) pair.
     ///
     /// DURABLE-FIRST (task-durable-index-state): the authority is the on-disk

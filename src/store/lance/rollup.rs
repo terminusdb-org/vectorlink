@@ -24,6 +24,13 @@ use lance_index::optimize::OptimizeOptions;
 
 use crate::kernel::error::StoreError;
 
+/// Determine whether a commit at the given 0-indexed position should trigger
+/// index creation. Indices are created at every 3rd commit: positions 2, 5, 8,
+/// 11, 14, ... (0-indexed). Non-indexed commits rely on KNN fallback for search.
+pub fn should_index_commit(commit_position: usize) -> bool {
+    (commit_position + 1).is_multiple_of(3)
+}
+
 /// Integer logarithm: floor(log_base(N)).
 /// Returns 0 when base > N.
 fn ilog(n: usize, base: usize) -> usize {
@@ -500,5 +507,28 @@ mod tests {
         assert_eq!(merges_needed(10), 0);
         assert_eq!(merges_needed(13), 0);
         assert_eq!(merges_needed(134), 0);
+    }
+
+    #[test]
+    fn should_index_commit_at_every_3rd() {
+        assert!(should_index_commit(2));
+        assert!(should_index_commit(5));
+        assert!(should_index_commit(8));
+        assert!(should_index_commit(11));
+        assert!(should_index_commit(14));
+        assert!(should_index_commit(17));
+        assert!(should_index_commit(20));
+    }
+
+    #[test]
+    fn should_index_commit_false_for_non_3rd() {
+        assert!(!should_index_commit(0));
+        assert!(!should_index_commit(1));
+        assert!(!should_index_commit(3));
+        assert!(!should_index_commit(4));
+        assert!(!should_index_commit(6));
+        assert!(!should_index_commit(7));
+        assert!(!should_index_commit(9));
+        assert!(!should_index_commit(10));
     }
 }

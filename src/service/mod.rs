@@ -1781,27 +1781,46 @@ impl SearchService {
         Ok(())
     }
 
-    /// Trigger data compaction and index cascade for a domain's dataset on a
-    /// given branch. Merges small data fragments (one per push) into fewer
-    /// large fragments, then runs the incremental cascade to consolidate
-    /// accumulated index deltas via exponential roll-up (base 3).
+    /// Trigger full compaction for a domain's dataset on a given branch.
+    ///
+    /// Drops all indices, compacts data fragments into fewer large fragments,
+    /// recreates indices from scratch, resets the delta count, runs the
+    /// incremental cascade, cleans up, and refreshes the cached handle.
     ///
     /// INVARIANT (snapshot isolation): historical commit tags are NEVER repointed.
     /// Each commit tag points to the version created by its own push. Compaction
     /// benefits HEAD only; historical tags retain their original fragments and
     /// index state.
     ///
-    /// Admin-only, idempotent: re-running on an already-compacted dataset is fast
-    /// (the threshold check short-circuits if fragments <= 16).
+    /// Admin-only, idempotent: re-running on an already-compacted dataset is fast.
     pub async fn compact_domain(
         &self,
         domain_raw: &str,
         branch: &str,
     ) -> Result<serde_json::Value, ServiceError> {
+        use lance::index::DatasetIndexExt;
+
         let rp =
             parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
         let domain = Domain::from_resource_path(&rp);
         let domain_str = domain.as_str().to_owned();
+
+        // Acquire the pipeline lock to prevent concurrent compaction or push
+        // operations on the same domain/branch. Without this, two simultaneous
+        // compact requests race on dataset mutation and produce 500 errors.
+        let _pipeline_guard = match self
+            .store
+            .try_acquire_pipeline_lock(&domain_str, branch)
+            .await
+        {
+            Some(g) => g,
+            None => {
+                return Err(ServiceError::Conflict(format!(
+                    "compaction or push already in progress for {}/{}, retry later",
+                    domain_str, branch
+                )));
+            }
+        };
 
         let ds = self
             .store
@@ -1821,10 +1840,30 @@ impl SearchService {
 
         let fragments_before = ds.get_fragments().len();
         let version_before = ds.version().version;
+        let store_clustering = self.store.domain_settings.store_clustering(&domain_str).await;
+        let vector_config = self.store.vector_index_config().clone();
 
-        // ── Step 1/3: Compact data fragments ────────────────────────────
+        // ── Step 1/5: Drop all existing indices ────────────────────────────
         eprintln!(
-            "[compaction] step 1/3: domain={} branch={} compacting data fragments (before={})",
+            "[compaction] step 1/5: domain={} branch={} dropping all indices",
+            domain_raw, branch
+        );
+
+        let indices = ds
+            .load_indices()
+            .await
+            .map_err(|e| ServiceError::Internal(format!("load_indices failed: {}", e)))?;
+        let index_names: Vec<String> = indices.iter().map(|idx| idx.name.clone()).collect();
+        let indices_before = index_names.len();
+        for name in &index_names {
+            ds.drop_index(name)
+                .await
+                .map_err(|e| ServiceError::Internal(format!("drop_index {} failed: {}", name, e)))?;
+        }
+
+        // ── Step 2/5: Compact data fragments ───────────────────────────────
+        eprintln!(
+            "[compaction] step 2/5: domain={} branch={} compacting data fragments (before={})",
             domain_raw, branch, fragments_before
         );
 
@@ -1836,13 +1875,13 @@ impl SearchService {
         let compacted_version = ds.version().version;
 
         eprintln!(
-            "[compaction] step 1/3: done, fragments {}→{}",
+            "[compaction] step 2/5: done, fragments {}→{}",
             fragments_before, fragments_after
         );
 
         // Clean up old unreferenced fragments from data compaction.
         if let Err(e) = self.store.io_cleanup_aggressive(&domain_str, branch).await {
-            eprintln!("[compaction] step 1/3: aggressive cleanup failed (soft): {}", e);
+            eprintln!("[compaction] step 2/5: aggressive cleanup failed (soft): {}", e);
         }
 
         tokio::task::yield_now().await;
@@ -1852,32 +1891,57 @@ impl SearchService {
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
-        // ── Step 2/3: Merge index deltas via cascade ───────────────────
-        // Consolidates accumulated index deltas using exponential roll-up
-        // (base 3), reducing O(N) index probes to O(log₃(N)) at HEAD.
+        // ── Step 3/5: Recreate indices from scratch ────────────────────────
         eprintln!(
-            "[compaction] step 2/3: domain={} branch={} running index cascade",
+            "[compaction] step 3/5: domain={} branch={} recreating indices",
             domain_raw, branch
         );
 
+        crate::store::lance::io_ensure_fts_index_on_dataset(&mut ds)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        crate::store::vector_index::io_ensure_vector_index(&mut ds, &vector_config, false)
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+        if store_clustering {
+            crate::store::vector_index::io_ensure_clustering_vector_index(&mut ds, &vector_config, false)
+                .await
+                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+        }
+
+        let indices_after = ds
+            .load_indices()
+            .await
+            .map_err(|e| ServiceError::Internal(format!("load_indices after recreate failed: {}", e)))?
+            .len();
+
+        // ── Step 4/5: Reset delta count and run cascade ────────────────────
+        eprintln!(
+            "[compaction] step 4/5: domain={} branch={} resetting delta count + cascade",
+            domain_raw, branch
+        );
+
+        self.store.io_reset_delta_count(&domain_str, branch).await;
         let delta_count = self.store.io_get_delta_count(&domain_str, branch).await;
-        let (indices_before, indices_after) =
+        let (cascade_before, cascade_after) =
             crate::store::lance::io_incremental_cascade(&mut ds, delta_count)
                 .await
                 .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         eprintln!(
-            "[compaction] step 2/3: done, indices {}→{}",
-            indices_before, indices_after
+            "[compaction] step 4/5: done, cascade indices {}→{}",
+            cascade_before, cascade_after
         );
 
-        // ── Step 3/3: Final cleanup + refresh ──────────────────────────
+        // ── Step 5/5: Final cleanup + refresh ──────────────────────────────
         if let Err(e) = self.store.io_cleanup_aggressive(&domain_str, branch).await {
-            eprintln!("[compaction] step 3/3: aggressive cleanup failed (soft): {}", e);
+            eprintln!("[compaction] step 5/5: aggressive cleanup failed (soft): {}", e);
         }
 
         if let Err(e) = self.store.io_prune_empty_index_dirs(&domain_str) {
-            eprintln!("[compaction] step 3/3: prune empty dirs failed (soft): {}", e);
+            eprintln!("[compaction] step 5/5: prune empty dirs failed (soft): {}", e);
         }
 
         self.store
@@ -1899,7 +1963,7 @@ impl SearchService {
             "compacted_version": compacted_version,
             "indices_before": indices_before,
             "indices_after": indices_after,
-            "indices_merged": indices_before != indices_after,
+            "indices_recreated": true,
         }))
     }
 
@@ -2354,23 +2418,59 @@ async fn io_run_index_pipeline(
             .await
             .map_err(|e| format!("batch delete-append failed: {}", e))?;
 
-        // Optimize indices on an UNCACHED handle (Fix #2: doesn't block searches).
-        // FTS + vector ANN are built incrementally via optimize_indices(append()) — O(delta).
-        // This runs BEFORE tagging so the tagged version has full index coverage.
-        //
-        // Optimization is a SOFT failure: if it fails (e.g. stale data file reference,
-        // LanceDB internal path issue), the data is already written and searchable
-        // via flat scan. We log the error and tag at last_version so the commit is
-        // available for search. The index will be built on a future optimize cycle.
-        let indexed_version = match io_optimize_on_uncached_handle(
-            ctx.store, ctx.domain, ctx.branch, store_clustering
-        ).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[pipeline] index optimization failed (soft): {} — tagging at data version {}", e, last_version);
-                None
+        // Boundary-aware indexing: create indices only at every 3rd commit
+        // (positions 2, 5, 8, ... 0-indexed). Non-indexed commits rely on
+        // KNN fallback for search (at most 2 commits delta).
+        let commit_position = ctx.store.io_count_branch_commits(ctx.domain, ctx.branch).await.unwrap_or(0);
+        let action = should_create_index(commit_position);
+
+        let mut indexed_version: Option<u64> = None;
+
+        if action == IndexAction::Create {
+            let vector_config = ctx.store.vector_index_config().clone();
+
+            let ds_opt = ctx.store.io_open_dataset_uncached(ctx.domain, ctx.branch).await;
+            if let Ok(Some(mut ds_opt)) = ds_opt {
+                crate::store::lance::io_ensure_fts_index_on_dataset(&mut ds_opt)
+                    .await
+                    .map_err(|e| format!("FTS index creation failed: {}", e))?;
+
+                crate::store::vector_index::io_ensure_vector_index(&mut ds_opt, &vector_config, false)
+                    .await
+                    .map_err(|e| format!("vector index creation failed: {}", e))?;
+
+                if store_clustering {
+                    crate::store::vector_index::io_ensure_clustering_vector_index(&mut ds_opt, &vector_config, false)
+                        .await
+                        .map_err(|e| format!("clustering vector index creation failed: {}", e))?;
+                }
+
+                indexed_version = Some(ds_opt.version().version);
+
+                ctx.store.io_increment_delta_count(ctx.domain, ctx.branch).await;
+                let delta_count = ctx.store.io_get_delta_count(ctx.domain, ctx.branch).await;
+
+                let (idx_before, idx_after) =
+                    crate::store::lance::io_incremental_cascade(&mut ds_opt, delta_count)
+                        .await
+                        .unwrap_or((0, 0));
+
+                if idx_after != idx_before {
+                    eprintln!(
+                        "[pipeline] cascade: domain={} branch={} delta_count={} indices {}→{}",
+                        ctx.domain, ctx.branch, delta_count, idx_before, idx_after
+                    );
+                }
+
+                ctx.store.io_refresh_cached_dataset(ctx.domain, ctx.branch).await
+                    .map_err(|e| format!("cascade cache refresh failed: {}", e))?;
+
+                eprintln!(
+                    "[pipeline] boundary index created: domain={} branch={} commit_position={}",
+                    ctx.domain, ctx.branch, commit_position
+                );
             }
-        };
+        }
 
         // Tag the commit to the INDEXED version (data + indices), or fall back
         // to the data-only version if optimization was skipped/failed.
@@ -2385,6 +2485,11 @@ async fn io_run_index_pipeline(
         ctx.store
             .update_last_indexed(ctx.domain, ctx.branch, commit, tag_version)
             .await;
+
+        // Aggressively prune untagged intermediate versions after tagging.
+        if let Err(e) = ctx.store.io_cleanup_aggressive(ctx.domain, ctx.branch).await {
+            eprintln!("[pipeline] aggressive cleanup failed (soft): {}", e);
+        }
     } else {
         // ─── NO-OP path (RISK-26 fix): tag + advance without writing data ──────
         // The commit contains no indexable content (all Operation::Error, empty ops,
@@ -2436,30 +2541,22 @@ async fn io_run_index_pipeline(
 ///   2. Micro-batch loop: read N docs → chunk → embed → delete old (Changed) → append → drop
 ///   3. After all ops: optimize indices + tag commit
 ///
-// ─── Inline optimize trigger logic ──────────────────────────────────
-/// Safety-net threshold: if unindexed docs or micro-batches exceed these
-/// limits, trigger an inline cascade optimization. The primary cascade runs
-/// after every push (post-write), so this threshold only fires if the primary
-/// cascade silently failed or if a very large push accumulates many deltas.
-const UNINDEXED_DOCS_THRESHOLD: u64 = 30_000;
-const UNINDEXED_FRAGMENT_GUARD: u32 = 30;
+// ─── Boundary-aware indexing logic ──────────────────────────────────
+/// Indices are created at every 3rd commit (positions 2, 5, 8, ... 0-indexed).
+/// Non-indexed commits rely on KNN fallback for search (at most 2 commits delta).
 
 #[derive(Debug, PartialEq)]
-enum OptimizeAction {
-    None,
-    OptimizeWithCascade,
+enum IndexAction {
+    Skip,
+    Create,
 }
 
-fn should_optimize(
-    docs_since_last_index: u64,
-    microbatch_count_since_index: u32,
-) -> OptimizeAction {
-    if docs_since_last_index > UNINDEXED_DOCS_THRESHOLD
-        || microbatch_count_since_index > UNINDEXED_FRAGMENT_GUARD
-    {
-        return OptimizeAction::OptimizeWithCascade;
+fn should_create_index(commit_position: usize) -> IndexAction {
+    if crate::store::lance::should_index_commit(commit_position) {
+        IndexAction::Create
+    } else {
+        IndexAction::Skip
     }
-    OptimizeAction::None
 }
 
 /// The pipeline lock is held for the entire loop (still one commit at a time).
@@ -2510,9 +2607,14 @@ async fn io_run_index_pipeline_stream(
 
     let store_clustering = ctx.store.domain_settings.store_clustering(ctx.domain).await;
 
-    // Inline optimize counters — track docs and micro-batches since last optimize.
-    let mut docs_since_last_index: u64 = 0;
-    let mut microbatch_count_since_index: u32 = 0;
+    // Boundary-aware indexing: determine commit position (0-indexed) for this
+    // push. Indices are created at every 3rd commit (positions 2, 5, 8, ...).
+    let commit_position = ctx.store.io_count_branch_commits(ctx.domain, ctx.branch).await.unwrap_or(0);
+
+    // Push-level row accumulator: all micro-batch rows are collected here and
+    // appended in a single ds.append() call at the end, producing exactly 1
+    // new data fragment per push (Option C architecture).
+    let mut all_rows: Vec<ChunkRow> = Vec::new();
 
     // ─── Micro-batch flush helper ───────────────────────────────────────
     // Embeds, deletes old chunks (for Changed docs), appends new rows,
@@ -2523,6 +2625,7 @@ async fn io_run_index_pipeline_stream(
         ds: &mut lance::dataset::Dataset,
         batch_docs: &mut Vec<DocToEmbed>,
         all_delete_ids: &mut Vec<String>,
+        all_rows: &mut Vec<ChunkRow>,
         skipped: &mut Vec<SkippedDoc>,
         store_clustering: bool,
         progress_tx: &Option<mpsc::Sender<ProgressUpdate>>,
@@ -2709,12 +2812,12 @@ async fn io_run_index_pipeline_stream(
             }
         }
 
-        // Append all rows for this micro-batch (one fragment).
+        // Accumulate rows for the single end-of-push append (Option C).
+        // No per-micro-batch append — all rows are appended once after the
+        // main loop, producing exactly 1 new data fragment per push.
         if !batch_rows.is_empty() {
-            batch_rows.shrink_to_fit();
-            ctx.store.io_microbatch_append(ds, &batch_rows).await
-                .map_err(|e| format!("microbatch append failed: {}", e))?;
             ctx.store.pipeline_written_chunks.fetch_add(batch_rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            all_rows.extend(batch_rows);
         }
 
         // Decrement pending by the batch chunk count (they're now embedded+written).
@@ -2788,77 +2891,24 @@ async fn io_run_index_pipeline_stream(
 
         // Flush when the micro-batch is full.
         if batch_docs.len() >= MICRO_BATCH_DOCS {
-            let batch_doc_count = batch_docs.len();
             flush_microbatch(
-                ctx, &mut ds, &mut batch_docs, &mut all_delete_ids,
+                ctx, &mut ds, &mut batch_docs, &mut all_delete_ids, &mut all_rows,
                 &mut skipped, store_clustering, &progress_tx,
                 &mut total_docs_seen, &mut indexed_count,
                 cancel_token,
             ).await?;
-
-            // Inline optimize trigger — runs on the write handle directly
-            // (same execution context as the append calls, no tokio::spawn).
-            docs_since_last_index += batch_doc_count as u64;
-            microbatch_count_since_index += 1;
-
-            let action = should_optimize(
-                docs_since_last_index,
-                microbatch_count_since_index,
-            );
-
-            if action != OptimizeAction::None {
-                let vector_config = ctx.store.vector_index_config().clone();
-
-                crate::store::lance::io_ensure_fts_index_on_dataset(&mut ds)
-                    .await
-                    .map_err(|e| format!("inline FTS optimize failed: {}", e))?;
-
-                crate::store::vector_index::io_ensure_vector_index(&mut ds, &vector_config, false)
-                    .await
-                    .map_err(|e| format!("inline vector optimize failed: {}", e))?;
-
-                if store_clustering {
-                    crate::store::vector_index::io_ensure_clustering_vector_index(&mut ds, &vector_config, false)
-                        .await
-                        .map_err(|e| format!("inline clustering vector optimize failed: {}", e))?;
-                }
-
-                if action == OptimizeAction::OptimizeWithCascade {
-                    let delta_count = ctx.store.io_get_delta_count(ctx.domain, ctx.branch).await;
-                    let (idx_before, idx_after) =
-                        crate::store::lance::io_incremental_cascade(&mut ds, delta_count)
-                            .await
-                            .map_err(|e| format!("inline cascade failed: {}", e))?;
-
-                    eprintln!(
-                        "[pipeline] inline optimize: domain={} branch={} docs={} microbatches={} indices {}→{}",
-                        ctx.domain, ctx.branch, docs_since_last_index, microbatch_count_since_index,
-                        idx_before, idx_after
-                    );
-
-                    if let Err(e) = ctx.store.io_cleanup_aggressive(ctx.domain, ctx.branch).await {
-                        eprintln!("[pipeline] inline aggressive cleanup failed (soft): {}", e);
-                    }
-                }
-
-                ctx.store.io_refresh_cached_dataset(ctx.domain, ctx.branch).await
-                    .map_err(|e| format!("inline cache refresh failed: {}", e))?;
-
-                docs_since_last_index = 0;
-                microbatch_count_since_index = 0;
-            }
         }
     }
 
     // Channel closed — flush any remaining docs in the buffer.
     flush_microbatch(
-        ctx, &mut ds, &mut batch_docs, &mut all_delete_ids,
+        ctx, &mut ds, &mut batch_docs, &mut all_delete_ids, &mut all_rows,
         &mut skipped, store_clustering, &progress_tx,
         &mut total_docs_seen, &mut indexed_count,
         cancel_token,
     ).await?;
 
-    // ─── Write phase: optimize indices + tag ────────────────────────────
+    // ─── Write phase: single append + boundary indexing + tag ───────────
     let has_work = indexed_count > 0 || !all_delete_ids.is_empty();
 
     // For pure Deleted docs (not Changed), do one delete now.
@@ -2867,51 +2917,72 @@ async fn io_run_index_pipeline_stream(
             .map_err(|e| format!("final delete failed: {}", e))?;
     }
 
-    // Capture the final version from the write handle.
-    let last_version = ds.version().version;
+    // Single end-of-push append: all rows accumulated during micro-batch
+    // processing are appended in one ds.append() call, producing exactly
+    // 1 new data fragment per push (Option C architecture).
+    if !all_rows.is_empty() {
+        ctx.store.io_microbatch_append(&mut ds, &all_rows).await
+            .map_err(|e| format!("end-of-push append failed: {}", e))?;
+    }
 
     // Refresh the cached handle so subsequent reads see the new data.
     ctx.store.io_refresh_cached_dataset(ctx.domain, ctx.branch).await
         .map_err(|e| format!("cache refresh failed: {}", e))?;
 
     if has_work {
-        // Optimize indices on an UNCACHED handle (FTS + vector ANN).
-        // This indexes all new fragments created by the micro-batch appends.
-        let indexed_version = match io_optimize_on_uncached_handle(
-            ctx.store, ctx.domain, ctx.branch, store_clustering
-        ).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[pipeline] index optimization failed (soft): {} — tagging at data version {}", e, last_version);
-                None
-            }
-        };
+        // Boundary-aware indexing: create indices only at every 3rd commit
+        // (positions 2, 5, 8, ... 0-indexed). Non-indexed commits rely on
+        // KNN fallback for search (at most 2 commits delta).
+        let action = should_create_index(commit_position);
 
-        // Increment delta count and run the incremental merge(3) cascade.
-        // The cascade maintains a base-3 index hierarchy at HEAD, keeping
-        // search latency at O(log₃ N) instead of O(N).
-        if indexed_version.is_some() {
+        let mut indexed_version: Option<u64> = None;
+
+        if action == IndexAction::Create {
+            let vector_config = ctx.store.vector_index_config().clone();
+
+            // Create/update indices on the write handle.
+            crate::store::lance::io_ensure_fts_index_on_dataset(&mut ds)
+                .await
+                .map_err(|e| format!("FTS index creation failed: {}", e))?;
+
+            crate::store::vector_index::io_ensure_vector_index(&mut ds, &vector_config, false)
+                .await
+                .map_err(|e| format!("vector index creation failed: {}", e))?;
+
+            if store_clustering {
+                crate::store::vector_index::io_ensure_clustering_vector_index(&mut ds, &vector_config, false)
+                    .await
+                    .map_err(|e| format!("clustering vector index creation failed: {}", e))?;
+            }
+
+            indexed_version = Some(ds.version().version);
+
+            // Increment delta count and run the incremental merge(3) cascade.
             ctx.store.io_increment_delta_count(ctx.domain, ctx.branch).await;
             let delta_count = ctx.store.io_get_delta_count(ctx.domain, ctx.branch).await;
 
-            let ds_opt = ctx.store.io_open_dataset_uncached(ctx.domain, ctx.branch).await;
-            if let Ok(Some(mut ds_opt)) = ds_opt {
-                let (idx_before, idx_after) =
-                    crate::store::lance::io_incremental_cascade(&mut ds_opt, delta_count)
-                        .await
-                        .unwrap_or((0, 0));
+            let (idx_before, idx_after) =
+                crate::store::lance::io_incremental_cascade(&mut ds, delta_count)
+                    .await
+                    .unwrap_or((0, 0));
 
-                if idx_after != idx_before {
-                    eprintln!(
-                        "[pipeline] cascade: domain={} branch={} delta_count={} indices {}→{}",
-                        ctx.domain, ctx.branch, delta_count, idx_before, idx_after
-                    );
-                    ctx.store.io_refresh_cached_dataset(ctx.domain, ctx.branch).await
-                        .map_err(|e| format!("cascade cache refresh failed: {}", e))?;
-                }
+            if idx_after != idx_before {
+                eprintln!(
+                    "[pipeline] cascade: domain={} branch={} delta_count={} indices {}→{}",
+                    ctx.domain, ctx.branch, delta_count, idx_before, idx_after
+                );
             }
+
+            ctx.store.io_refresh_cached_dataset(ctx.domain, ctx.branch).await
+                .map_err(|e| format!("cascade cache refresh failed: {}", e))?;
+
+            eprintln!(
+                "[pipeline] boundary index created: domain={} branch={} commit_position={}",
+                ctx.domain, ctx.branch, commit_position
+            );
         }
 
+        let last_version = ds.version().version;
         let tag_version = indexed_version.unwrap_or(last_version);
         if let Err(e) = ctx.store.io_tag_commit(ctx.domain, ctx.branch, commit, tag_version).await {
             let msg = format!("failed to tag commit: {}", e);
@@ -2924,9 +2995,6 @@ async fn io_run_index_pipeline_stream(
         ctx.store.update_last_indexed(ctx.domain, ctx.branch, commit, tag_version).await;
 
         // Aggressively prune untagged intermediate versions after tagging.
-        // retain_n_versions(1) keeps only the current (tagged) version plus
-        // all tagged versions. This ensures orphaned index files from
-        // append-only optimize cycles are physically deleted.
         if let Err(e) = ctx.store.io_cleanup_aggressive(ctx.domain, ctx.branch).await {
             eprintln!("[pipeline] aggressive cleanup failed (soft): {}", e);
         }
@@ -2968,54 +3036,6 @@ async fn io_run_index_pipeline_stream(
     }
 
     Ok((indexed_count, skipped))
-}
-
-/// Optimize FTS + vector indices on an uncached dataset handle.
-/// Returns the version after optimization, or None if the dataset doesn't exist yet.
-///
-/// Uses `io_open_dataset_uncached` so the write operations don't hold the shared
-/// `Arc<RwLock<Dataset>>` and block concurrent search reads (Fix #2).
-/// After optimization, refreshes the cached handle.
-async fn io_optimize_on_uncached_handle(
-    store: &LanceStore,
-    domain: &str,
-    branch: &str,
-    store_clustering: bool,
-) -> Result<Option<u64>, String> {
-    let ds = store
-        .io_open_dataset_uncached(domain, branch)
-        .await
-        .map_err(|e| format!("uncached open failed: {}", e))?;
-
-    let mut ds = match ds {
-        Some(d) => d,
-        None => return Ok(None),
-    };
-
-    let vector_config = store.vector_index_config().clone();
-
-    crate::store::lance::io_ensure_fts_index_on_dataset(&mut ds)
-        .await
-        .map_err(|e| format!("FTS optimize failed: {}", e))?;
-
-    crate::store::vector_index::io_ensure_vector_index(&mut ds, &vector_config, false)
-        .await
-        .map_err(|e| format!("vector optimize failed: {}", e))?;
-
-    if store_clustering {
-        crate::store::vector_index::io_ensure_clustering_vector_index(&mut ds, &vector_config, false)
-            .await
-            .map_err(|e| format!("clustering vector optimize failed: {}", e))?;
-    }
-
-    let final_version = ds.version().version;
-
-    store
-        .io_refresh_cached_dataset(domain, branch)
-        .await
-        .map_err(|e| format!("cache refresh failed: {}", e))?;
-
-    Ok(Some(final_version))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -4992,26 +5012,27 @@ mod tests_index_trigger {
     use super::*;
 
     #[test]
-    fn threshold_triggers_optimize_with_cascade() {
-        let action = should_optimize(30_001, 5);
-        assert_eq!(action, OptimizeAction::OptimizeWithCascade);
+    fn should_create_index_at_3rd_commit() {
+        assert_eq!(should_create_index(2), IndexAction::Create);
     }
 
     #[test]
-    fn fragment_guard_triggers_optimize_with_cascade() {
-        let action = should_optimize(1000, 31);
-        assert_eq!(action, OptimizeAction::OptimizeWithCascade);
+    fn should_create_index_at_6th_commit() {
+        assert_eq!(should_create_index(5), IndexAction::Create);
     }
 
     #[test]
-    fn below_threshold_returns_none() {
-        let action = should_optimize(5000, 5);
-        assert_eq!(action, OptimizeAction::None);
+    fn should_create_index_at_9th_commit() {
+        assert_eq!(should_create_index(8), IndexAction::Create);
     }
 
     #[test]
-    fn exact_threshold_returns_none() {
-        let action = should_optimize(30_000, 30);
-        assert_eq!(action, OptimizeAction::None);
+    fn should_skip_index_for_non_3rd() {
+        assert_eq!(should_create_index(0), IndexAction::Skip);
+        assert_eq!(should_create_index(1), IndexAction::Skip);
+        assert_eq!(should_create_index(3), IndexAction::Skip);
+        assert_eq!(should_create_index(4), IndexAction::Skip);
+        assert_eq!(should_create_index(6), IndexAction::Skip);
+        assert_eq!(should_create_index(7), IndexAction::Skip);
     }
 }

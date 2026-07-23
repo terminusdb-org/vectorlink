@@ -9468,14 +9468,14 @@ async fn compaction_flow_preserves_tagged_manifests() {
         .expect("delta-fork retagging");
     assert_tags_resolve(&store, domain, "after delta-fork").await;
 
-    // Step 4 of io_background_compact: final aggressive cleanup.
+    // Step 4: final aggressive cleanup.
     store
         .io_cleanup_aggressive(domain, "main")
         .await
         .expect("post-retag cleanup");
     assert_tags_resolve(&store, domain, "after post-retag cleanup").await;
 
-    // Step 5 of io_background_compact: orphaned tag / stale branch cleanup.
+    // Step 5: orphaned tag / stale branch cleanup.
     store
         .io_cleanup_orphaned_tags_and_stale_branches(domain)
         .await
@@ -9764,9 +9764,107 @@ async fn production_store_historic_searchability() {
     let mut sorted_tags: Vec<(String, _)> = tags.into_iter().collect();
     sorted_tags.sort_by_key(|(_, tc)| (tc.branch.clone(), tc.version));
 
-    // Prepare a dummy query embedding (768-dim, all zeros — we just want to
-    // verify the search path works, not result quality).
-    let dummy_embedding = vec![0.0f32; 768];
+    // Real L2-normalized embedding for "search_query: product" from
+    // nomic-embed-text-v2-moe (768-dim). This produces meaningful vector
+    // search hits instead of the zero-vector no-op.
+    let dummy_embedding: Vec<f32> = vec![
+        0.0493964005f32, -0.0076268156f32, -0.0478943746f32, -0.0642956668f32, 0.0047795463f32, 0.0008906153f32, 0.0118389064f32, -0.0056415942f32,
+        -0.0096636655f32, 0.0835293358f32, 0.0336471183f32, 0.0001663360f32, -0.0056399444f32, 0.0090132405f32, 0.0429322138f32, -0.0086339666f32,
+        -0.0088066846f32, -0.0021529045f32, 0.0165312282f32, 0.0165519332f32, 0.0015920432f32, 0.0221244609f32, -0.0097195285f32, -0.0932218313f32,
+        -0.0422059609f32, -0.0255716877f32, 0.0553415202f32, 0.0345715983f32, 0.0034806587f32, 0.0127692044f32, -0.0176365031f32, -0.0644342418f32,
+        -0.0645256468f32, 0.0482490176f32, -0.0170854881f32, 0.0773524361f32, 0.0186992651f32, -0.0834883458f32, 0.0128488784f32, 0.0078525486f32,
+        0.0616632449f32, -0.0487703976f32, -0.0205449430f32, 0.0296580835f32, 0.0679867906f32, 0.0731773363f32, 0.0632577668f32, -0.0206191270f32,
+        0.0353525522f32, 0.0605886850f32, -0.0240665998f32, 0.0115882064f32, 0.0391679310f32, -0.0006425000f32, 0.0051917397f32, -0.0223144319f32,
+        -0.0067084303f32, 0.0075456734f32, -0.0340724383f32, -0.0208197920f32, -0.0016482468f32, -0.0282566556f32, -0.0507427135f32, 0.0079588856f32,
+        0.0388000811f32, -0.0259720357f32, 0.0190697020f32, -0.0375010581f32, -0.0083013316f32, -0.0165072372f32, -0.0665585267f32, -0.0018807540f32,
+        0.0329173713f32, -0.0183132501f32, -0.0458201877f32, 0.0209897489f32, -0.0249618817f32, 0.0138086963f32, -0.0371633381f32, -0.0049053484f32,
+        0.0113402324f32, 0.0773682411f32, 0.0429108158f32, 0.0386239181f32, 0.0065277500f32, 0.0087805466f32, 0.0653214067f32, 0.0203996940f32,
+        -0.0693794865f32, 0.0068150237f32, -0.0053232714f32, 0.0008777272f32, 0.0354064312f32, 0.0024250099f32, 0.0016693374f32, -0.0143372113f32,
+        -0.0185077191f32, 0.0373199151f32, 0.0599135540f32, -0.0372819731f32, 0.0844367158f32, 0.0050959253f32, 0.0156367652f32, -0.0562627702f32,
+        -0.0212475649f32, 0.0575940801f32, 0.0400835740f32, -0.0514764494f32, 0.0024972536f32, -0.0556485102f32, -0.0232097698f32, -0.0165853642f32,
+        -0.0082424996f32, -0.0495008655f32, 0.0081794626f32, -0.0842466358f32, -0.0191719020f32, 0.0031120773f32, 0.0174672521f32, 0.0733863763f32,
+        0.0099001635f32, 0.0225872219f32, 0.0508062624f32, -0.0015717730f32, -0.0005420819f32, -0.0124835374f32, -0.0115336204f32, 0.0154585292f32,
+        -0.0338532903f32, 0.0048619678f32, 0.0012853709f32, 0.0699192025f32, 0.0382237881f32, -0.0444049978f32, 0.0034687796f32, 0.0512324694f32,
+        0.0738941963f32, -0.0813859209f32, -0.0135281833f32, -0.0428881328f32, 0.0202038790f32, 0.0072519536f32, 0.0513637304f32, -0.0913758904f32,
+        -0.0281540346f32, -0.0160497102f32, 0.0005541927f32, -0.0037998322f32, -0.0071678856f32, -0.0386625061f32, -0.0081893716f32, -0.0348191683f32,
+        -0.0465949777f32, -0.0102923245f32, -0.0294105545f32, -0.0028997116f32, 0.0003250527f32, -0.0025740987f32, 0.0130332103f32, -0.0146973633f32,
+        0.0615294069f32, -0.0108662175f32, 0.0452251937f32, 0.0437688958f32, 0.0273031116f32, 0.0748608002f32, 0.0522329474f32, 0.0213167389f32,
+        0.0062588547f32, -0.0398239510f32, 0.0419698479f32, -0.0401571520f32, -0.0290200605f32, -0.0267563587f32, 0.0354851842f32, 0.0228538799f32,
+        -0.0345336403f32, 0.0232339598f32, 0.0037931686f32, 0.0037535061f32, 0.0626347069f32, 0.0481837926f32, -0.0332776883f32, 0.0109960154f32,
+        0.0058028811f32, -0.0488081845f32, 0.0269422606f32, -0.0281726316f32, 0.0461558747f32, 0.0591372410f32, -0.0343862303f32, 0.0314785084f32,
+        -0.0340182883f32, 0.0539698473f32, -0.0251080007f32, 0.0012660258f32, 0.0141171918f32, -0.0377917011f32, -0.0421100979f32, -0.0837332118f32,
+        -0.0344311313f32, -0.0100838855f32, -0.0526420004f32, -0.0077877460f32, 0.0092140625f32, -0.0320049064f32, -0.0655965027f32, 0.0738055463f32,
+        0.0046390042f32, 0.0767954861f32, -0.0180889951f32, -0.0258662317f32, 0.0092221265f32, -0.0463844777f32, -0.0186492591f32, 0.0447534898f32,
+        -0.0177792111f32, 0.0215920629f32, 0.0513037524f32, -0.0321403584f32, -0.0927037853f32, 0.0424325179f32, -0.0041051132f32, -0.0631944168f32,
+        -0.0289779235f32, -0.0255128677f32, 0.0382321231f32, -0.0068569697f32, 0.0089239996f32, -0.0250253407f32, -0.0125108404f32, -0.0338586483f32,
+        0.0346994013f32, 0.0639484968f32, -0.0042020408f32, 0.0221803979f32, -0.0328173064f32, 0.0458493207f32, -0.0057065242f32, -0.0118449764f32,
+        -0.0459439957f32, -0.0205669360f32, -0.0294330645f32, -0.0138947863f32, -0.0417861209f32, -0.0325471334f32, -0.0733843863f32, -0.0373517441f32,
+        0.0002911378f32, 0.0313507864f32, -0.0249696477f32, -0.0454196677f32, 0.0189121951f32, 0.0988670910f32, -0.0495017145f32, 0.0284372166f32,
+        -0.0218378169f32, -0.0154842182f32, 0.0366763082f32, -0.0472388176f32, 0.0394814740f32, -0.0256584717f32, -0.0028684009f32, -0.0199994470f32,
+        0.0104575055f32, 0.0204962200f32, -0.0293866385f32, -0.0519613274f32, -0.0285086056f32, -0.0384027981f32, -0.0582649231f32, -0.0013812334f32,
+        -0.0011122703f32, 0.0080486536f32, -0.0264811287f32, -0.0176580311f32, 0.0139964333f32, -0.0297109415f32, 0.0276367966f32, -0.0493633675f32,
+        0.0436251078f32, 0.0144284803f32, 0.0202558850f32, 0.0029268269f32, -0.0043892803f32, 0.0557549192f32, -0.0282916636f32, -0.0645222708f32,
+        -0.0677882966f32, -0.0129968773f32, 0.0291139745f32, -0.0139237623f32, 0.0191110900f32, 0.0036800462f32, 0.0185692671f32, -0.0064750547f32,
+        -0.0156449222f32, 0.0595952970f32, -0.0617848339f32, -0.0389761420f32, -0.0236542528f32, 0.0042283278f32, -0.0101522435f32, -0.0476554176f32,
+        -0.0066869737f32, 0.0243271338f32, 0.0536080493f32, 0.0202308120f32, 0.0629166568f32, -0.0071556016f32, 0.0243966478f32, -0.0193555620f32,
+        0.0756400862f32, -0.0239678608f32, -0.0106970165f32, 0.0140242363f32, 0.0495088595f32, 0.0488868445f32, -0.0364767332f32, 0.0204493170f32,
+        0.0544576913f32, -0.0347954763f32, -0.0095390995f32, 0.0269074926f32, -0.0299084895f32, -0.0060979120f32, 0.0419926959f32, -0.0022887803f32,
+        0.0358776502f32, 0.0215621299f32, -0.0553496752f32, 0.0325342554f32, -0.0075095056f32, 0.0272077266f32, 0.0422912559f32, 0.0080514596f32,
+        0.0068782207f32, 0.0329631443f32, -0.0193861860f32, -0.0067311697f32, 0.0519175204f32, 0.0468949676f32, 0.0623193649f32, 0.0022032081f32,
+        0.0569356651f32, -0.0845270858f32, -0.0106492245f32, 0.0010651507f32, 0.0391305400f32, 0.0085307126f32, 0.0041231828f32, -0.0049607193f32,
+        -0.0671904126f32, 0.0334332533f32, -0.0248953667f32, 0.0473154236f32, 0.0211108859f32, 0.0622115739f32, -0.0023798543f32, -0.0471952426f32,
+        -0.0289456695f32, -0.0028543755f32, -0.0768025961f32, 0.0163674342f32, -0.0015036767f32, 0.0707884464f32, -0.0266694437f32, -0.0296355245f32,
+        -0.0808269759f32, -0.0383393561f32, 0.0290438315f32, 0.0204327790f32, 0.0174831741f32, 0.0101832725f32, 0.0160537912f32, 0.0002140577f32,
+        0.0067894521f32, 0.0300275855f32, -0.0659304267f32, 0.0091355745f32, 0.0191973900f32, -0.0139490073f32, 0.0407628360f32, -0.0304604885f32,
+        0.0192182520f32, -0.0420057049f32, 0.0219766089f32, -0.0140268223f32, -0.0059629667f32, 0.0029609181f32, -0.0319494384f32, -0.0189946320f32,
+        0.0008424715f32, 0.0207891140f32, -0.0088314396f32, -0.0524661874f32, -0.0096786235f32, 0.0169652061f32, -0.0168639342f32, 0.0216568619f32,
+        0.0529322573f32, 0.0147501023f32, -0.0148722513f32, 0.0922463154f32, 0.0313771724f32, -0.0330654983f32, 0.0032890370f32, -0.0299190265f32,
+        0.0099957205f32, -0.0217388109f32, -0.0015896121f32, -0.0002101789f32, -0.0228987738f32, -0.0318340304f32, 0.0273391196f32, -0.0215854429f32,
+        -0.0246427368f32, 0.0317813184f32, -0.0216909149f32, -0.0257058287f32, -0.0138346423f32, 0.0344910903f32, -0.0350822412f32, -0.0239696888f32,
+        -0.0332341253f32, -0.0283853346f32, 0.0178953321f32, 0.0104695675f32, 0.0337313583f32, 0.0290788605f32, -0.0157141022f32, 0.0048646838f32,
+        0.0188323361f32, 0.0570967801f32, -0.0168237472f32, -0.0264091537f32, 0.0422127039f32, 0.0131201333f32, -0.0142785063f32, 0.0109244965f32,
+        -0.0096261115f32, -0.0323875984f32, -0.0110890864f32, 0.0517494374f32, -0.0073988811f32, 0.0161102932f32, 0.0034497853f32, -0.0049657728f32,
+        -0.0149131093f32, -0.0260878507f32, -0.0465859007f32, -0.0290346745f32, -0.0180114911f32, -0.0209194579f32, 0.0260331657f32, -0.0188778541f32,
+        0.0407986180f32, -0.0651547867f32, 0.0022091448f32, -0.0094672395f32, -0.0318401364f32, -0.0419530179f32, -0.0111986584f32, -0.0427786949f32,
+        0.0137088683f32, 0.0108762735f32, 0.0184653211f32, -0.0012932667f32, 0.0195994550f32, -0.0083666736f32, 0.0186761551f32, -0.0208364850f32,
+        -0.0085693096f32, -0.0175036091f32, -0.0625680429f32, 0.0005347970f32, -0.0629472928f32, 0.0038641084f32, -0.0246134888f32, -0.0195555300f32,
+        0.0160540592f32, 0.0118049884f32, 0.0206008250f32, -0.0150724027f32, -0.0035898816f32, 0.0481075176f32, -0.0567714971f32, -0.0065070417f32,
+        0.0470552676f32, -0.0421240579f32, -0.0156821992f32, -0.0183647971f32, -0.0033485736f32, -0.0419587659f32, 0.0418054629f32, -0.0423538399f32,
+        -0.0702143665f32, 0.0088922076f32, 0.0119568169f32, 0.0272068796f32, 0.0041989761f32, -0.0550152072f32, -0.0229155038f32, -0.0257036037f32,
+        -0.1071506446f32, -0.0128113404f32, -0.0348334083f32, 0.0148939383f32, 0.0024201883f32, 0.0483269476f32, 0.0485708426f32, 0.0175573931f32,
+        -0.0610591219f32, -0.0175450251f32, 0.0174316591f32, 0.0319423434f32, -0.0274462886f32, -0.0168823372f32, 0.0124728654f32, 0.0406889580f32,
+        -0.0086032196f32, 0.0422637999f32, 0.0429244918f32, 0.0111102184f32, -0.0141200118f32, 0.0041982232f32, 0.0236899338f32, 0.0360293412f32,
+        0.0268915056f32, -0.0169739661f32, 0.0245267868f32, -0.0214012199f32, -0.0207547690f32, 0.0352471182f32, 0.0291153685f32, 0.0129177324f32,
+        0.0155913332f32, -0.0237929438f32, -0.0153828142f32, 0.0888963355f32, 0.0175940701f32, -0.0341434013f32, -0.0479943576f32, -0.0103395095f32,
+        0.0130063193f32, -0.0419077779f32, -0.0749791002f32, -0.0710317464f32, -0.0002631060f32, -0.0093090335f32, 0.0438447238f32, 0.0074644811f32,
+        0.0098276415f32, -0.0095689685f32, -0.0401974750f32, 0.0040997325f32, -0.0479649956f32, -0.0683633966f32, -0.0148637213f32, -0.0149368882f32,
+        -0.0456275847f32, -0.0044882603f32, 0.0277292396f32, 0.0260723287f32, -0.0195284180f32, 0.0215451789f32, 0.0477357406f32, 0.0545987643f32,
+        -0.0328472054f32, 0.0151942002f32, 0.0317026184f32, -0.0317560044f32, 0.0089687955f32, -0.0076175011f32, 0.0137645543f32, -0.0168445892f32,
+        -0.0286962766f32, 0.0479666176f32, -0.0540091813f32, 0.0058394099f32, 0.0371796381f32, -0.0482815276f32, -0.0098241865f32, 0.0474965576f32,
+        -0.0224289679f32, -0.0094544465f32, -0.0014734722f32, 0.0580197071f32, 0.0048235098f32, 0.0350773782f32, -0.0027862817f32, -0.0355080012f32,
+        -0.0007032834f32, -0.0236611228f32, 0.0321065734f32, 0.0709054064f32, -0.0173240961f32, 0.0433334728f32, 0.0501667195f32, -0.0256518557f32,
+        0.0026790469f32, -0.0444356108f32, 0.0144633433f32, 0.0987034910f32, -0.0191069550f32, 0.0054763757f32, -0.0403172950f32, 0.0206633760f32,
+        -0.0138348623f32, 0.0153496872f32, 0.0191362620f32, -0.0455525877f32, -0.0712589764f32, 0.0443415278f32, -0.0532917473f32, -0.0081408486f32,
+        0.0161199042f32, -0.0157081492f32, -0.0297944755f32, -0.0312512654f32, 0.0146967003f32, 0.0078707306f32, -0.0069188971f32, 0.0645984568f32,
+        0.0246773288f32, -0.0697929305f32, -0.0359406182f32, 0.0273286886f32, -0.0306907885f32, -0.0283793416f32, -0.0512992274f32, -0.0134057343f32,
+        0.0435877718f32, 0.0472999976f32, -0.0217211289f32, -0.0016120242f32, 0.0510523374f32, -0.0207218910f32, 0.0105068375f32, 0.0586884851f32,
+        -0.0238722028f32, -0.0451444327f32, 0.0227688239f32, 0.0480871376f32, 0.0350599582f32, 0.0880568556f32, 0.0104892965f32, -0.0370279531f32,
+        0.0218567859f32, -0.0096095605f32, 0.0235042518f32, 0.0215195759f32, 0.0736321163f32, -0.0347937103f32, 0.0634892768f32, 0.0203586080f32,
+        0.0180302991f32, -0.0253792617f32, 0.0360018282f32, 0.0280729446f32, 0.0020780559f32, -0.0072486556f32, 0.0006769710f32, 0.0058215830f32,
+        -0.1195126340f32, 0.0924538154f32, -0.0678086866f32, 0.0346691183f32, -0.0377694311f32, -0.0122079334f32, 0.0291348785f32, 0.0214981789f32,
+        -0.0187401911f32, 0.0029495527f32, -0.0032017413f32, 0.0156112142f32, -0.0115704324f32, -0.0341995863f32, -0.0057471662f32, 0.0376350341f32,
+        -0.0269292386f32, 0.0559779642f32, -0.0247928838f32, -0.0490352475f32, 0.0175124341f32, 0.0082411676f32, 0.0307891875f32, -0.0275652656f32,
+        -0.0870179356f32, 0.0585707251f32, 0.0125316104f32, -0.0025036180f32, 0.0525705234f32, 0.0352154652f32, -0.0166211862f32, 0.0590523530f32,
+        0.0072761626f32, -0.0053103637f32, 0.0304644315f32, 0.0273681806f32, -0.0217064519f32, -0.0030373056f32, 0.0118071474f32, 0.0185692861f32,
+        0.0020299250f32, -0.0291589315f32, -0.0599375150f32, 0.0139104298f32, 0.0768959261f32, -0.0006652940f32, 0.0714888864f32, -0.0179751821f32,
+        -0.0609253129f32, 0.0521022954f32, 0.0144791713f32, 0.0056748827f32, -0.0510837574f32, 0.0427907379f32, 0.0066550511f32, 0.0057513962f32,
+        0.0322670434f32, -0.0054790151f32, -0.0011546294f32, -0.0009914264f32, -0.0116588764f32, -0.0057463261f32, -0.0524134124f32, 0.0159135752f32,
+        -0.0288265876f32, -0.0491750625f32, -0.0458685847f32, 0.0761230402f32, -0.0179710301f32, -0.0343553783f32, 0.0289302365f32, -0.0008097217f32,
+        0.0240540348f32, 0.0126366784f32, 0.0066003257f32, -0.0319009634f32, -0.0681393406f32, 0.0676925226f32, -0.0765857862f32, -0.0468698756f32,
+        -0.0695335965f32, -0.0187388351f32, -0.0335249963f32, -0.0150601292f32, -0.0149305483f32, 0.0083449556f32, -0.0165856272f32, 0.0150615152f32,
+        -0.0080790386f32, 0.0276191576f32, -0.0304603025f32, 0.0599187100f32, -0.0381556431f32, 0.0081368706f32, 0.0209731339f32, 0.0326592484f32,
+        0.0117236474f32, -0.0098692075f32, 0.0507493575f32, 0.0480049526f32, 0.0313557704f32, -0.0156158102f32, -0.0383137711f32, 0.0409384129f32,
+    ];
     let query_text = "product";
 
     let mut summary = Vec::new();
@@ -10098,8 +10196,6 @@ async fn active_compaction_latency_cliff() {
         nprobes: 4,
         refine_factor: Some(10),
     });
-    // Disable probabilistic auto-compaction for deterministic control.
-    store.set_auto_compaction_enabled(false);
 
     // Phase 1: Push enough data to create the initial vector index.
     // Need >= 256 rows for IVF training.
@@ -10174,7 +10270,7 @@ async fn active_compaction_latency_cliff() {
         // Every 20th push, trigger background compaction manually.
         if batch % 20 == 0 {
             eprintln!("       >>> triggering background compaction <<<");
-            // Simulate what io_background_compact does: compact data only, NO index rebuild.
+            // Compact data only, NO index rebuild.
             let ds_uncached = store
                 .io_open_dataset_uncached(domain, branch)
                 .await
@@ -10326,157 +10422,258 @@ struct SearchResult {
     error: String,
 }
 
-/// Verify that after `io_background_compact`, the vector index covers all
-/// data fragments. This is the TDD failing test for the compaction index
-/// rebuild fix.
-///
-/// On current (buggy) code, `io_background_compact` compacts data fragments
-/// but does NOT drop/recreate indices. The old indices reference deleted
-/// fragment IDs, and the new compacted fragments have no index coverage.
-/// Search degrades to flat-scan.
-///
-/// Run with:
-///   cargo test --lib store::lance::tests -- background_compact_index_coverage --nocapture
+// ===========================================================================
+// BOUNDARY-AWARE INDEXING TESTS
+//
+// Tests for the new architecture: single end-of-push append (Option C),
+// boundary-aware indexing at every 3rd commit, cascade merges, and
+// index_delta_counts purge on delete.
+// ===========================================================================
+
+/// Helper: push docs and tag a commit, returning the tagged version.
+/// Uses io_upsert_chunks + io_tag_commit (simulates a push without the
+/// full pipeline, which requires an embed provider).
+async fn push_and_tag(
+    store: &LanceStore,
+    domain: &str,
+    branch: &str,
+    commit: &str,
+    rows: &[ChunkRow],
+) -> u64 {
+    let v = store
+        .io_upsert_chunks(domain, branch, &format!("doc_{}", commit), rows)
+        .await
+        .expect("upsert");
+    store
+        .io_tag_commit(domain, branch, commit, v)
+        .await
+        .expect("tag");
+    v
+}
+
+/// Helper: count tagged commits for a branch.
+async fn count_tags(store: &LanceStore, domain: &str, branch: &str) -> usize {
+    store.io_count_branch_commits(domain, branch).await.unwrap_or(0)
+}
+
+/// Push 5 batches via io_upsert_chunks (each simulating a micro-batch within
+/// a single push). After the push, assert exactly 1 new data fragment at HEAD.
 #[tokio::test]
-async fn background_compact_index_coverage() {
+async fn single_append_one_fragment_per_push() {
+    use crate::store::vector_index::tests::make_chunk_row;
+
+    let dim = 8;
+    let (store, _tmp) = make_test_store(dim);
+    let domain = "admin/single_append";
+    let branch = "main";
+
+    // Push 1: 5 docs in one io_upsert_chunks call (single append).
+    let rows: Vec<ChunkRow> = (0..5)
+        .map(|i| make_chunk_row(&format!("doc/{}", i), dim, i + 1))
+        .collect();
+    push_and_tag(&store, domain, branch, "c0", &rows).await;
+
+    let ds = store.io_open_dataset_readonly(domain).await.unwrap().unwrap();
+    let ds = ds.read().await;
+    let fragments = ds.get_fragments().len();
+    assert_eq!(
+        fragments, 1,
+        "single push should produce exactly 1 fragment, got {}",
+        fragments
+    );
+
+    // Push 2: 3 more docs.
+    let rows2: Vec<ChunkRow> = (5..8)
+        .map(|i| make_chunk_row(&format!("doc/{}", i), dim, i + 1))
+        .collect();
+    let _v1 = push_and_tag(&store, domain, branch, "c1", &rows2).await;
+
+    let ds = store.io_open_dataset_readonly(domain).await.unwrap().unwrap();
+    let ds = ds.read().await;
+    let fragments = ds.get_fragments().len();
+    assert_eq!(
+        fragments, 2,
+        "two pushes should produce exactly 2 fragments, got {}",
+        fragments
+    );
+}
+
+/// Push 2 commits, assert 2 fragments total (1 per push, no cross-push merging).
+#[tokio::test]
+async fn single_append_no_cross_push_merging() {
+    use crate::store::vector_index::tests::make_chunk_row;
+
+    let dim = 8;
+    let (store, _tmp) = make_test_store(dim);
+    let domain = "admin/no_cross_merge";
+    let branch = "main";
+
+    // Push 1.
+    let rows1: Vec<ChunkRow> = (0..10)
+        .map(|i| make_chunk_row(&format!("doc/{}", i), dim, i + 1))
+        .collect();
+    push_and_tag(&store, domain, branch, "c0", &rows1).await;
+
+    // Push 2.
+    let rows2: Vec<ChunkRow> = (10..20)
+        .map(|i| make_chunk_row(&format!("doc/{}", i), dim, i + 1))
+        .collect();
+    push_and_tag(&store, domain, branch, "c1", &rows2).await;
+
+    let ds = store.io_open_dataset_readonly(domain).await.unwrap().unwrap();
+    let ds = ds.read().await;
+    let fragments = ds.get_fragments().len();
+    assert_eq!(
+        fragments, 2,
+        "two pushes should produce exactly 2 fragments (no cross-push merging), got {}",
+        fragments
+    );
+}
+
+/// After 3 pushes (commit_position 0, 1, 2), the 3rd push (position 2) should
+/// have a vector index created.
+#[tokio::test]
+async fn third_commit_gets_index() {
     use crate::store::vector_index::tests::make_chunk_row;
     use crate::store::vector_index::{io_ensure_vector_index, VECTOR_INDEX_NAME};
-    use crate::store::lance::io_ensure_fts_index_on_dataset;
-    use crate::store::lance::io_background_compact;
-    use lance::index::DatasetIndexExt;
 
     let dim = 128;
     let config = crate::store::vector_index::tests::make_test_config(dim);
     let (mut store, _tmp) = make_test_store(dim);
     store.set_vector_index_config(config.clone());
-    store.set_auto_compaction_enabled(false);
-
-    let domain = "admin/bgcompact_idx";
+    let domain = "admin/third_commit_idx";
     let branch = "main";
 
-    // Phase 1: Push 300 rows in one batch (above IVF training floor of 256).
-    let rows: Vec<ChunkRow> = (0..300)
-        .map(|i| make_chunk_row(&format!("doc/{}", i), dim, i as u64 + 1))
-        .collect();
-    let v0 = store
-        .io_upsert_chunks(domain, branch, "doc_batch_0", &rows)
-        .await
-        .expect("initial push");
-    store.io_tag_commit(domain, branch, "c0", v0).await.expect("tag c0");
+    // Push 3 commits with enough data for IVF training (>= 256 rows).
+    for i in 0..3 {
+        let rows: Vec<ChunkRow> = (0..100)
+            .map(|j| make_chunk_row(&format!("doc/{}_{}", i, j), dim, (i * 100 + j) as u64 + 1))
+            .collect();
+        push_and_tag(&store, domain, branch, &format!("c{}", i), &rows).await;
+    }
 
-    // Create vector + FTS indices on the initial data.
+    // Simulate boundary indexing at commit_position 2 (3rd commit).
+    // The pipeline would call io_ensure_vector_index at this point.
     {
-        let ds_arc = store.io_open_dataset(domain, branch).await.expect("open dataset");
+        let ds_arc = store.io_open_dataset(domain, branch).await.expect("open");
         let mut ds = ds_arc.write().await;
         io_ensure_vector_index(&mut ds, &config, false).await.expect("create vector index");
-        io_ensure_fts_index_on_dataset(&mut ds).await.expect("create FTS index");
     }
     store.io_refresh_cached_dataset(domain, branch).await.expect("refresh");
 
-    // Phase 2: Push 20 small batches (5 rows each) to create 20 new fragments.
-    // Each push creates one new data fragment + one delta index via the
-    // inline optimize trigger in the pipeline. We call io_upsert_chunks
-    // directly (not through the pipeline) so we need to manually ensure
-    // vector index after each push to simulate the pipeline's inline optimize.
-    for batch in 1..=20 {
-        let doc_id = format!("doc_batch_{}", batch);
-        let rows: Vec<ChunkRow> = (0..5)
-            .map(|i| {
-                let global_i = 300 + (batch - 1) * 5 + i;
-                make_chunk_row(&format!("doc/{}", global_i), dim, global_i as u64 + 1)
-            })
+    // Verify vector index exists.
+    let ds = store.io_open_dataset_readonly(domain).await.unwrap().unwrap();
+    let ds = ds.read().await;
+    let indices = ds.load_indices().await.expect("load indices");
+    assert!(
+        indices.iter().any(|i| i.name == VECTOR_INDEX_NAME),
+        "vector index must exist after 3rd commit boundary indexing"
+    );
+}
+
+/// Non-3rd commits (positions 0, 1, 3, 4) should NOT have a new index UUID.
+/// Verify by checking that no vector index exists after pushes 1 and 2.
+#[tokio::test]
+async fn non_third_commit_skips_index() {
+    use crate::store::vector_index::tests::make_chunk_row;
+    use crate::store::vector_index::VECTOR_INDEX_NAME;
+
+    let dim = 128;
+    let config = crate::store::vector_index::tests::make_test_config(dim);
+    let (mut store, _tmp) = make_test_store(dim);
+    store.set_vector_index_config(config.clone());
+    let domain = "admin/non_third_skip";
+    let branch = "main";
+
+    // Push 1 commit (position 0 — should NOT create index).
+    let rows: Vec<ChunkRow> = (0..100)
+        .map(|j| make_chunk_row(&format!("doc/0_{}", j), dim, j as u64 + 1))
+        .collect();
+    push_and_tag(&store, domain, branch, "c0", &rows).await;
+
+    // Verify NO vector index exists (pipeline skips index at position 0).
+    let ds = store.io_open_dataset_readonly(domain).await.unwrap().unwrap();
+    let ds = ds.read().await;
+    let indices = ds.load_indices().await.expect("load indices");
+    assert!(
+        !indices.iter().any(|i| i.name == VECTOR_INDEX_NAME),
+        "vector index must NOT exist after 1st commit (position 0)"
+    );
+}
+
+/// After 9 pushes with boundary indexing at positions 2, 5, 8,
+/// the cascade should merge index deltas.
+#[tokio::test]
+async fn cascade_merges_at_9th_commit() {
+    use crate::store::vector_index::tests::make_chunk_row;
+    use crate::store::vector_index::{io_ensure_vector_index, VECTOR_INDEX_NAME};
+    use crate::store::lance::io_ensure_fts_index_on_dataset;
+    use crate::store::lance::io_incremental_cascade;
+
+    let dim = 128;
+    let config = crate::store::vector_index::tests::make_test_config(dim);
+    let (mut store, _tmp) = make_test_store(dim);
+    store.set_vector_index_config(config.clone());
+    let domain = "admin/cascade_9";
+    let branch = "main";
+
+    // Push 9 commits with enough data for IVF training.
+    for i in 0..9 {
+        let rows: Vec<ChunkRow> = (0..50)
+            .map(|j| make_chunk_row(&format!("doc/{}_{}", i, j), dim, (i * 50 + j) as u64 + 1))
             .collect();
-        let v = store
-            .io_upsert_chunks(domain, branch, &doc_id, &rows)
-            .await
-            .expect("push batch");
+        push_and_tag(&store, domain, branch, &format!("c{}", i), &rows).await;
 
-        // Simulate inline optimize: create delta index for new fragments.
-        let ds_arc = store.io_open_dataset(domain, branch).await.expect("open for optimize");
-        let mut ds = ds_arc.write().await;
-        io_ensure_vector_index(&mut ds, &config, false).await.expect("append vector index");
-        io_ensure_fts_index_on_dataset(&mut ds).await.expect("append FTS index");
-        drop(ds);
+        // Simulate boundary indexing at positions 2, 5, 8.
+        if crate::store::lance::should_index_commit(i) {
+            let ds_arc = store.io_open_dataset(domain, branch).await.expect("open");
+            let mut ds = ds_arc.write().await;
+            io_ensure_vector_index(&mut ds, &config, false).await.expect("vector index");
+            io_ensure_fts_index_on_dataset(&mut ds).await.expect("FTS index");
+            drop(ds);
+            store.io_refresh_cached_dataset(domain, branch).await.expect("refresh");
 
-        store.io_refresh_cached_dataset(domain, branch).await.expect("refresh after optimize");
+            // Increment delta count and run cascade.
+            store.io_increment_delta_count(domain, branch).await;
+            let delta_count = store.io_get_delta_count(domain, branch).await;
+            if let Some(mut ds_u) = store.io_open_dataset_uncached(domain, branch).await.expect("open uncached") {
+                let _ = io_incremental_cascade(&mut ds_u, delta_count).await;
+            }
+            store.io_refresh_cached_dataset(domain, branch).await.expect("refresh after cascade");
+        }
     }
 
-    // Check state before compaction.
-    let ds_before = store
-        .io_open_dataset_readonly(domain)
-        .await
-        .expect("open before")
-        .expect("dataset exists");
-    {
-        let ds = ds_before.read().await;
-        let frags_before = ds.get_fragments().len();
-        let indices_before = ds.load_indices().await.expect("load indices before");
-        let vec_count_before = indices_before.iter().filter(|i| i.name == VECTOR_INDEX_NAME).count();
-        let fts_count_before = indices_before.iter().filter(|i| i.name == "content_fts").count();
-        eprintln!(
-            "Before compaction: fragments={} vec_indices={} fts_indices={}",
-            frags_before, vec_count_before, fts_count_before
-        );
-        assert!(frags_before > 16, "should have >16 fragments before compaction, got {}", frags_before);
-        assert!(vec_count_before > 0, "should have vector indices before compaction");
-    }
-    drop(ds_before);
+    // Verify vector index exists after 9 pushes with cascade.
+    let ds = store.io_open_dataset_readonly(domain).await.unwrap().unwrap();
+    let ds = ds.read().await;
+    let indices = ds.load_indices().await.expect("load indices");
+    assert!(
+        indices.iter().any(|i| i.name == VECTOR_INDEX_NAME),
+        "vector index must exist after 9 pushes with cascade"
+    );
+}
 
-    // Phase 3: Call io_background_compact (the function under test).
-    let result = io_background_compact(&store, domain, branch).await;
-    assert!(result.is_ok(), "io_background_compact failed: {:?}", result);
+/// Search at a non-indexed commit should still return correct results
+/// (KNN fallback for at most 2 commits delta).
+#[tokio::test]
+async fn search_correct_at_non_indexed_commit() {
+    use crate::store::vector_index::tests::make_chunk_row;
 
-    // Phase 4: Verify index coverage after compaction.
-    let ds_after = store
-        .io_open_dataset_readonly(domain)
-        .await
-        .expect("open after")
-        .expect("dataset exists");
-    {
-        let ds = ds_after.read().await;
-        let frags_after = ds.get_fragments().len();
-        let indices_after = ds.load_indices().await.expect("load indices after");
-        let vec_count_after = indices_after.iter().filter(|i| i.name == VECTOR_INDEX_NAME).count();
-        let fts_count_after = indices_after.iter().filter(|i| i.name == "content_fts").count();
+    let dim = 8;
+    let (store, _tmp) = make_test_store(dim);
+    let domain = "admin/search_non_indexed";
+    let branch = "main";
 
-        eprintln!(
-            "After compaction: fragments={} vec_indices={} fts_indices={}",
-            frags_after, vec_count_after, fts_count_after
-        );
+    // Push 1 commit (position 0 — no index).
+    let rows: Vec<ChunkRow> = (0..5)
+        .map(|i| make_chunk_row(&format!("doc/{}", i), dim, i + 1))
+        .collect();
+    push_and_tag(&store, domain, branch, "c0", &rows).await;
 
-        // Compaction should have reduced fragment count.
-        // On buggy code, compaction is ineffective because fragments have
-        // different index UUIDs — DefaultCompactionPlanner bins them separately
-        // and cannot merge. Dropping indices first ensures all fragments share
-        // the same (empty) index set, allowing full consolidation.
-        assert!(
-            frags_after <= 16,
-            "compaction should reduce fragments to <=16, got {} — \
-             fragments with different index UUIDs cannot be merged without dropping indices first",
-            frags_after
-        );
-
-        // KEY ASSERTION: vector index must exist after compaction.
-        // On buggy code, the old indices are stale (reference deleted fragments)
-        // and no fresh index covers the new compacted fragments.
-        assert!(
-            vec_count_after > 0,
-            "vector index must exist after background compaction — \
-             stale indices reference deleted fragments, new fragments have no coverage"
-        );
-
-        // FTS index must also exist after compaction.
-        assert!(
-            fts_count_after > 0,
-            "FTS index must exist after background compaction"
-        );
-    }
-    drop(ds_after);
-
-    // Phase 5: Verify search still works correctly after compaction.
+    // Search at c0 — should work via flat KNN (no ANN index).
     let query = SearchQuery {
-        query_embedding: vec![0.5f32; dim],
-        query_text: "test".to_string(),
+        query_embedding: fake_embedding(dim, 1.0),
+        query_text: "content".to_string(),
         mode: SearchMode::Vector,
         start: 0,
         count: 10,
@@ -10487,10 +10684,380 @@ async fn background_compact_index_coverage() {
     let hits = store
         .io_search(domain, branch, "c0", &query)
         .await
-        .expect("search after compaction");
+        .expect("search at non-indexed commit");
     assert!(
         !hits.is_empty(),
-        "vector search must return results after background compaction"
+        "search must return results at non-indexed commit (KNN fallback)"
     );
-    eprintln!("Search after compaction: {} hits", hits.len());
+}
+
+/// Search at an indexed commit should return correct results via ANN index.
+#[tokio::test]
+async fn search_correct_at_indexed_commit() {
+    use crate::store::vector_index::tests::make_chunk_row;
+    use crate::store::vector_index::{io_ensure_vector_index, VECTOR_INDEX_NAME};
+
+    let dim = 128;
+    let config = crate::store::vector_index::tests::make_test_config(dim);
+    let (mut store, _tmp) = make_test_store(dim);
+    store.set_vector_index_config(config.clone());
+    let domain = "admin/search_indexed";
+    let branch = "main";
+
+    // Push enough data for IVF training.
+    let rows: Vec<ChunkRow> = (0..300)
+        .map(|i| make_chunk_row(&format!("doc/{}", i), dim, i + 1))
+        .collect();
+    push_and_tag(&store, domain, branch, "c0", &rows).await;
+
+    // Create vector index (simulating boundary indexing).
+    {
+        let ds_arc = store.io_open_dataset(domain, branch).await.expect("open");
+        let mut ds = ds_arc.write().await;
+        io_ensure_vector_index(&mut ds, &config, false).await.expect("create vector index");
+    }
+    store.io_refresh_cached_dataset(domain, branch).await.expect("refresh");
+
+    // Verify index exists.
+    let ds = store.io_open_dataset_readonly(domain).await.unwrap().unwrap();
+    let ds = ds.read().await;
+    let indices = ds.load_indices().await.expect("load indices");
+    assert!(indices.iter().any(|i| i.name == VECTOR_INDEX_NAME));
+
+    // Search at c0 — should work via ANN index.
+    let query = SearchQuery {
+        query_embedding: crate::store::vector_index::tests::seeded_normalized_embedding(dim, 1),
+        query_text: "content".to_string(),
+        mode: SearchMode::Vector,
+        start: 0,
+        count: 10,
+        doc_type_filter: Vec::new(),
+        doc_id_filter: Vec::new(),
+        snippet: false,
+    };
+    let hits = store
+        .io_search(domain, branch, "c0", &query)
+        .await
+        .expect("search at indexed commit");
+    assert!(
+        !hits.is_empty(),
+        "search must return results at indexed commit (ANN)"
+    );
+}
+
+/// Push 5+ commits, verify every tagged commit resolves and returns correct
+/// results for both vector and FTS search (indexed commits via ANN,
+/// non-indexed via KNN fallback).
+#[tokio::test]
+async fn snapshot_isolation_across_indexed_and_non_indexed() {
+    use crate::store::vector_index::tests::make_chunk_row;
+    use crate::store::vector_index::io_ensure_vector_index;
+    use crate::store::lance::io_ensure_fts_index_on_dataset;
+    use crate::store::lance::io_incremental_cascade;
+
+    let dim = 128;
+    let config = crate::store::vector_index::tests::make_test_config(dim);
+    let (mut store, _tmp) = make_test_store(dim);
+    store.set_vector_index_config(config.clone());
+    let domain = "admin/snapshot_isolation";
+    let branch = "main";
+
+    let commits: Vec<String> = (0..6).map(|i| format!("c{}", i)).collect();
+
+    // Push 6 commits, each with 50 docs.
+    // Pipeline flow: write data → create indices (if boundary) → tag at final version.
+    for (i, commit) in commits.iter().enumerate() {
+        let rows: Vec<ChunkRow> = (0..50)
+            .map(|j| make_chunk_row(&format!("doc/{}_{}", i, j), dim, (i * 50 + j) as u64 + 1))
+            .collect();
+
+        // Write data (simulates end-of-push append).
+        store
+            .io_upsert_chunks(domain, branch, &format!("doc_{}", commit), &rows)
+            .await
+            .expect("upsert");
+
+        // Boundary indexing at positions 2, 5: create indices BEFORE tagging
+        // so the tagged version includes index coverage.
+        if crate::store::lance::should_index_commit(i) {
+            let ds_arc = store.io_open_dataset(domain, branch).await.expect("open");
+            let mut ds = ds_arc.write().await;
+            io_ensure_vector_index(&mut ds, &config, false).await.expect("vector index");
+            io_ensure_fts_index_on_dataset(&mut ds).await.expect("FTS index");
+            drop(ds);
+            store.io_refresh_cached_dataset(domain, branch).await.expect("refresh");
+
+            store.io_increment_delta_count(domain, branch).await;
+            let delta_count = store.io_get_delta_count(domain, branch).await;
+            if let Some(mut ds_u) = store.io_open_dataset_uncached(domain, branch).await.expect("open uncached") {
+                let _ = io_incremental_cascade(&mut ds_u, delta_count).await;
+            }
+            store.io_refresh_cached_dataset(domain, branch).await.expect("refresh after cascade");
+        }
+
+        // Tag at the current HEAD version (includes indices if boundary commit).
+        let head_version = store
+            .io_branch_head_version(domain, branch)
+            .await
+            .expect("branch head version");
+        store
+            .io_tag_commit(domain, branch, commit, head_version)
+            .await
+            .expect("tag");
+    }
+
+    // Verify every tagged commit resolves and returns correct vector search results.
+    // Vector search works at ALL commits (KNN fallback for non-indexed).
+    let query = SearchQuery {
+        query_embedding: crate::store::vector_index::tests::seeded_normalized_embedding(dim, 1),
+        query_text: "content".to_string(),
+        mode: SearchMode::Vector,
+        start: 0,
+        count: 10,
+        doc_type_filter: Vec::new(),
+        doc_id_filter: Vec::new(),
+        snippet: false,
+    };
+
+    for (i, commit) in commits.iter().enumerate() {
+        let hits = store
+            .io_search(domain, branch, commit, &query)
+            .await
+            .unwrap_or_else(|_| panic!("vector search at {} failed", commit));
+        assert!(
+            !hits.is_empty(),
+            "vector search at {} (position {}) must return results, got 0 hits",
+            commit, i
+        );
+    }
+
+    // FTS search works at commits >= position 2 (after first boundary index).
+    // At positions 0-1, no FTS index exists yet — FTS returns empty (by design).
+    let fts_query = SearchQuery {
+        query_embedding: vec![0.0f32; dim],
+        query_text: "content".to_string(),
+        mode: SearchMode::Fts,
+        start: 0,
+        count: 10,
+        doc_type_filter: Vec::new(),
+        doc_id_filter: Vec::new(),
+        snippet: false,
+    };
+
+    for (i, commit) in commits.iter().enumerate() {
+        let hits = store
+            .io_search(domain, branch, commit, &fts_query)
+            .await
+            .unwrap_or_else(|_| panic!("FTS search at {} failed", commit));
+
+        if i >= 2 {
+            assert!(
+                !hits.is_empty(),
+                "FTS search at {} (position {}) must return results after first boundary index, got 0 hits",
+                commit, i
+            );
+        } else {
+            // Positions 0-1: no FTS index exists yet. FTS returns empty (expected).
+            assert!(
+                hits.is_empty(),
+                "FTS search at {} (position {}) should return empty (no FTS index yet), got {} hits",
+                commit, i, hits.len()
+            );
+        }
+    }
+}
+
+/// compact_domain drops all indices, compacts data, recreates fresh indices.
+/// This test verifies the core behavior using store-level functions
+/// (the full compact_domain is in SearchService, which requires an embed provider).
+#[tokio::test]
+async fn compact_domain_drops_recreates_and_compacts() {
+    use crate::store::vector_index::tests::make_chunk_row;
+    use crate::store::vector_index::{io_ensure_vector_index, VECTOR_INDEX_NAME};
+    use crate::store::lance::io_ensure_fts_index_on_dataset;
+    use crate::store::lance::io_compact_data;
+    use crate::store::lance::io_incremental_cascade;
+
+    let dim = 128;
+    let config = crate::store::vector_index::tests::make_test_config(dim);
+    let (mut store, _tmp) = make_test_store(dim);
+    store.set_vector_index_config(config.clone());
+    let domain = "admin/compact_drops_recreate";
+    let branch = "main";
+
+    // Push 5 commits to create multiple fragments.
+    for i in 0..5 {
+        let rows: Vec<ChunkRow> = (0..60)
+            .map(|j| make_chunk_row(&format!("doc/{}_{}", i, j), dim, (i * 60 + j) as u64 + 1))
+            .collect();
+        push_and_tag(&store, domain, branch, &format!("c{}", i), &rows).await;
+    }
+
+    // Create indices.
+    {
+        let ds_arc = store.io_open_dataset(domain, branch).await.expect("open");
+        let mut ds = ds_arc.write().await;
+        io_ensure_vector_index(&mut ds, &config, false).await.expect("vector index");
+        io_ensure_fts_index_on_dataset(&mut ds).await.expect("FTS index");
+    }
+    store.io_refresh_cached_dataset(domain, branch).await.expect("refresh");
+
+    // Verify indices exist.
+    let ds = store.io_open_dataset_readonly(domain).await.unwrap().unwrap();
+    let ds = ds.read().await;
+    let indices_before = ds.load_indices().await.expect("load indices");
+    let frags_before = ds.get_fragments().len();
+    assert!(indices_before.iter().any(|i| i.name == VECTOR_INDEX_NAME));
+    assert!(frags_before > 1, "should have multiple fragments before compaction");
+    drop(ds);
+
+    // Simulate compact_domain: drop all indices, compact, recreate.
+    {
+        let ds = store.io_open_dataset_uncached(domain, branch).await.expect("open uncached").expect("dataset");
+        let mut ds = ds;
+
+        // Step 1: Drop all indices.
+        let indices = ds.load_indices().await.expect("load indices");
+        let names: Vec<String> = indices.iter().map(|i| i.name.clone()).collect();
+        for name in &names {
+            ds.drop_index(name).await.expect("drop index");
+        }
+
+        // Step 2: Compact data.
+        io_compact_data(&mut ds, true).await.expect("compact data");
+
+        // Step 3: Recreate indices.
+        io_ensure_vector_index(&mut ds, &config, false).await.expect("recreate vector index");
+        io_ensure_fts_index_on_dataset(&mut ds).await.expect("recreate FTS index");
+
+        // Step 4: Reset delta count + cascade.
+        store.io_reset_delta_count(domain, branch).await;
+        let delta_count = store.io_get_delta_count(domain, branch).await;
+        let _ = io_incremental_cascade(&mut ds, delta_count).await;
+    }
+
+    // Cleanup + refresh.
+    let _ = store.io_cleanup_aggressive(domain, branch).await;
+    let _ = store.io_prune_empty_index_dirs(domain);
+    store.io_refresh_cached_dataset(domain, branch).await.expect("refresh");
+
+    // Verify indices exist after compaction.
+    let ds = store.io_open_dataset_readonly(domain).await.unwrap().unwrap();
+    let ds = ds.read().await;
+    let indices_after = ds.load_indices().await.expect("load indices after");
+    let frags_after = ds.get_fragments().len();
+    assert!(
+        indices_after.iter().any(|i| i.name == VECTOR_INDEX_NAME),
+        "vector index must exist after compact_domain"
+    );
+    assert!(
+        indices_after.iter().any(|i| i.name == "content_fts"),
+        "FTS index must exist after compact_domain"
+    );
+    assert!(
+        frags_after <= frags_before,
+        "fragment count after compaction should be <= before ({} -> {})",
+        frags_before, frags_after
+    );
+}
+
+/// Deleting a domain should reset index_delta_counts for all its branches.
+#[tokio::test]
+async fn delete_domain_resets_delta_count() {
+    use crate::store::vector_index::tests::make_chunk_row;
+
+    let dim = 8;
+    let (store, _tmp) = make_test_store(dim);
+    let domain = "admin/delete_delta_reset";
+    let branch = "main";
+
+    // Push a commit and increment delta count.
+    let rows: Vec<ChunkRow> = (0..5)
+        .map(|i| make_chunk_row(&format!("doc/{}", i), dim, i + 1))
+        .collect();
+    push_and_tag(&store, domain, branch, "c0", &rows).await;
+    store.io_increment_delta_count(domain, branch).await;
+    store.io_increment_delta_count(domain, branch).await;
+
+    // Verify delta count is 2.
+    let count = store.io_get_delta_count(domain, branch).await;
+    assert_eq!(count, 2, "delta count should be 2 before delete");
+
+    // Delete domain.
+    store.io_delete_domain(domain).await.expect("delete domain");
+
+    // Verify delta count is reset (returns 0 for missing key).
+    let count = store.io_get_delta_count(domain, branch).await;
+    assert_eq!(count, 0, "delta count should be 0 after domain delete");
+}
+
+/// Deleting a branch index should reset index_delta_counts for that branch.
+#[tokio::test]
+async fn delete_branch_index_resets_delta_count() {
+    use crate::store::vector_index::tests::make_chunk_row;
+
+    let dim = 8;
+    let (store, _tmp) = make_test_store(dim);
+    let domain = "admin/delete_branch_delta_reset";
+    let branch = "main";
+
+    // Push a commit and increment delta count.
+    let rows: Vec<ChunkRow> = (0..5)
+        .map(|i| make_chunk_row(&format!("doc/{}", i), dim, i + 1))
+        .collect();
+    push_and_tag(&store, domain, branch, "c0", &rows).await;
+    store.io_increment_delta_count(domain, branch).await;
+    store.io_increment_delta_count(domain, branch).await;
+    store.io_increment_delta_count(domain, branch).await;
+
+    // Verify delta count is 3.
+    let count = store.io_get_delta_count(domain, branch).await;
+    assert_eq!(count, 3, "delta count should be 3 before delete");
+
+    // Delete branch index.
+    store.io_delete_branch_index(domain, branch).await.expect("delete branch index");
+
+    // Verify delta count is reset.
+    let count = store.io_get_delta_count(domain, branch).await;
+    assert_eq!(count, 0, "delta count should be 0 after branch index delete");
+}
+
+/// io_count_branch_commits returns the correct count of tagged commits.
+#[tokio::test]
+async fn io_count_branch_commits_returns_correct_count() {
+    use crate::store::vector_index::tests::make_chunk_row;
+
+    let dim = 8;
+    let (store, _tmp) = make_test_store(dim);
+    let domain = "admin/count_commits";
+    let branch = "main";
+
+    // Initially 0 commits.
+    assert_eq!(count_tags(&store, domain, branch).await, 0);
+
+    // Push 5 commits.
+    for i in 0..5 {
+        let rows: Vec<ChunkRow> = vec![make_chunk_row(&format!("doc/{}", i), dim, i + 1)];
+        push_and_tag(&store, domain, branch, &format!("c{}", i), &rows).await;
+    }
+
+    // Should have 5 tagged commits.
+    assert_eq!(
+        count_tags(&store, domain, branch).await,
+        5,
+        "should have 5 tagged commits"
+    );
+
+    // Push 3 more.
+    for i in 5..8 {
+        let rows: Vec<ChunkRow> = vec![make_chunk_row(&format!("doc/{}", i), dim, i + 1)];
+        push_and_tag(&store, domain, branch, &format!("c{}", i), &rows).await;
+    }
+
+    // Should have 8 tagged commits.
+    assert_eq!(
+        count_tags(&store, domain, branch).await,
+        8,
+        "should have 8 tagged commits"
+    );
 }

@@ -412,6 +412,11 @@ impl LanceStore {
             let mut guards = self.domain_guards.write().await;
             guards.remove(domain);
         }
+        {
+            // Purge index delta counts for all branches of this domain.
+            let mut deltas = self.index_delta_counts.write().await;
+            deltas.retain(|(d, _b), _| d != domain);
+        }
 
         Ok(())
     }
@@ -489,8 +494,9 @@ impl LanceStore {
             inflight.retain(|(d, b, _c)| !(*d == domain && *b == branch));
         }
         {
-            let mut compaction = self.compaction_in_progress.write().await;
-            compaction.remove(&key);
+            // Purge index delta count for this (domain, branch).
+            let mut deltas = self.index_delta_counts.write().await;
+            deltas.remove(&key);
         }
 
         Ok(())
