@@ -435,13 +435,6 @@ impl SearchService {
 
         match result {
             Ok((indexed, skipped)) => {
-                if indexed > 0 {
-                    LanceStore::maybe_trigger_background_compaction(
-                        Arc::clone(&store_after),
-                        domain_after.clone(),
-                        branch_after.clone(),
-                    );
-                }
                 store_after
                     .record_task(
                         &task_id_clone,
@@ -615,13 +608,6 @@ impl SearchService {
             // Record task status and release reservation inside the spawned task.
             match result {
                 Ok((indexed, skipped)) => {
-                    if indexed > 0 {
-                        LanceStore::maybe_trigger_background_compaction(
-                            Arc::clone(&store),
-                            domain_str.clone(),
-                            branch.clone(),
-                        );
-                    }
                     store
                         .record_task(
                             &task_id_clone,

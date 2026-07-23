@@ -287,8 +287,6 @@ pub struct InternalStats {
     pub domain_guards: usize,
     /// Number of in-flight commit reservations.
     pub inflight_commits: usize,
-    /// Number of domains with compaction in progress.
-    pub compaction_in_progress: usize,
     /// Pipeline progress: chunks chunked but not yet embedded.
     pub pipeline_pending_chunks: u64,
     /// Pipeline progress: chunks embedded but not yet written to Lance.

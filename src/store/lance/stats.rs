@@ -505,7 +505,6 @@ impl LanceStore {
         let pipeline_locks = self.pipeline_locks.read().await.len();
         let domain_guards = self.domain_guards.read().await.len();
         let inflight_commits = self.inflight_commits.read().await.len();
-        let compaction_in_progress = self.compaction_in_progress.read().await.len();
 
         InternalStats {
             cached_datasets,
@@ -514,7 +513,6 @@ impl LanceStore {
             pipeline_locks,
             domain_guards,
             inflight_commits,
-            compaction_in_progress,
             pipeline_pending_chunks: self.pipeline_pending_chunks.load(std::sync::atomic::Ordering::Relaxed),
             pipeline_embedded_chunks: self.pipeline_embedded_chunks.load(std::sync::atomic::Ordering::Relaxed),
             pipeline_written_chunks: self.pipeline_written_chunks.load(std::sync::atomic::Ordering::Relaxed),

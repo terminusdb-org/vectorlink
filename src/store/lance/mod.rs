@@ -37,8 +37,7 @@ pub use self::schema::{
 };
 pub use self::dedup::{dedup_chunks_to_documents, pairs_from_neighbours};
 pub use self::index::{io_compact_data, io_ensure_fts_index_on_dataset, io_merge_indices};
-pub(crate) use self::write::io_background_compact;
-pub use self::rollup::{io_exponential_rollup, io_incremental_cascade, merges_needed, rollup_partitions};
+pub use self::rollup::{io_exponential_rollup, io_incremental_cascade, merges_needed, rollup_partitions, should_index_commit};
 pub use self::commit::VersionDelta;
 
 /// Cleanup mode controls how aggressive version cleanup interacts with
@@ -173,16 +172,6 @@ pub struct LanceStore {
     /// the regression test can assert reads reuse the cache rather than opening
     /// fresh per query.
     fresh_open_count: std::sync::atomic::AtomicU64,
-    /// Per-(domain, branch) guard preventing concurrent background compactions.
-    /// A domain/branch key is present while a background compaction task is
-    /// in-flight; a 5% roll that hits while a compaction is already running is
-    /// a no-op. Guards are removed on task completion (success or failure).
-    pub(super) compaction_in_progress: RwLock<std::collections::HashSet<BranchKey>>,
-    /// Whether probabilistic auto-compaction is enabled. When `false`,
-    /// `maybe_trigger_background_compaction` is a no-op (early-returns).
-    /// Explicit `/compact` still works regardless. Controlled by
-    /// `TDB_SEARCH_DISABLE_AUTO_COMPACTION=1` at boot.
-    auto_compaction_enabled: std::sync::atomic::AtomicBool,
     /// Per-domain settings (clustering, etc.). Loaded from
     /// `domain_settings.json` at startup.
     pub domain_settings: DomainSettingsMap,
@@ -237,8 +226,6 @@ impl LanceStore {
             inflight_commits: RwLock::new(std::collections::HashSet::new()),
             reservation_lock: tokio::sync::Mutex::new(()),
             fresh_open_count: std::sync::atomic::AtomicU64::new(0),
-            compaction_in_progress: RwLock::new(std::collections::HashSet::new()),
-            auto_compaction_enabled: std::sync::atomic::AtomicBool::new(true),
             domain_settings,
             lance_session: Arc::new(Session::new(
                 lance_index_cache_bytes,
@@ -254,13 +241,6 @@ impl LanceStore {
             index_delta_counts: RwLock::new(HashMap::new()),
             cleanup_mode: std::sync::atomic::AtomicU8::new(CleanupMode::CurrentCode as u8),
         }
-    }
-
-    /// Disable probabilistic auto-compaction. Explicit `/compact` still works.
-    /// Used by integration tests for deterministic compaction control.
-    pub fn set_auto_compaction_enabled(&self, enabled: bool) {
-        self.auto_compaction_enabled
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Set the cleanup mode. Controls how version cleanup interacts with

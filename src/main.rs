@@ -61,13 +61,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         config.lance_metadata_cache_bytes,
     ));
 
-    // Disable probabilistic auto-compaction when opted out (deterministic test mode).
-    // Explicit POST /compact still works regardless.
-    if std::env::var("TDB_SEARCH_DISABLE_AUTO_COMPACTION").unwrap_or_default() == "1" {
-        lance_store.set_auto_compaction_enabled(false);
-        eprintln!("[config] auto-compaction DISABLED (TDB_SEARCH_DISABLE_AUTO_COMPACTION=1)");
-    }
-
     // Startup cleanup: delete any stale __compact_rebuild branches left by
     // a crashed compaction. This is a critical safety check — a lingering
     // rebuild branch indicates a crashed compaction and should not be served.
@@ -107,12 +100,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
-
-            // Disable auto-compaction immediately — no new compaction should start
-            // during shutdown. This ensures we can exit quickly once pipeline tasks
-            // finish their current batch.
-            store_for_shutdown.set_auto_compaction_enabled(false);
-            eprintln!("[shutdown] auto-compaction disabled, waiting for in-flight pipeline tasks...");
 
             // Wait for all in-flight pipeline tasks to complete.
             // These tasks are tokio::spawn'd background tasks that write data to

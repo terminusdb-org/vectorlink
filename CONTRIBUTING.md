@@ -52,6 +52,75 @@ make server-clean     # stop, wipe storage, start fresh
 make server-status    # show status
 ```
 
+### Reindexing a domain
+
+When the tdb-search binary is rebuilt with indexing changes (new index cadence, compaction logic, or vector index config), existing domains must be reindexed to pick up the new architecture. The reindex is triggered through the TerminusDB indexer plugin, which wipes the branch index on tdb-search and replays all commits from the oldest forward.
+
+**Prerequisites:**
+- Both servers running (`make server-start` or `make server-restart` after a fresh build)
+- The release binary in place (`make build-release` or `cargo build --release`)
+- The embedding provider (Ollama) running and reachable
+
+**Trigger a reindex:**
+
+```bash
+# Restart both servers to pick up the new binary
+make server-restart
+
+# Trigger reindex for a specific domain via the TerminusDB API
+curl -X POST http://127.0.0.1:7373/api/index/<org>/<db> \
+  -u admin:root \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+For example, to reindex `admin/product_assortment`:
+
+```bash
+curl -X POST http://127.0.0.1:7373/api/index/admin/product_assortment \
+  -u admin:root \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+**Monitor progress:**
+
+```bash
+# Check indexer status (commits processed, documents sent, searchable count)
+curl -s http://127.0.0.1:7373/api/index/admin/product_assortment -u admin:root | python3 -m json.tool
+```
+
+Key fields in the response:
+- `status`: `indexing`, `completed`, `not_found`, or `error`
+- `branch_processing.commits_processed` / `branch_processing.total_commits`: commit-level progress
+- `engine.documents_sent`: total documents pushed to tdb-search
+- `engine.searchable_documents`: documents available for search
+- `last_indexed_commit`: the most recent commit tagged in tdb-search
+
+**Verify after reindex:**
+
+```bash
+# Check statistics
+curl -s 'http://127.0.0.1:7372/statistics?domain=admin/product_assortment' -u admin:root | python3 -m json.tool
+
+# Check integrity (no orphaned tags, no stale index dirs, no dangling refs)
+curl -s 'http://127.0.0.1:7372/integrity?domain=admin/product_assortment' -u admin:root | python3 -m json.tool
+
+# Test FTS search at the last indexed commit
+curl -s 'http://127.0.0.1:7372/last-indexed?domain=admin/product_assortment&branch=main' -u admin:root
+# Use the returned commit value in the search query:
+curl -s "http://127.0.0.1:7372/search?domain=admin/product_assortment&branch=main&commit=<commit>&mode=fts&count=5&q=test" -u admin:root | python3 -m json.tool
+
+# Check store size (should be under 25 GB for production datasets)
+du -sh /tmp/tdb-search-data/admin__<org>__<db>.lance/
+```
+
+**Notes:**
+- Reindexing is idempotent — running it again on an already-indexed domain replays all commits but reuses cached embeddings (sled embed cache), so subsequent runs are faster.
+- The embed cache is preserved across restarts (stored in `<data_dir>/embed_cache/`). Reindexing after a binary change does not require re-embedding unchanged texts.
+- The `commit=latest` alias does not work for search; always use the actual commit ID from `last-indexed`.
+- Boundary-aware indexing creates index deltas at every 3rd commit (positions 2, 5, 8, ...). Non-indexed commits rely on flat KNN fallback for vector search. FTS search only works at commits that have an FTS index (from the first boundary commit onward).
+
 ### E2E test with TerminusDB
 
 The E2E test (`tests/e2e/indexer-push-e2e.js` in the terminusdb repo) exercises the full pipeline: schema with embedding metadata, document insertion, automatic indexer push, and search through both the TerminusDB proxy and tdb-search directly.

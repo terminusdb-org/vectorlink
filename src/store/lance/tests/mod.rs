@@ -2963,8 +2963,8 @@ async fn post_compaction_snapshot_isolation_regression_guard() {
             .expect("upsert filler");
     }
 
-    // Trigger compaction (mirrors io_background_compact: uncached open, compact,
-    // refresh). Total fragments = 2 (A, B) + 16 (fillers) = 18 > threshold of 16.
+    // Trigger compaction (uncached open, compact, refresh).
+    // Total fragments = 2 (A, B) + 16 (fillers) = 18 > threshold of 16.
     {
         let ds = store
             .io_open_dataset_uncached(domain, "main")
@@ -2989,7 +2989,7 @@ async fn post_compaction_snapshot_isolation_regression_guard() {
             ds.version().version
         );
     }
-    // Refresh the cached handle (as io_background_compact does after compaction).
+    // Refresh the cached handle after compaction.
     store
         .io_refresh_cached_dataset(domain, "main")
         .await
@@ -3561,7 +3561,7 @@ async fn fd_measurement_historical_version_search_after_compaction() {
             ds.version().version
         );
     }
-    // Refresh the cached handle after compaction (as io_background_compact does).
+    // Refresh the cached handle after compaction.
     store
         .io_refresh_cached_dataset(domain, "main")
         .await
@@ -5938,9 +5938,9 @@ async fn delta_fork_uses_previous_commit_not_boundary() {
 
 // --- FULL REINDEXING: compaction pipeline with delta-fork retagging ---
 
-/// Helper: run the compaction pipeline steps that mirror `io_background_compact`:
-/// open uncached, compact data, aggressive cleanup, delta-fork retag, aggressive
-/// cleanup again, prune empty index dirs, refresh cached handle.
+/// Helper: run the compaction pipeline steps: open uncached, compact data,
+/// aggressive cleanup, delta-fork retag, aggressive cleanup again, prune
+/// empty index dirs, refresh cached handle.
 async fn run_compaction_pipeline(store: &LanceStore, domain: &str, branch: &str) {
     use crate::store::lance::io_compact_data;
 
@@ -6481,8 +6481,7 @@ fn dir_has_files(dir: &std::path::Path) -> bool {
 
 /// Helper: run the FULL compaction pipeline that mirrors the HTTP API
 /// compaction (service/mod.rs `compact_domain`). This includes index
-/// drop/recreate and incremental cascade — the background compaction
-/// (`io_background_compact`) skips these steps.
+/// drop/recreate and incremental cascade.
 ///
 /// **DRIFT WARNING (REVIEW-7):** This function manually duplicates the
 /// steps in `SearchService::compact_domain`. Any change to the compaction
@@ -8260,7 +8259,6 @@ async fn setup_ten_commits_with_cleanup_mode(
     let config = crate::store::vector_index::tests::make_test_config(dim);
     let (mut store, tmp) = make_test_store(dim);
     store.set_vector_index_config(config.clone());
-    store.set_auto_compaction_enabled(false);
     store.set_cleanup_mode(cleanup_mode);
 
     let mut commits: Vec<(String, u64)> = Vec::new();
@@ -9426,9 +9424,8 @@ async fn aggressive_cleanup_preserves_tagged_manifests_on_main() {
     assert_tags_resolve(&store, domain, "after cleanup 2").await;
 }
 
-/// Full compaction flow: mirrors io_background_compact (write.rs:316-396)
-/// step-by-step using the REAL production functions. Every tagged
-/// manifest must survive every stage.
+/// Full compaction flow: step-by-step using the REAL production functions.
+/// Every tagged manifest must survive every stage.
 #[tokio::test]
 async fn compaction_flow_preserves_tagged_manifests() {
     let (store, _tmp) = make_test_store(8);
@@ -9453,14 +9450,14 @@ async fn compaction_flow_preserves_tagged_manifests() {
 
     assert_tags_resolve(&store, domain, "after setup").await;
 
-    // Step 2 of io_background_compact: aggressive cleanup before retagging.
+    // Step 2: aggressive cleanup before retagging.
     store
         .io_cleanup_aggressive(domain, "main")
         .await
         .expect("pre-retag cleanup");
     assert_tags_resolve(&store, domain, "after pre-retag cleanup").await;
 
-    // Step 3 of io_background_compact: delta-fork retagging.
+    // Step 3: delta-fork retagging.
     let head = store
         .io_branch_head_version(domain, "main")
         .await

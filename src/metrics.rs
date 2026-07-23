@@ -89,10 +89,6 @@ async fn render_metrics(service: &SearchService) -> String {
     out.push_str("# TYPE tdb_search_inflight_commits gauge\n");
     out.push_str(&format!("tdb_search_inflight_commits {}\n", internal.inflight_commits));
 
-    out.push_str("# HELP tdb_search_compaction_in_progress Number of domains with compaction in progress\n");
-    out.push_str("# TYPE tdb_search_compaction_in_progress gauge\n");
-    out.push_str(&format!("tdb_search_compaction_in_progress {}\n", internal.compaction_in_progress));
-
     // ── Pipeline progress ──
     out.push_str("# HELP tdb_search_pipeline_pending_chunks Chunks chunked but not yet written to Lance\n");
     out.push_str("# TYPE tdb_search_pipeline_pending_chunks gauge\n");
