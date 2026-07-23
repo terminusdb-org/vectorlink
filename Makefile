@@ -185,13 +185,11 @@ dev-up-release: build-release
 
 # build-release: RELEASE build (no LTO). Fast enough for `make pr` gate
 # (incremental relinks). LTO only in `make release-image` (production publish).
-# Binary copied to host target/release/.
+# Binary lands in host target/release/.
 .PHONY: build-release
 build-release:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		$(DOCKER_RUN) \
-			cargo build --release ; \
-		$(MAKE) copy-binaries PROFILE_DIR=release ; \
+		cargo build --release ; \
 	else \
 		echo "• release build skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
