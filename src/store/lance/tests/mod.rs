@@ -6938,11 +6938,11 @@ async fn manifest_count_tag_distribution_and_boundaries_are_exact() {
         setup_two_compaction_cycles(8, "admin/proof_exact_state").await;
 
     let boundaries = expected_boundary_positions(commits.len());
-    let expected_boundary_commits: Vec<&str> = boundaries
+    let _expected_boundary_commits: Vec<&str> = boundaries
         .iter()
         .map(|&i| commits[i].0.as_str())
         .collect();
-    let expected_intermediate_count = commits.len() - boundaries.len();
+    let _expected_intermediate_count = commits.len() - boundaries.len();
 
     // --- Tag distribution ---
     let uri = path.to_string_lossy().to_string();
@@ -7041,7 +7041,7 @@ async fn manifest_count_tag_distribution_and_boundaries_are_exact() {
         .iter()
         .filter_map(|(tag, _)| crate::layeridx::decode_commit_tag(tag).ok())
         .collect();
-    for (i, (commit, _)) in commits.iter().enumerate() {
+    for (commit, _) in commits.iter() {
         assert!(
             main_commit_names.contains(commit) || rebuild_commit_names.contains(commit),
             "commit {} must be tagged on either main or rebuild branch",
@@ -8444,7 +8444,7 @@ fn count_non_empty_index_dirs(dir: &std::path::Path) -> usize {
                 .filter_map(|e| e.ok())
                 .filter(|e| {
                     e.path().is_dir()
-                        && std::fs::read_dir(&e.path())
+                        && std::fs::read_dir(e.path())
                             .map(|d| d.filter(|e| e.is_ok()).count() > 0)
                             .unwrap_or(false)
                 })
@@ -8454,6 +8454,7 @@ fn count_non_empty_index_dirs(dir: &std::path::Path) -> usize {
 }
 
 /// Count manifest files in _versions/.
+#[allow(dead_code)]
 fn count_manifests(dir: &std::path::Path) -> usize {
     if !dir.exists() {
         return 0;
@@ -8587,7 +8588,7 @@ async fn cleanup_battery_head_has_900_rows() {
 async fn cleanup_battery_main_data_files_bounded() {
     let dim = 8;
     let domain = "admin/cleanup_battery_datafiles";
-    let (store, _tmp, _commits, path) =
+    let (_store, _tmp, _commits, path) =
         setup_ten_commits_one_compaction(dim, domain).await;
 
     print_full_disk_report(&path);
@@ -8613,7 +8614,7 @@ async fn cleanup_battery_main_data_files_bounded() {
 async fn cleanup_battery_main_index_dirs_bounded() {
     let dim = 8;
     let domain = "admin/cleanup_battery_indexdirs";
-    let (store, _tmp, _commits, path) =
+    let (_store, _tmp, _commits, path) =
         setup_ten_commits_one_compaction(dim, domain).await;
 
     let indices_dir = path.join("_indices");
@@ -8637,7 +8638,7 @@ async fn cleanup_battery_main_index_dirs_bounded() {
 async fn cleanup_battery_rebuild_branch_exists() {
     let dim = 8;
     let domain = "admin/cleanup_battery_rebuild";
-    let (store, _tmp, _commits, path) =
+    let (store, _tmp, _commits, _path) =
         setup_ten_commits_one_compaction(dim, domain).await;
 
     let rebuild_branch = find_rebuild_branch(&store, domain).await;
@@ -8669,7 +8670,7 @@ async fn cleanup_battery_rebuild_branch_exists() {
 async fn cleanup_battery_rebuild_branch_data_files_on_disk() {
     let dim = 8;
     let domain = "admin/cleanup_battery_rebuild_data";
-    let (store, _tmp, _commits, path) =
+    let (store, _tmp, _commits, _path) =
         setup_ten_commits_one_compaction(dim, domain).await;
 
     let rebuild_branch = find_rebuild_branch(&store, domain).await;
@@ -8686,7 +8687,7 @@ async fn cleanup_battery_rebuild_branch_data_files_on_disk() {
             .expect("rebuild branch dataset exists");
         let fragments = ds.get_fragments();
         assert!(
-            fragments.len() > 0,
+            !fragments.is_empty(),
             "rebuild branch '{}' should have fragments referencing data files",
             branch_name
         );
@@ -8716,7 +8717,7 @@ async fn cleanup_battery_rebuild_branch_data_files_on_disk() {
 async fn cleanup_battery_no_orphaned_data_files() {
     let dim = 8;
     let domain = "admin/cleanup_battery_orphans";
-    let (store, _tmp, _commits, path) =
+    let (_store, _tmp, _commits, path) =
         setup_ten_commits_one_compaction(dim, domain).await;
 
     print_full_disk_report(&path);
@@ -8774,7 +8775,7 @@ async fn cleanup_battery_integrity_check_passes() {
 async fn cleanup_battery_tag_distribution_boundary_vs_intermediate() {
     let dim = 8;
     let domain = "admin/cleanup_battery_tagdist";
-    let (store, _tmp, commits, _path) =
+    let (store, _tmp, _commits, _path) =
         setup_ten_commits_one_compaction(dim, domain).await;
 
     let rebuild_branch = find_rebuild_branch(&store, domain).await;
@@ -8860,7 +8861,7 @@ async fn cleanup_battery_no_stale_rebuild_branches() {
 async fn cleanup_battery_disk_usage_bounded_and_reported() {
     let dim = 8;
     let domain = "admin/cleanup_battery_diskreport";
-    let (store, _tmp, _commits, path) =
+    let (_store, _tmp, _commits, path) =
         setup_ten_commits_one_compaction(dim, domain).await;
 
     print_full_disk_report(&path);
@@ -8985,7 +8986,7 @@ async fn cleanup_battery_mode_a_rebuild_branch_has_fragments() {
         setup_ten_commits_with_cleanup_mode(dim, domain, CleanupMode::TargetNoPatch).await;
     let rebuild = find_rebuild_branch(&store, domain).await.expect("rebuild branch");
     let ds = store.io_open_dataset_uncached(domain, &rebuild).await.expect("open").expect("exists");
-    assert!(ds.get_fragments().len() > 0, "Mode A: rebuild branch should have fragments");
+    assert!(!ds.get_fragments().is_empty(), "Mode A: rebuild branch should have fragments");
 }
 
 #[tokio::test]
@@ -9181,7 +9182,7 @@ async fn cleanup_battery_mode_b_rebuild_branch_has_fragments() {
         setup_ten_commits_with_cleanup_mode(dim, domain, CleanupMode::TargetWithPatch).await;
     let rebuild = find_rebuild_branch(&store, domain).await.expect("rebuild branch");
     let ds = store.io_open_dataset_uncached(domain, &rebuild).await.expect("open").expect("exists");
-    assert!(ds.get_fragments().len() > 0, "Mode B: rebuild branch should have fragments");
+    assert!(!ds.get_fragments().is_empty(), "Mode B: rebuild branch should have fragments");
 }
 
 #[tokio::test]
@@ -9668,7 +9669,7 @@ async fn production_store_branch_field() {
                 main_broken += 1;
                 eprintln!("  BROKEN main tag: {} -> version={}", tag_name, tc.version);
             }
-            (Some(b), true) => rebuild_ok += 1,
+            (Some(_b), true) => rebuild_ok += 1,
             (Some(b), false) => {
                 rebuild_broken += 1;
                 eprintln!("  BROKEN rebuild tag: {} -> version={}, branch={}", tag_name, tc.version, b);
@@ -9724,6 +9725,7 @@ async fn production_store_branch_field() {
 ///   cargo test --lib store::lance::tests -- production_store_historic_searchability --ignored --nocapture
 #[tokio::test]
 #[ignore]
+#[allow(clippy::excessive_precision)]
 async fn production_store_historic_searchability() {
     use std::time::Instant;
 
@@ -9912,7 +9914,7 @@ async fn production_store_historic_searchability() {
             Ok(ds) => {
                 // Count fragments and rows.
                 let fragment_count = ds.manifest.fragments.len();
-                let total_rows: usize = ds.manifest.fragments.iter().map(|f| f.num_rows().unwrap_or(0) as usize).sum();
+                let total_rows: usize = ds.manifest.fragments.iter().map(|f| f.num_rows().unwrap_or(0)).sum();
 
                 // Vector search via io_search (public API).
                 let vq = SearchQuery {
@@ -10113,8 +10115,8 @@ async fn production_store_index_coverage() {
 
     eprintln!("=== INDEX COVERAGE AT KEY VERSIONS ===");
     eprintln!(
-        "{:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {}",
-        "version", "frags", "indexed", "unindexed", "pct_idx", "idx_files", "note"
+        "{:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}  note",
+        "version", "frags", "indexed", "unindexed", "pct_idx", "idx_files"
     );
     eprintln!("{}", "-".repeat(70));
 
@@ -10218,8 +10220,8 @@ async fn active_compaction_latency_cliff() {
     // Trigger compaction manually after every 20th push (simulating background compaction).
     eprintln!("\n=== Phase 2: Incremental pushes with latency measurement ===");
     eprintln!(
-        "{:>5}  {:>6}  {:>6}  {:>8}  {:>8}  {}",
-        "push", "frags", "rows", "vec_ms", "delta_ms", "event"
+        "{:>5}  {:>6}  {:>6}  {:>8}  {:>8}  event",
+        "push", "frags", "rows", "vec_ms", "delta_ms"
     );
     eprintln!("{}", "-".repeat(60));
 
@@ -10401,6 +10403,7 @@ fn make_search_query(dim: usize, mode: SearchMode) -> SearchQuery {
     }
 }
 
+#[allow(dead_code)]
 struct SearchResult {
     commit_id: String,
     tag_name: String,
@@ -11076,7 +11079,7 @@ async fn fts_index_exists_after_first_push() {
 
     // Push data (upsert creates the dataset + appends rows).
     let rows = vec![make_chunk_row("doc/apple", dim, 1)];
-    let v = store
+    let _v = store
         .io_upsert_chunks(domain, "main", "doc_c0", &rows)
         .await
         .expect("upsert");
@@ -11163,7 +11166,7 @@ async fn fts_search_works_at_all_commit_versions() {
     for i in 0..6u32 {
         let doc_id = format!("doc/item_{}", i);
         let rows = vec![make_chunk_row(&doc_id, dim, (i + 1) as u64)];
-        let v = store
+        let _v = store
             .io_upsert_chunks(domain, "main", &format!("doc_c{}", i), &rows)
             .await
             .expect("upsert");
@@ -11232,7 +11235,7 @@ async fn fts_search_works_at_all_commit_versions() {
         let hits = store
             .io_search(domain, "main", commit, &query)
             .await
-            .expect(&format!("FTS search at {}", commit));
+            .unwrap_or_else(|_| panic!("FTS search at {}", commit));
         assert!(
             !hits.is_empty(),
             "FTS search at {} must return hits, got 0",

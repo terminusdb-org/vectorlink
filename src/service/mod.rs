@@ -2763,7 +2763,7 @@ async fn io_run_index_pipeline_stream(
         // KNN fallback for search (at most 2 commits delta).
         let action = should_create_index(commit_position);
 
-        let mut indexed_version: Option<u64> = None;
+        let indexed_version: Option<u64>;
 
         if action == IndexAction::Create {
             let vector_config = ctx.store.vector_index_config().clone();
