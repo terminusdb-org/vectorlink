@@ -247,10 +247,54 @@ describe("Security: filter injection prevention", function () {
     const ids = await searchIds(DOMAIN, "sec-commit-002", newText, "vector")
     expect(ids).to.include(target.id)
 
-    // The old content should no longer match this doc at the new commit
-    // (Changed = replace, not append)
-    const oldIds = await searchIds(DOMAIN, "sec-commit-002", target.text, "vector")
-    expect(oldIds).to.not.include(target.id)
+    // The old content should no longer appear in any result at the new commit.
+    // Check both the ID and the actual content — the old text must not be
+    // present in any returned snippet (Changed = replace, not append).
+    const debugRes = await agent()
+      .get("/search")
+      .query({ domain: DOMAIN, commit: "sec-commit-002", q: target.text, mode: "vector", snippet: true, count: 10 })
+      .set("Authorization", authHeader())
+
+    const oldHits = debugRes.body
+    const oldSnippets = oldHits.map((h) => h.chunk.snippet).filter(Boolean)
+    const oldTextPresent = oldSnippets.some((s) => s.includes(target.text))
+
+    // The doc's old content must not appear in any result
+    expect(oldTextPresent).to.equal(false)
+
+    // The doc must not appear with its old content — check by ID + content match
+    const targetWithOldContent = oldHits.find((h) => h.id === target.id && h.chunk.snippet && h.chunk.snippet.includes(target.text))
+    expect(targetWithOldContent).to.equal(undefined)
+  })
+
+  // ── Phase 5b: Changed op on a benign id — same behaviour, no malice ──
+
+  it("should update a benign-id doc via Changed without creating duplicates", async function () {
+    const benignId = "benign_doc_001"
+    const benignOldText = "A completely benign document about cats and dogs"
+    const benignNewText = "A completely benign document about quantum physics and relativity"
+
+    const result = await pushAndWait(DOMAIN, BRANCH, "sec-commit-002b", [
+      { op: "Changed", id: benignId, string: benignNewText },
+    ])
+    expect(result.status).to.equal("Complete")
+
+    // Search at the new commit — should find the updated content
+    const ids = await searchIds(DOMAIN, "sec-commit-002b", benignNewText, "vector")
+    expect(ids).to.include(benignId)
+
+    // The old content should not appear in any snippet at the new commit
+    const debugRes = await agent()
+      .get("/search")
+      .query({ domain: DOMAIN, commit: "sec-commit-002b", q: benignOldText, mode: "vector", snippet: true, count: 10 })
+      .set("Authorization", authHeader())
+    const oldSnippets = debugRes.body.map((h) => h.chunk.snippet).filter(Boolean)
+    const oldTextPresent = oldSnippets.some((s) => s.includes(benignOldText))
+    expect(oldTextPresent).to.equal(false)
+
+    // The doc must not appear with its old content
+    const targetWithOldContent = debugRes.body.find((h) => h.id === benignId && h.chunk.snippet && h.chunk.snippet.includes(benignOldText))
+    expect(targetWithOldContent).to.equal(undefined)
   })
 
   // ── Phase 6: Deleted op on malicious id removes it ──────────────────
@@ -275,7 +319,8 @@ describe("Security: filter injection prevention", function () {
   // ── Phase 7: Benign doc is unaffected by any malicious operations ───
 
   it("should still find the benign doc after all malicious operations", async function () {
-    const ids = await searchIds(DOMAIN, "sec-commit-003", "cats and dogs", "vector")
+    // Phase 5b updated the benign doc to quantum physics content
+    const ids = await searchIds(DOMAIN, "sec-commit-003", "quantum physics and relativity", "vector")
     expect(ids).to.include("benign_doc_001")
   })
 

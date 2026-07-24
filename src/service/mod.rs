@@ -247,8 +247,8 @@ impl SearchService {
     ///
     /// When `commit` is provided and non-empty, it is returned as-is.
     /// When `commit` is absent/empty but `branch` is provided, the latest
-    /// indexed commit for that branch is returned. Defaults branch to "main"
-    /// when both are absent/empty (returns 400 if no branch can be resolved).
+    /// indexed commit for that branch is returned. When both are absent/empty,
+    /// returns 400 (commit or branch is required — no implicit latest).
     pub async fn resolve_commit_or_branch(
         &self,
         domain_raw: &str,
@@ -258,9 +258,14 @@ impl SearchService {
         if !commit.is_empty() {
             return Ok(commit.to_owned());
         }
-        let branch_name = branch
-            .filter(|b| !b.is_empty())
-            .unwrap_or("main");
+        let branch_name = match branch.filter(|b| !b.is_empty()) {
+            Some(b) => b,
+            None => {
+                return Err(ServiceError::Validation(
+                    "missing required query parameter: commit or branch".to_owned(),
+                ));
+            }
+        };
         let last = self.last_indexed(domain_raw, branch_name).await?;
         last.commit
             .ok_or_else(|| ServiceError::NotFound(format!(
@@ -357,16 +362,22 @@ impl SearchService {
         // Clone what we need for the background task.
         let store = Arc::clone(&self.store);
 
-        // Try to acquire the pipeline lock before spawning. If compaction is
-        // running, reject the push with 503 so TerminusDB retries.
-        let pipeline_guard = match store.try_acquire_pipeline_lock(&domain_str, &branch).await {
-            Some(g) => g,
-            None => {
+        // Acquire the pipeline lock with a timeout. A previous pipeline for
+        // this branch may still be winding down (releasing its lock). A 30s
+        // timeout covers the edge case where the previous pipeline is
+        // mid-embed-call; only true compaction (which doesn't check cancel
+        // tokens) will exceed the timeout and get a 503 so TerminusDB retries.
+        let pipeline_guard = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            store.acquire_pipeline_lock(&domain_str, &branch),
+        ).await {
+            Ok(g) => g,
+            Err(_) => {
                 self.store
                     .io_release_commit_reservation(&domain_str, &branch, &commit)
                     .await;
                 return Err(ServiceError::Unavailable(format!(
-                    "compaction in progress for {}/{}, retry later",
+                    "pipeline lock busy for {}/{}, retry later",
                     domain_str, branch
                 )));
             }
@@ -557,13 +568,18 @@ impl SearchService {
 
         let cancel_token_for_task = cancel_token.clone();
 
-        // Try to acquire the pipeline lock before spawning. If compaction is
-        // running, reject the push with 503 so TerminusDB retries. This prevents
-        // the dead man's switch from firing (no document progress while waiting
-        // for the lock).
-        let pipeline_guard = match store.try_acquire_pipeline_lock(&domain_str, &branch).await {
-            Some(g) => g,
-            None => {
+        // Acquire the pipeline lock with a timeout. The cancel token above
+        // already cancelled any previous push pipeline for this branch, so it
+        // should release the lock within seconds. A 30s timeout covers the
+        // edge case where the previous pipeline is mid-embed-call; only true
+        // compaction (which doesn't check cancel tokens) will exceed the
+        // timeout and get a 503 so TerminusDB retries.
+        let pipeline_guard = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            store.acquire_pipeline_lock(&domain_str, &branch),
+        ).await {
+            Ok(g) => g,
+            Err(_) => {
                 self.store
                     .io_release_commit_reservation(&domain_str, &branch, &commit)
                     .await;
@@ -571,7 +587,7 @@ impl SearchService {
                     .cancel_previous_pipeline_and_register(&cancel_domain, &cancel_branch, cancel_token.clone())
                     .await;
                 return Err(ServiceError::Unavailable(format!(
-                    "compaction in progress for {}/{}, retry later",
+                    "pipeline lock busy for {}/{}, retry later",
                     domain_str, branch
                 )));
             }
@@ -2287,17 +2303,17 @@ async fn io_run_index_pipeline(
         } else {
             // Non-boundary commit: FTS has no flat-scan fallback (unlike vector
             // search), so the inverted index must exist and cover new fragments.
-            // io_ensure_fts_index creates the index on first push, then calls
-            // optimize_indices(append()) on subsequent pushes to index new
-            // data fragments incrementally (O(delta) per push).
-            let fts_version = ctx.store
-                .io_ensure_fts_index(ctx.domain, ctx.branch)
-                .await
-                .map_err(|e| format!("FTS index ensure failed: {}", e))?;
-            indexed_version = Some(fts_version);
-
-            ctx.store.io_refresh_cached_dataset(ctx.domain, ctx.branch).await
-                .map_err(|e| format!("FTS cache refresh failed: {}", e))?;
+            // Open a branch-bound handle — NOT io_ensure_fts_index which opens
+            // the cached MAIN handle and would tag the wrong version for non-main
+            // branches.
+            let ds_opt = ctx.store.io_open_dataset_uncached(ctx.domain, ctx.branch).await
+                .map_err(|e| format!("FTS index: failed to open dataset: {}", e))?;
+            if let Some(mut ds_opt) = ds_opt {
+                let fts_version = crate::store::lance::io_ensure_fts_index_on_dataset(&mut ds_opt)
+                    .await
+                    .map_err(|e| format!("FTS index ensure failed: {}", e))?;
+                indexed_version = Some(fts_version);
+            }
         }
 
         // Tag the commit to the INDEXED version (data + indices), or fall back
@@ -2811,11 +2827,10 @@ async fn io_run_index_pipeline_stream(
         } else {
             // Non-boundary commit: FTS has no flat-scan fallback (unlike vector
             // search), so the inverted index must exist and cover new fragments.
-            // io_ensure_fts_index creates the index on first push, then calls
-            // optimize_indices(append()) on subsequent pushes to index new
-            // data fragments incrementally (O(delta) per push).
-            let fts_version = ctx.store
-                .io_ensure_fts_index(ctx.domain, ctx.branch)
+            // Use the branch-bound write handle (ds) — NOT io_ensure_fts_index
+            // which opens the cached MAIN handle and would tag the wrong version
+            // for non-main branches.
+            let fts_version = crate::store::lance::io_ensure_fts_index_on_dataset(&mut ds)
                 .await
                 .map_err(|e| format!("FTS index ensure failed: {}", e))?;
             indexed_version = Some(fts_version);
