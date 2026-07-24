@@ -583,19 +583,27 @@ describe("POST /push?stream=true — streaming push with progress", function () 
       setTimeout(resolve, 5000)
     })
 
-    // Wait for the pipeline to process the disconnect or complete
-    await new Promise((resolve) => setTimeout(resolve, 5000))
-
-    // The key contract: the task must reach a terminal state (Complete or Error),
-    // never stuck Pending. If the pipeline finished before noticing the disconnect,
-    // it's Complete. If it noticed the disconnect, it's Error.
+    // Wait for the pipeline to process the disconnect or complete.
+    // Poll /check until the task reaches a terminal state (Complete or Error),
+    // or timeout. A fixed wait is insufficient in CI where Ollama is slow.
     expect(capturedTaskId).to.not.equal(null)
     expect(capturedTaskId).to.match(/^task-/)
 
-    const checkRes = await agent()
-      .get("/check")
-      .query({ task_id: capturedTaskId })
-      .set("Authorization", authHeader())
+    let checkRes = null
+    const pollDeadline = Date.now() + 60000
+    while (Date.now() < pollDeadline) {
+      checkRes = await agent()
+        .get("/check")
+        .query({ task_id: capturedTaskId })
+        .set("Authorization", authHeader())
+      if (checkRes.status === 200 && checkRes.body.status !== "Pending") {
+        break
+      }
+      if (checkRes.status === 500) {
+        break
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000))
+    }
 
     // Must be 200 (Complete) or 500 (Error) — never 200 with Pending
     if (checkRes.status === 200) {

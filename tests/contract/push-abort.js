@@ -40,6 +40,10 @@ describe("POST /push — abort (OpAbort → 422)", function () {
     expect(res.status).to.equal(422)
     expect(res.body).to.have.property("error")
     expect(res.body.error).to.include("abort")
+
+    // Allow the aborted pipeline to fully wind down (release lock + reservation)
+    // before the next test starts a new push on the same domain/branch.
+    await new Promise(resolve => setTimeout(resolve, 1000))
   })
 
   it("abort on first line returns 422 immediately", async function () {
@@ -54,6 +58,9 @@ describe("POST /push — abort (OpAbort → 422)", function () {
 
     expect(res.status).to.equal(422)
     expect(res.body).to.have.property("error")
+
+    // Allow the aborted pipeline to fully wind down.
+    await new Promise(resolve => setTimeout(resolve, 1000))
   })
 
   it("abort after valid inserts does not index the aborted commit", async function () {
