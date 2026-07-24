@@ -346,6 +346,7 @@ jobs:
       - name: Start tdb-search engine
         run: |
           mkdir -p /tmp/tdb-search-e2e-data
+          TDB_SEARCH_PORT=7372 \
           TDB_SEARCH_ADMIN_USER=admin \
           TDB_SEARCH_ADMIN_SECRET=root \
           TDB_SEARCH_EMBED_PROVIDER=openai_compatible \

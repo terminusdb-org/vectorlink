@@ -40,6 +40,7 @@ help:
 	@echo "  make docs-rebuild     Clean rebuild of the dist/api API docs"
 	@echo "  make verify           lint + test (no side effects)"
 	@echo "  make pr               Full pre-PR gate: lint + test + release build + docs"
+	@echo "  make pr-light         Pre-PR gate without release build (fast, no Rust recompile)"
 	@echo "  make server-start     Start tdb-search (7372) + TerminusDB (7373)"
 	@echo "  make server-stop      Stop both test servers"
 	@echo "  make server-restart   Restart both test servers"
@@ -281,15 +282,18 @@ docs-rebuild:
 verify: lint test
 	@echo "✓ verify passed"
 
+# pr-light: lint + unit tests + integration + e2e + docs. No release build,
+# so no expensive Rust recompile. Use for rapid iteration on JS/tests.
+.PHONY: pr-light
+pr-light: lint test test-integration test-e2e docs
+	@echo "✓ PR-light gate passed (no release build) — review $(DOCS_OUT), then commit (GPG-signed)"
+
 # pr: the full pre-PR gate. Mirrors TerminusDB's `pr` target. Must be green
-# before opening a PR. Runs lint (incl. clippy -D warnings) + unit tests +
-# integration tests (requires a live tdb-search server + Ollama on
-# localhost:7372 — use `make server-start` to start them) +
-# e2e tests (requires TerminusDB on localhost:7373) +
-# production release build + docs. The release build proves the production
-# binary compiles cleanly but is NOT used for tests (debug binary is used).
+# before opening a PR. Delegates to pr-light, then adds the release build
+# which proves the production binary compiles cleanly (but is NOT used for
+# tests — debug binary is used).
 .PHONY: pr
-pr: lint test test-integration test-e2e build-release docs
+pr: pr-light build-release
 	@echo "✓ PR gate passed — review $(DOCS_OUT), then commit (GPG-signed)"
 
 # ──────────────────────── test server ────────────────────────────────────
