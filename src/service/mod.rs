@@ -2470,6 +2470,20 @@ async fn io_run_index_pipeline(
                     ctx.domain, ctx.branch, commit_position
                 );
             }
+        } else {
+            // Non-boundary commit: FTS has no flat-scan fallback (unlike vector
+            // search), so the inverted index must exist and cover new fragments.
+            // io_ensure_fts_index creates the index on first push, then calls
+            // optimize_indices(append()) on subsequent pushes to index new
+            // data fragments incrementally (O(delta) per push).
+            let fts_version = ctx.store
+                .io_ensure_fts_index(ctx.domain, ctx.branch)
+                .await
+                .map_err(|e| format!("FTS index ensure failed: {}", e))?;
+            indexed_version = Some(fts_version);
+
+            ctx.store.io_refresh_cached_dataset(ctx.domain, ctx.branch).await
+                .map_err(|e| format!("FTS cache refresh failed: {}", e))?;
         }
 
         // Tag the commit to the INDEXED version (data + indices), or fall back
@@ -2980,6 +2994,20 @@ async fn io_run_index_pipeline_stream(
                 "[pipeline] boundary index created: domain={} branch={} commit_position={}",
                 ctx.domain, ctx.branch, commit_position
             );
+        } else {
+            // Non-boundary commit: FTS has no flat-scan fallback (unlike vector
+            // search), so the inverted index must exist and cover new fragments.
+            // io_ensure_fts_index creates the index on first push, then calls
+            // optimize_indices(append()) on subsequent pushes to index new
+            // data fragments incrementally (O(delta) per push).
+            let fts_version = ctx.store
+                .io_ensure_fts_index(ctx.domain, ctx.branch)
+                .await
+                .map_err(|e| format!("FTS index ensure failed: {}", e))?;
+            indexed_version = Some(fts_version);
+
+            ctx.store.io_refresh_cached_dataset(ctx.domain, ctx.branch).await
+                .map_err(|e| format!("FTS cache refresh failed: {}", e))?;
         }
 
         let last_version = ds.version().version;

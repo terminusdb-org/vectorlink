@@ -11061,3 +11061,222 @@ async fn io_count_branch_commits_returns_correct_count() {
         "should have 8 tagged commits"
     );
 }
+
+/// FTS index must exist after the first push (position 0, non-boundary)
+/// so that FTS search returns hits immediately — not only at the first
+/// boundary commit (position 2). The streaming pipeline calls
+/// io_ensure_fts_index on every push to guarantee this.
+#[tokio::test]
+async fn fts_index_exists_after_first_push() {
+    use crate::store::vector_index::tests::make_chunk_row;
+
+    let dim = 8;
+    let (store, _tmp) = make_test_store(dim);
+    let domain = "admin/fts_first_push";
+
+    // Push data (upsert creates the dataset + appends rows).
+    let rows = vec![make_chunk_row("doc/apple", dim, 1)];
+    let v = store
+        .io_upsert_chunks(domain, "main", "doc_c0", &rows)
+        .await
+        .expect("upsert");
+
+    // Ensure FTS index exists and covers new fragments BEFORE tagging.
+    // io_ensure_fts_index creates the index on first push, then calls
+    // optimize_indices(append()) to index new data fragments.
+    let indexed_v = store
+        .io_ensure_fts_index(domain, "main")
+        .await
+        .expect("FTS index creation");
+
+    // Tag at the indexed version (not the pre-index version).
+    store
+        .io_tag_commit(domain, "main", "c0", indexed_v)
+        .await
+        .expect("tag");
+
+    // Refresh cached handle so search sees the indexed version.
+    store
+        .io_refresh_cached_dataset(domain, "main")
+        .await
+        .expect("refresh");
+
+    // Verify the FTS index exists on the tagged version.
+    {
+        let ds_arc = store.io_open_dataset(domain, "main").await.expect("open");
+        let ds = ds_arc.read().await;
+        let indices = ds.load_indices().await.expect("load indices");
+        let index_names: Vec<String> = indices.iter().map(|i| i.name.clone()).collect();
+        assert!(
+            index_names.contains(&"content_fts".to_owned()),
+            "FTS index content_fts must exist after first push, got {:?}",
+            index_names
+        );
+    }
+
+    // FTS search at c0 must return hits.
+    let query = SearchQuery {
+        query_embedding: fake_embedding(dim, 1.0),
+        query_text: "content".to_owned(),
+        mode: SearchMode::Fts,
+        start: 0,
+        count: 10,
+        doc_type_filter: vec![],
+        doc_id_filter: vec![],
+        snippet: false,
+    };
+    let hits = store
+        .io_search(domain, "main", "c0", &query)
+        .await
+        .expect("FTS search at c0");
+    assert!(
+        !hits.is_empty(),
+        "FTS search at c0 must return hits for 'content', got {} hits",
+        hits.len()
+    );
+    assert_eq!(
+        hits[0].doc_id, "doc/apple",
+        "FTS hit must be doc/apple"
+    );
+}
+
+/// Integration test: FTS search must return hits at ALL historic commit
+/// versions, not just boundary commits. This simulates the full pipeline:
+/// - Every push calls io_ensure_fts_index (non-boundary FTS ensure + append)
+/// - Every 3rd push (boundary) calls io_ensure_fts_index_on_dataset + cascade
+/// - No compact_files is called — compaction is a manual maintenance op only
+///
+/// After 6 pushes (2 boundaries at positions 2 and 5), FTS search at every
+/// tagged commit must return the expected documents.
+#[tokio::test]
+async fn fts_search_works_at_all_commit_versions() {
+    use crate::store::vector_index::tests::make_chunk_row;
+    use crate::store::lance::{io_ensure_fts_index_on_dataset, io_incremental_cascade};
+
+    let dim = 8;
+    let (store, _tmp) = make_test_store(dim);
+    let domain = "admin/fts_all_versions";
+
+    let mut commits: Vec<(String, u64)> = Vec::new();
+
+    // Push 6 commits, simulating the boundary-aware pipeline.
+    for i in 0..6u32 {
+        let doc_id = format!("doc/item_{}", i);
+        let rows = vec![make_chunk_row(&doc_id, dim, (i + 1) as u64)];
+        let v = store
+            .io_upsert_chunks(domain, "main", &format!("doc_c{}", i), &rows)
+            .await
+            .expect("upsert");
+
+        let commit_position = store
+            .io_count_branch_commits(domain, "main")
+            .await
+            .unwrap_or(0);
+
+        let is_boundary = crate::store::lance::should_index_commit(commit_position);
+
+        let tagged_version;
+        if is_boundary {
+            // Boundary: full index optimization + cascade.
+            let ds_arc = store
+                .io_open_dataset_uncached(domain, "main")
+                .await
+                .expect("open uncached")
+                .expect("dataset exists");
+            let mut ds = ds_arc;
+
+            io_ensure_fts_index_on_dataset(&mut ds)
+                .await
+                .expect("FTS optimize");
+
+            store.io_increment_delta_count(domain, "main").await;
+            let delta_count = store.io_get_delta_count(domain, "main").await;
+            let _ = io_incremental_cascade(&mut ds, delta_count).await;
+
+            tagged_version = ds.version().version;
+        } else {
+            // Non-boundary: ensure FTS index exists and covers new fragments.
+            let fts_v = store
+                .io_ensure_fts_index(domain, "main")
+                .await
+                .expect("FTS ensure");
+            tagged_version = fts_v;
+        }
+
+        store
+            .io_tag_commit(domain, "main", &format!("c{}", i), tagged_version)
+            .await
+            .expect("tag");
+
+        store
+            .io_refresh_cached_dataset(domain, "main")
+            .await
+            .expect("refresh");
+
+        commits.push((format!("c{}", i), tagged_version));
+    }
+
+    // Verify FTS search at every commit version.
+    let query = SearchQuery {
+        query_embedding: fake_embedding(dim, 1.0),
+        query_text: "content".to_owned(),
+        mode: SearchMode::Fts,
+        start: 0,
+        count: 50,
+        doc_type_filter: vec![],
+        doc_id_filter: vec![],
+        snippet: false,
+    };
+
+    for (commit, _v) in &commits {
+        let hits = store
+            .io_search(domain, "main", commit, &query)
+            .await
+            .expect(&format!("FTS search at {}", commit));
+        assert!(
+            !hits.is_empty(),
+            "FTS search at {} must return hits, got 0",
+            commit
+        );
+    }
+
+    // Verify snapshot isolation: c0 must only find doc/item_0.
+    let hits_c0 = store
+        .io_search(domain, "main", "c0", &query)
+        .await
+        .expect("search c0");
+    let ids_c0: Vec<&str> = hits_c0.iter().map(|h| h.doc_id.as_str()).collect();
+    assert!(
+        ids_c0.contains(&"doc/item_0"),
+        "c0 must find doc/item_0"
+    );
+    assert!(
+        !ids_c0.contains(&"doc/item_5"),
+        "c0 must NOT find doc/item_5 (snapshot isolation)"
+    );
+
+    // c5 must find all 6 docs.
+    let hits_c5 = store
+        .io_search(domain, "main", "c5", &query)
+        .await
+        .expect("search c5");
+    let ids_c5: Vec<&str> = hits_c5.iter().map(|h| h.doc_id.as_str()).collect();
+    for i in 0..6 {
+        let expected = format!("doc/item_{}", i);
+        assert!(
+            ids_c5.contains(&expected.as_str()),
+            "c5 must find {} (got {:?})",
+            expected, ids_c5
+        );
+    }
+
+    // Verify fragment count: 6 pushes without compaction = 6 fragments.
+    let ds_arc = store.io_open_dataset(domain, "main").await.expect("open");
+    let ds = ds_arc.read().await;
+    let fragment_count = ds.get_fragments().len();
+    assert_eq!(
+        fragment_count, 6,
+        "fragment count after 6 pushes without compaction should be 6, got {}",
+        fragment_count
+    );
+}

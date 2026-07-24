@@ -16,7 +16,8 @@ use super::LanceStore;
 impl LanceStore {
     /// Ensure the FTS inverted index EXISTS (create if not present, no-op otherwise).
     /// Used inline during push to guarantee FTS is available for search immediately.
-    /// Does NOT call optimize_indices — that's deferred to the background worker.
+    /// Does NOT call optimize_indices — that is deferred to boundary commits
+    /// (every 3rd push) where io_ensure_fts_index_on_dataset is called instead.
     ///
     /// Unlike vector search (which flat-scans unindexed fragments), FTS REQUIRES
     /// the inverted index to exist. Calling this inline on each push is O(1) after
@@ -135,9 +136,13 @@ pub async fn io_ensure_fts_index_on_dataset(ds: &mut Dataset) -> Result<u64, Sto
 /// After compaction, the fragment count is reduced to O(1) (typically 1-2 large
 /// fragments), so full-table scans use only a few FDs.
 ///
-/// Called by the background index worker AFTER index optimization. Idempotent:
-/// if the dataset already has a reasonable number of fragments (<= target), this
-/// is effectively a no-op (returns quickly without rewriting data).
+/// Called via the manual /compact API endpoint, NOT during the indexing pipeline.
+/// Compaction rewrites all current data into new merged fragments, which creates
+/// new Lance versions. Since historical tagged versions reference old fragments
+/// (snapshot isolation), the old files cannot be deleted — causing store bloat
+/// proportional to the number of compaction operations. Use sparingly.
+/// Idempotent: if the dataset already has a reasonable number of fragments
+/// (<= target), this is effectively a no-op (returns quickly without rewriting).
 pub async fn io_compact_data(ds: &mut Dataset, force: bool) -> Result<(), StoreError> {
     use lance::dataset::optimize::{compact_files, CompactionOptions};
 
