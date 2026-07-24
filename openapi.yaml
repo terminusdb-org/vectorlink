@@ -845,54 +845,6 @@ paths:
         '404': { $ref: '#/components/responses/NoIndexedLineage' }
         '500': { $ref: '#/components/responses/UpstreamError' }
 
-  /compact:
-    post:
-      tags: [ops]
-      operationId: compactDomain
-      summary: Trigger data compaction for a domain (merge small fragments).
-      description: >
-        Merges small data fragments (one per push) into fewer large fragments,
-        reducing the fragment count required for full-table scans. Admin-only,
-        idempotent: re-running on an already-compacted dataset is fast (the
-        threshold check short-circuits if fragments <= 16). Compaction benefits
-        HEAD only; historical tags do not suffer fragment pressure.
-      parameters:
-        - $ref: '#/components/parameters/Domain'
-        - $ref: '#/components/parameters/BranchOptional'
-      responses:
-        '200':
-          description: Compaction result with before/after fragment counts.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/CompactResult' }
-              examples:
-                compacted:
-                  summary: Fragments were merged
-                  value:
-                    domain: admin/star_wars
-                    branch: main
-                    fragments_before: 42
-                    fragments_after: 3
-                    compacted: true
-                    compacted_version: 8
-                noop:
-                  summary: Already compact (no-op)
-                  value:
-                    domain: admin/star_wars
-                    branch: main
-                    fragments_before: 3
-                    fragments_after: 3
-                    compacted: false
-                    compacted_version: 7
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404':
-          description: Domain has no dataset on disk.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '500': { $ref: '#/components/responses/UpstreamError' }
-
   # ───────────────────────────── compare ───────────────────────────────────
   /compare:
     post:
@@ -1976,17 +1928,6 @@ components:
           items: { type: string }
           description: Nearest-first ancestor window (first line only).
 
-    CompactResult:
-      type: object
-      required: [domain, branch, fragments_before, fragments_after, compacted, compacted_version]
-      additionalProperties: false
-      properties:
-        domain:            { type: string, description: "The compacted domain." }
-        branch:            { type: string, description: "The compacted branch." }
-        fragments_before:  { type: integer, description: "Fragment count before compaction." }
-        fragments_after:   { type: integer, description: "Fragment count after compaction." }
-        compacted:         { type: boolean, description: "Whether fragments were actually merged (false = already compact)." }
-        compacted_version: { type: integer, description: "The dataset version after compaction (unchanged if no-op)." }
 
     Statistics:
       type: object

@@ -1827,42 +1827,6 @@ async fn handle_compare(
     }
 }
 
-// ─────────────────────────── Compact ────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct CompactParams {
-    pub domain: Option<String>,
-    pub branch: Option<String>,
-}
-
-/// POST /compact?domain=<org/db>[&branch=main] — trigger data compaction.
-/// Merges small data fragments (one per push) into fewer large fragments,
-/// reducing the FD count required for full-table scans. Admin-only, idempotent.
-/// Returns the number of fragments before/after compaction.
-async fn handle_compact(
-    State(state): State<AppState>,
-    Query(params): Query<CompactParams>,
-) -> Response {
-    let domain = match params.domain {
-        Some(d) if !d.is_empty() => d,
-        _ => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "missing required query parameter: domain".to_owned(),
-            );
-        }
-    };
-    let branch = params.branch.unwrap_or_else(|| "main".to_owned());
-    if let Err(r) = validate_branch_name(&branch) {
-        return r;
-    }
-
-    match state.service.compact_domain(&domain, &branch).await {
-        Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
-        Err(e) => service_error_to_response(e),
-    }
-}
-
 // ─────────────────────────── Suggest ─────────────────────────────────────
 
 /// GET /suggest?domain=<org/db>&commit=<hash>&q=<partial>&count=11
@@ -2025,7 +1989,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/similar", get(handle_similar).post(handle_similar_post))
         .route("/duplicates", get(handle_duplicates))
         .route("/candidates", post(handle_candidates))
-        .route("/compact", post(handle_compact))
         .route("/compare", post(handle_compare))
         .route("/statistics", get(handle_statistics))
         .route("/integrity", get(handle_integrity))
