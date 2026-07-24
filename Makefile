@@ -91,11 +91,21 @@ DOCKER_RUN := docker run --rm \
 	-w /work \
 	$(BUILD_IMAGE)
 
+# Detect Docker availability. When Docker (or the build image) is absent,
+# cargo targets fall back to running on the host directly.
+DOCKER_AVAILABLE := $(shell command -v docker >/dev/null 2>&1 && docker image inspect $(BUILD_IMAGE) >/dev/null 2>&1 && echo yes || echo no)
+
+# CARGO_RUN: expands to the Docker wrapper when available, or plain cargo when not.
+ifeq ($(DOCKER_AVAILABLE),yes)
+CARGO_RUN := $(DOCKER_RUN)
+else
+CARGO_RUN :=
+endif
+
 .PHONY: clippy
 clippy:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		$(DOCKER_RUN) \
-			cargo clippy --all-targets --all-features -- -D warnings ; \
+		$(CARGO_RUN) cargo clippy --all-targets --all-features -- -D warnings ; \
 	else \
 		echo "• clippy skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
@@ -213,22 +223,36 @@ release-image:
 .PHONY: test
 test:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		$(DOCKER_RUN) \
-			cargo test --all-features ; \
+		$(CARGO_RUN) cargo test --all-features ; \
 	else \
 		echo "• test skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
 
-# Integration tests (mocha) against a LIVE server. Self-contained: builds the
-# engine, starts it in a container on a free host port, waits for readiness,
-# runs the suite, and tears down. Part of the `pr` gate.
+# Integration tests (mocha) against a LIVE tdb-search server. The server and
+# Ollama must already be running — this target only runs the test suite.
+# Set TDB_SEARCH_URL to point at a non-default endpoint (default: localhost:7372).
+# Part of the `pr` gate.
 .PHONY: test-integration
 test-integration:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		CARGO_VOLUME=$(CARGO_VOLUME) TARGET_VOLUME=$(TARGET_VOLUME) BUILD_IMAGE=$(BUILD_IMAGE) ./scripts/run-integration-tests.sh ; \
+		TDB_SEARCH_URL="${TDB_SEARCH_URL:-http://localhost:7372}" \
+		TDB_SEARCH_ADMIN_USER="${TDB_SEARCH_ADMIN_USER:-admin}" \
+		TDB_SEARCH_ADMIN_SECRET="${TDB_SEARCH_ADMIN_SECRET:-root}" \
+		npx mocha --timeout 60000 ; \
 	else \
 		echo "• integration tests skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
+
+# E2e tests (mocha) — require BOTH tdb-search (7372) and TerminusDB (7373)
+# to be running. These tests exercise the TerminusDB plugin endpoints that
+# proxy to tdb-search. NOT part of the `pr` gate (run separately).
+# Use `make server-start` to start both servers.
+.PHONY: test-e2e
+test-e2e:
+	@TDB_SEARCH_URL="${TDB_SEARCH_URL:-http://localhost:7372}" \
+		TDB_SEARCH_ADMIN_USER="${TDB_SEARCH_ADMIN_USER:-admin}" \
+		TDB_SEARCH_ADMIN_SECRET="${TDB_SEARCH_ADMIN_SECRET:-root}" \
+		npx mocha --config .mocharc.e2e.js
 
 # Lint the JS test sources (eslint, TerminusDB-style). Part of `lint`.
 .PHONY: lint-tests
@@ -259,11 +283,13 @@ verify: lint test
 
 # pr: the full pre-PR gate. Mirrors TerminusDB's `pr` target. Must be green
 # before opening a PR. Runs lint (incl. clippy -D warnings) + unit tests +
-# integration tests (debug) + production release build + docs. The release
-# build proves the production binary compiles cleanly but is NOT used for
-# tests (debug binary is used).
+# integration tests (requires a live tdb-search server + Ollama on
+# localhost:7372 — use `make server-start` to start them) +
+# e2e tests (requires TerminusDB on localhost:7373) +
+# production release build + docs. The release build proves the production
+# binary compiles cleanly but is NOT used for tests (debug binary is used).
 .PHONY: pr
-pr: lint test test-integration build-release docs
+pr: lint test test-integration test-e2e build-release docs
 	@echo "✓ PR gate passed — review $(DOCS_OUT), then commit (GPG-signed)"
 
 # ──────────────────────── test server ────────────────────────────────────

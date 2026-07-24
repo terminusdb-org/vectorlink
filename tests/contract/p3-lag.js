@@ -39,15 +39,20 @@
  */
 
 const { expect } = require("chai")
-const { execFileSync } = require("child_process")
+const { execFileSync, execSync } = require("child_process")
 const { agent, authHeader, BASE_URL } = require("../lib/agent")
 
-// The engine container name, injected by the integration runner. When present,
-// the restart-invariant test (P3-LAG-4) genuinely restarts the live engine to
-// prove durable state survives. When absent (e.g. an externally-managed engine),
-// the test is skipped — the same invariant is covered exhaustively at the store
-// level (fresh LanceStore over the same on-disk dir, in src/store/lance.rs).
+// The engine restart mechanism, injected by the integration runner.
+// TDB_SEARCH_ITEST_RESTART_CMD: a shell command that restarts the engine
+//   (e.g. "kill <pid> && <binary>" for local, "docker restart <container>" for Docker).
+// TDB_SEARCH_ITEST_CONTAINER: (legacy) Docker container name — when present without
+//   RESTART_CMD, uses `docker restart <container>`.
+// When neither is set, the restart test is skipped — the same invariant is
+// covered exhaustively at the store level (fresh LanceStore over the same
+// on-disk dir, in src/store/lance.rs).
 const ITEST_CONTAINER = process.env.TDB_SEARCH_ITEST_CONTAINER
+const ITEST_RESTART_CMD = process.env.TDB_SEARCH_ITEST_RESTART_CMD
+const restartAvailable = ITEST_RESTART_CMD || ITEST_CONTAINER
 
 async function waitForLive (timeoutMs = 30000) {
   const start = Date.now()
@@ -244,7 +249,7 @@ describe("P3-LAG — lag, catch-up, durable resolution", function () {
   // searchable, its /last-indexed STILL reports it, /duplicates STILL works, and
   // it is NEVER a post-restart 404. This is the exact failure observed live
   // (1091 docs on disk, /last-indexed=null, search 404 after a rebuild).
-  const restartIt = ITEST_CONTAINER ? it : it.skip
+  const restartIt = restartAvailable ? it : it.skip
   restartIt("P3-LAG-4: index survives a real engine container restart (no lost corpus)", async function () {
     this.timeout(120000)
     const RESTART_DOMAIN = "admin/restart_invariant"
@@ -271,9 +276,12 @@ describe("P3-LAG — lag, catch-up, durable resolution", function () {
       .expect(200)
     expect(searchBefore.headers["terminusdb-data-version"]).to.equal(`commit:${COMMIT}`)
 
-    // 3. RESTART the engine container. Process state evaporates; on-disk Lance
-    //    tags persist (the container writable layer survives `docker restart`).
-    execFileSync("docker", ["restart", ITEST_CONTAINER], { stdio: "ignore" })
+    // 3. RESTART the engine. Process state evaporates; on-disk Lance tags persist.
+    if (ITEST_RESTART_CMD) {
+      execSync(ITEST_RESTART_CMD, { stdio: "ignore" })
+    } else {
+      execFileSync("docker", ["restart", ITEST_CONTAINER], { stdio: "ignore" })
+    }
     await waitForLive()
 
     // 4. THE INVARIANT: everything still works, derived from disk. NOT a 404.
