@@ -1,15 +1,26 @@
-# CI Gate — lint + test for tdb-search.
+# CI — lint, unit test, integration test, and Docker publish for tdb-search.
 #
-# Runs on every PR and push to main. Fast checks only (no Docker build,
-# no Ollama integration suite). This is a required status check for PRs.
+# Pipeline:
+#   1. build-release  — compile release binary, cache deps, upload artifact
+#   2. lint           — clippy + eslint + openapi (parallel, no build needed)
+#   3. unit-tests     — cargo test against the release binary
+#   4. integration    — mocha contract suite against live engine + Ollama sidecar
+#   5. docker-publish — build multi-arch image, push to GHCR (main + tags only)
 #
-# Required repo settings: none beyond default GITHUB_TOKEN.
+# Caching: Swatinem/rust-cache@v2 keys on Cargo.lock so the cargo registry,
+# git checkouts, and target/ are reused across all Rust jobs and across runs.
+# The release binary is built once and passed as an artifact to downstream jobs.
+#
+# Required repo settings:
+#   - GITHUB_TOKEN permissions: packages:write (declared on docker-publish job)
+#   - Package visibility: ghcr.io/dfrnt-com/tdb-search accessible to consumers
 
 name: CI
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -19,8 +30,9 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  rust-checks:
-    name: Rust Lint + Test
+  # ─── Build release binary (shared by unit + integration tests) ───────────
+  build-release:
+    name: Build (release)
     runs-on: ubuntu-latest
 
     steps:
@@ -40,27 +52,59 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
 
-      - name: Cache cargo registry + target
-        uses: actions/cache@v4
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          workspaces: ". -> target"
+          key: ${{ hashFiles('Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdb-search-release-bin
+          path: target/release/tdb-search
+          retention-days: 1
+
+  # ─── Lint (parallel with build, no binary needed) ────────────────────────
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler \
+            libprotobuf-dev \
+            g++ \
+            libssl-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: ${{ hashFiles('Cargo.lock') }}
 
       - name: Clippy (all targets, all features)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Run tests
-        run: cargo test --all-features
-
   openapi-lint:
-    name: OpenAPI Lint (Redocly)
+    name: OpenAPI Lint
     runs-on: ubuntu-latest
 
     steps:
@@ -79,7 +123,7 @@ jobs:
         run: redocly lint openapi.yaml
 
   js-lint:
-    name: ESLint (contract tests)
+    name: ESLint
     runs-on: ubuntu-latest
 
     steps:
@@ -95,4 +139,211 @@ jobs:
         run: npm ci
 
       - name: Run ESLint
-        run: npm run check
+        run: npx eslint --ext .js tests/
+
+  # ─── Unit tests (cargo test against release build) ───────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: build-release
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler \
+            libprotobuf-dev \
+            g++ \
+            libssl-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: ${{ hashFiles('Cargo.lock') }}
+
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: tdb-search-release-bin
+          path: target/release
+
+      - name: Make binary executable
+        run: chmod +x target/release/tdb-search
+
+      - name: Run cargo test
+        run: cargo test --all-features --release
+
+  # ─── Integration tests (mocha against live engine + Ollama) ──────────────
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: build-release
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libssl3 \
+            ca-certificates \
+            curl
+
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: tdb-search-release-bin
+          path: target/release
+
+      - name: Make binary executable
+        run: chmod +x target/release/tdb-search
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install JS test dependencies
+        run: npm ci
+
+      - name: Start Ollama embedding sidecar
+        run: |
+          docker run -d --name ollama \
+            -p 127.0.0.1:11434:11434 \
+            -v ollama-models:/root/.ollama \
+            ollama/ollama:latest
+
+          # Wait for Ollama to be ready
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+              echo "Ollama is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Pull the embedding model
+          echo "Pulling nomic-embed-text-v2-moe model..."
+          docker exec ollama ollama pull nomic-embed-text-v2-moe
+
+      - name: Start tdb-search engine
+        run: |
+          mkdir -p /tmp/tdb-search-ci-data
+          TDB_SEARCH_ADMIN_USER=admin \
+          TDB_SEARCH_ADMIN_SECRET=root \
+          TDB_SEARCH_EMBED_PROVIDER=openai_compatible \
+          TDB_SEARCH_EMBED_URL=http://127.0.0.1:11434 \
+          TDB_SEARCH_MODEL=nomic-embed-text-v2-moe \
+          TDB_SEARCH_DIM=768 \
+          TDB_SEARCH_DATA_DIR=/tmp/tdb-search-ci-data \
+          TDB_SEARCH_TOKENIZER_PATH=$GITHUB_WORKSPACE/assets/tokenizer.json.bz2 \
+          RUST_LOG=info \
+          ./target/release/tdb-search &
+          echo $! > /tmp/tdb-search.pid
+
+          # Wait for engine readiness
+          for i in $(seq 1 100); do
+            if curl -fsS http://127.0.0.1:8080/health/live >/dev/null 2>&1; then
+              echo "tdb-search engine is live"
+              break
+            fi
+            sleep 0.3
+          done
+
+          # Verify engine is actually up
+          if ! curl -fsS http://127.0.0.1:8080/health/live >/dev/null 2>&1; then
+            echo "ERROR: tdb-search did not become live"
+            cat /tmp/tdb-search-test.log 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Run mocha integration suite
+        env:
+          TDB_SEARCH_URL: http://127.0.0.1:8080
+          TDB_SEARCH_ADMIN_USER: admin
+          TDB_SEARCH_ADMIN_SECRET: root
+        run: npx mocha --timeout 60000
+
+      - name: Stop tdb-search engine
+        if: always()
+        run: |
+          if [ -f /tmp/tdb-search.pid ]; then
+            kill $(cat /tmp/tdb-search.pid) 2>/dev/null || true
+          fi
+
+      - name: Stop Ollama
+        if: always()
+        run: docker rm -f ollama 2>/dev/null || true
+
+  # ─── Docker build + publish to GHCR ──────────────────────────────────────
+  docker-publish:
+    name: Docker Publish
+    runs-on: ubuntu-latest
+    needs: [build-release, clippy, openapi-lint, js-lint, unit-tests, integration-tests]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine image tags
+        id: tags
+        run: |
+          IMAGE="ghcr.io/${{ github.repository }}"
+          # Lowercase the image name (GHCR requirement)
+          IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            TAGS="${IMAGE}:dev,${IMAGE}:dev-${GITHUB_SHA::7}"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            TAGS="${IMAGE}:${VERSION}"
+            # For non-prerelease tags: also tag :latest and :vN (major)
+            case "$VERSION" in
+              *-rc*|*-beta*|*-alpha*|*-dev*)
+                ;;
+              *)
+                MAJOR=$(echo "$VERSION" | cut -d '.' -f 1)
+                TAGS="${TAGS},${IMAGE}:latest,${IMAGE}:${MAJOR}"
+                ;;
+            esac
+          else
+            TAGS="${IMAGE}:ci-${GITHUB_SHA::7}"
+          fi
+
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Computed tags: ${TAGS}"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
