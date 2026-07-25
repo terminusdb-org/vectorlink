@@ -38,3 +38,4 @@ Thumbs.db
 
 # Vendor sources
 vendor/
+tests/.tdb-search-test.pid
