@@ -1,0 +1,36 @@
+# Native ARM64 Docker image build for tdb-search.
+#
+# Builds the production Dockerfile on ubuntu-22.04-arm (native ARM64), saves
+# the image as a gzipped tarball artifact for the publish workflow to consume.
+
+name: ARM64 Image Build
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  arm64_build:
+    name: Build (arm64)
+    runs-on: ubuntu-22.04-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ghcr.io/dfrnt-com/tdb-search:local \
+            -f ./Dockerfile \
+            .
+
+      - name: Save and compress image
+        run: docker save ghcr.io/dfrnt-com/tdb-search:local | gzip > tdb-search-arm64.tar.gz
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdb-search-arm64
+          path: tdb-search-arm64.tar.gz
+          retention-days: 1

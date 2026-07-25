@@ -1,195 +1,111 @@
-# VectorLink: The TerminusDB Semantic Indexer
+# tdb-search
 
-VectorLink is a vector database with an index based on Hierarchical
-Navigable Small World graphs written in Rust. It is designed to work
-closely with TerminusDB but can be used with any project via a simple
-HTTP API. In order to work well with TerminusDB it is designed with
-the following features:
+A semantic search engine built primarily for [TerminusDB](https://terminusdb.com), built in Rust on [LanceDB](https://lancedb.com). It is designed to work standalone.
 
-* Domains: The database can manage several domains. In a domain, you
-  have a vector store which is append-only. This allows you to share
-  vectors across indexes.
-* Commits: Each index exists at a commit. The index can point to any
-  vector in a domain. This allows us to add and remove vectors by
-  changing only the index.
-* Incremental Indexing: The indexer can take a previous commit, and
-  then perform the operations specified to obtain a new commit.
-* Connects with a text-to-vector embedding API in order to convert
-  content into vectors.
+`tdb-search` is an independent reimplementation of TerminusDB's VectorLink semantic indexer. It preserves VectorLink's **search-family** HTTP shapes and its TerminusDB integration, but replaces the bespoke HNSW index and hand-rolled vector store with **LanceDB** — gaining full-text search, hybrid (vector + keyword) search, and a maintained, versioned, branchable columnar vector store. Embeddings come from a **configurable provider**, defaulting to a local CPU model (served by an Ollama sidecar) so the whole stack runs offline.
 
-To invoke the server, you can run it as follows:
+---
 
-## Compiling
+## Why
 
-You can compile the system with cargo:
+The original [`terminusdb-semantic-indexer`](https://github.com/terminusdb-labs/terminusdb-semantic-indexer) (the source of the `terminusdb/vectorlink` image) hardcodes OpenAI embeddings and uses a custom HNSW engine that requires maintenance by the original team. Additionally, it was never completed and proven in production for actual workloads.
 
-```shell
-cargo compile --release
+`tdb-search`:
+
+- **Preserves the search interface** — the same `/search`, `/similar`, `/duplicates`, `/check`, `/statistics` shapes, so existing search callers keep working (search-family parity; additive search modes layered on).
+- **Inverts indexing to a push model** — instead of the indexer pulling content, **TerminusDB pushes** rendered text deltas to it (`GET /last-indexed` → `POST /push`). The indexer never calls back into TerminusDB; it owns the embedding model and is a complete, standalone HTTP search service.
+- **Uses LanceDB at the core** — versioned, branchable storage with full-text and hybrid search out of the box (selectable using a mode parameter).
+- **Configurable embeddings** — local CPU model via an Ollama sidecar (default), direct OpenAI, or any OpenAI-compatible / generic HTTP endpoint.
+- **Reflects TerminusDB history faithfully** — each commit is a versioned snapshot; branch-out shares the parent commit's vector blocks rather than copying them.
+
+## How history maps to LanceDB
+
+TerminusDB history is linear per branch. `tdb-search` mirrors this:
+
+| TerminusDB | tdb-search (LanceDB / Lance) |
+|------------|------------------------------|
+| domain `org/db` | a Lance dataset |
+| commit | a dataset version, bound by a Lance **tag** (`commit:<id>`) |
+| index commit `C` from parent `P` | append only the changed documents on top of `P`'s version |
+| branch-out at `P` | a Lance branch forked from `P`'s version, **sharing its data blocks** |
+| reassign commit pointer | a tag pointing at an existing version (no recompute) |
+
+Vector blocks from the parent commit are reused, never duplicated — the same property the original indexer achieved by sharing an append-only vector store across commits. A **global commit→layer index** (keyed by commit id, per domain, backed by Lance tags) resolves any commit's layer, so a branch forked at commit `P` finds `P`'s vectors regardless of which branch first indexed it.
+
+## Search
+
+A single endpoint serves three modes:
+
+- **`hybrid` (default)** — vector + full-text fused with reciprocal-rank fusion; best out-of-the-box relevance.
+- **`vector`** — semantic nearest-neighbour only; reproduces the original VectorLink behaviour exactly.
+- **`fts`** — keyword/full-text over the rendered text (filterable by `doc_type`).
+
+The same raw query text drives both sides in hybrid mode. Distances use the reference normalised cosine scale in `[0, 1]` (0 = identical, 0.5 = unrelated, 1 = opposite).
+
+## Embeddings
+
+The embedding provider is configurable:
+
+- **Local CPU (default)** — `nomic-ai/nomic-embed-text-v2-moe` (768-d, multilingual), served by a local **[Ollama](https://ollama.com) sidecar** (from Nomic's official GGUF, Q8_0) exposing an OpenAI-compatible API. arm64-native, runs on CPU, no external network after the one-time model pull.
+- **Direct OpenAI** — `api.openai.com` for parity with the original.
+- **Generic / OpenAI-compatible HTTP** — any embeddings endpoint, configurable base URL, model, and dimension (e.g. TEI or vLLM if you prefer a different sidecar).
+
+> The default model requires task prefixes (`search_document:` for indexed text, `search_query:` for queries); `tdb-search` injects these automatically from a hard-coded, model-keyed table, so they cannot be misconfigured per deployment.
+
+> An in-process (no-sidecar) embedding mode via `fastembed` is a deferred future option — it does not yet build on aarch64, so the Ollama sidecar is the canonical local runtime.
+
+## Access
+
+The indexer is a **trusted component** behind a single shared admin secret (HTTP Basic, default `admin:root`), checked on every request (`401` on miss) — authentication only, **no RBAC**. TerminusDB fronts search and authorises the caller against its own capability system before calling the indexer. Deploy the indexer on a private network with TerminusDB as the front door.
+
+## Quickstart (planned)
+
+```bash
+docker compose up
 ```
 
-## Running with docker-compose
+Brings up three services on CPU, no external calls (after the one-time model pull):
 
-Create a .env file with the following contents:
+- `tdb-search` — this server (HTTP API on `:8080`)
+- `embeddings` — Ollama serving `nomic-embed-text-v2-moe` (GGUF, Q8_0)
+- `terminusdb` — a TerminusDB server for an end-to-end example
 
-```
-OPENAI_KEY=YOUR_OPENAI_KEY
-BUFFER_AMOUNT=1200000
-```
+Drive indexing by push, then search (all requests carry the admin secret):
 
-The buffers are 12kb each, so this will roughly be ~1.2GB of memory.
-You can change this depending on your memory requirements.
+```bash
+# 1. ask where the indexer is up to (TerminusDB uses this to compute the delta)
+curl -u admin:root 'localhost:8080/last-indexed?domain=admin/star_wars&branch=main'
 
-After you created the ENV file, you can start the server by
-running `docker compose up` or `docker-compose up` depending
-on your docker-compose version. This will start a TerminusDB
-server on port 6363 and a VectorLink server on port 8080.
+# 2. push the rendered NDJSON delta for a commit (one operation per line)
+curl -u admin:root -X POST \
+  'localhost:8080/push?domain=admin/star_wars&branch=main&target_commit=<C>&parent_commit=<P>' \
+  -H 'Content-Type: application/x-ndjson' \
+  --data-binary @delta.ndjson
 
-## Invoking
-
-In order to invoke the server, you need to supply an OpenAI key. This
-will provide you with embeddings for your text.
-
-You can do this by either setting the env variable `OPENAI_KEY` or by
-using the `--key` command line option.
-
-```shell
-terminusdb-semantic-indexer serve --directory /path/to/storage/dir
+# 3. semantic search (raw text body; hybrid by default)
+curl -u admin:root 'localhost:8080/search?domain=admin/star_wars&commit=<C>' -d 'Wise old man'
 ```
 
-## Using with Ollama (Local Embeddings)
+In normal operation TerminusDB performs steps 1–2 automatically; the `curl` calls above are how you drive the indexer standalone.
 
-Instead of OpenAI, you can use [Ollama](https://ollama.ai) to generate
-embeddings locally. This is useful for development, testing, or when you
-want to be self-sovereign, keeping all data on your own infrastructure.
+## HTTP API
 
-### Prerequisites
+- **Indexing (push):** `GET /last-indexed`, `POST /push` (NDJSON operation stream, incremental), `GET /check` (poll a push task), `POST /assign` (point a commit at an existing index — a mutation, so POST, not the reference's `GET`).
+- **Search:** `POST /search?mode=vector|fts|hybrid` (hybrid default; `doc_type`/`doc_id` filters), `GET /similar`, `GET /duplicates`.
+- **Ops:** `GET /statistics`.
 
-1. Install Ollama following the [official instructions](https://ollama.ai)
-2. Pull the Qwen3 embedding model:
+Indexing is driven by push (`/last-indexed` + `/push`), not a pull trigger. The full contract is the OpenAPI document: [`openapi.yaml`](./openapi.yaml) — render it with `make docs`.
 
-```shell
-ollama pull qwen3-embedding:4b
-```
+## Deployment & startup
 
-### Running the server with Ollama
+The engine targets **fast cold-start for KEDA-style scale-from-zero**: a fresh pod binds and answers its liveness probe near-instantly, defers all heavy work (datasets opened on first touch, layer index resolved per request, no boot-time scans), and the embedding tier is scaled separately so an indexer pod never pays model-load cost on cold start.
 
-Start the vectorlink server without an OpenAI key. When indexing, pass the
-Ollama configuration via HTTP headers on the `/index` request:
+## Documentation
 
-```shell
-terminusdb-semantic-indexer serve \
-  --directory /path/to/storage/dir \
-  --content-endpoint http://localhost:6363/api/index \
-  --port 8080
-```
+- Design & specs: [`projects/2026-06-terminusdb-vectorlink/`](../../projects/2026-06-terminusdb-vectorlink/)
+- Architecture reference (teaching docs): [`docs/architecture/`](./docs/architecture/)
+- Tests not ported from the reference implementations: [`OMITTED_TESTS.md`](./OMITTED_TESTS.md)
 
-Then kick off indexing with the Ollama headers:
+## License
 
-```shell
-curl 'localhost:8080/index?commit=YOUR_COMMIT&domain=admin/my_db' \
-  -H 'VECTORLINK_OLLAMA_URL: http://localhost:11434' \
-  -H 'VECTORLINK_OLLAMA_MODEL: qwen3-embedding:4b' \
-  -H 'VECTORLINK_OLLAMA_DIMENSIONS: 1536'
-```
-
-The headers are:
-
-| Header | Default | Description |
-|---|---|---|
-| `VECTORLINK_OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
-| `VECTORLINK_OLLAMA_MODEL` | `qwen3-embedding:4b` | Ollama embedding model |
-| `VECTORLINK_OLLAMA_DIMENSIONS` | `1536` | Embedding vector dimensions |
-
-Searches against an Ollama-indexed commit use the same endpoints, but you
-must pass the same Ollama headers so the query text is embedded with the
-same model:
-
-```shell
-curl 'localhost:8080/search?commit=YOUR_COMMIT&domain=admin/my_db' \
-  -H 'VECTORLINK_OLLAMA_URL: http://localhost:11434' \
-  -H 'VECTORLINK_OLLAMA_MODEL: qwen3-embedding:4b' \
-  -H 'VECTORLINK_OLLAMA_DIMENSIONS: 1536' \
-  -d "Wise old man"
-```
-
-### Using with TerminusDB
-
-To use Ollama embeddings with TerminusDB's `http_vectorlink` indexer
-backend, set the following environment variables on the TerminusDB side:
-
-```shell
-TERMINUSDB_INDEXER_BACKEND=http_vectorlink \
-TERMINUSDB_SEMANTIC_INDEXER_ENDPOINT=http://localhost:8080 \
-TERMINUSDB_INSECURE_USER_HEADER_ENABLED=true \
-TERMINUSDB_INSECURE_USER_HEADER=x-terminusdb-user \
-terminusdb serve -m root
-```
-
-TerminusDB will forward indexing requests to the vectorlink server, which
-in turn calls Ollama for embeddings. The Ollama headers can be configured
-in the TerminusDB schema's `@metadata` embedding configuration or passed
-through by the vectorlink plugin.
-
-## Indexing
-
-If you wan to index documents, you can any of these methods:
-
-* Run a TerminusDB installation and refer to real commits and databases
-* Put up an endpoint that will issue the appropriate operations for a
-  commit id and a domain with the endpoint
-  `TERMINUSDB_CONTENT_ENDPOINT/{domain}?commit={commit}`
-* use the `load` command with a file
-
-In any of these cases, the indexer expects a content stream that will
-have the form (in JSONlines format):
-
-```json
-{"id":"terminusdb:///star-wars/People/20", "op":"Inserted", "string":"The person's name is Yoda. They are described with the following synopsis: Yoda is a fictional character in the Star Wars franchise created by George Lucas, first appearing in the 1980 film The Empire Strikes Back. In the original films, he trains Luke Skywalker to fight against the Galactic Empire. In the prequel films, he serves as the Grand Master of the Jedi Order and as a high-ranking general of Clone Troopers in the Clone Wars. Following his death in Return of the Jedi at the age of 900, Yoda was the oldest living character in the Star Wars franchise in canon, until the introduction of Maz Kanata in Star Wars: The Force Awakens. Their gender is male. They have the following hair colours: white. They have a mass of 17. Their skin colours are green."}
-{"id":"terminusdb:///star-wars/People/21", "op":"Deleted"}
-{"id":"terminusdb:///star-wars/People/22", "op":"Replaced", "string":"The person's name is Boba Fett. They are described with the following synopsis: Boba Fett is a fictional character in the Star Wars franchise. In The Empire Strikes Back and Return of the Jedi, he is a bounty hunter hired by Darth Vader and also employed by Jabba the Hutt. He was also added briefly to the original film Star Wars when the film was digitally remastered. Star Wars: Episode II – Attack of the Clones establishes his origin as an unaltered clone of the bounty hunter Jango Fett raised as his son. He also appears in several episodes of Star Wars: The Clone Wars cartoon series which further describes his growth as a villain in the Star Wars universe. His aura of danger and mystery has created a cult following for the character. Their gender is male. They have the following hair colours: black. They have a mass of 78.2. Their skin colours are fair."}
-```
-
-To kick off indexing you can submit the following request to the Vemdex server
-
-```shell
-curl 'localhost:8080/index?commit=0vj85ifuvfcn4vwqf7w4mo2kfa3ekkn&domain=admin/star_wars'
-```
-
-This invokes the indexer for commit `0vj85ifuvfcn4vwqf7w4mo2kfa3ekkn`
-and domain `admin/star_wars`.
-
-## Searching
-
-Searching is easy, you can specify a natural language query to the server as follows:
-
-```shell
-curl 'localhost:8080/search?commit=0vj85ifuvfcn4vwqf7w4mo2kfa3ekkn&domain=admin/star_wars'  -d "Wise old man"
-```
-
-You can also find nearby documents with:
-
-```shell
-curl 'localhost:8080/similar?commit=0vj85ifuvfcn4vwqf7w4mo2kfa3ekkn&domain=admin/star_wars?id=MyExternalID'
-```
-
-The `MyExternalID` refers to the name you gave the record during
-indexing (specified by the `id` field).
-
-## Todo
-
-Lots of work to make this the open-source versioned vector database
-that the world deserves. Anyone who wants to work on the project to
-advance these aims is welcome:
-
-* Add other AI configurations for obtaining the embeddings - we'd like
-  to be very complete and have ways of configuring other vendors and
-  open-source text-to-embedding systems.
-* Greater scope of metric support
-* Improve compression: We'd like to have a sytem of vector compression
-  such as PQ for dealing with very large datasets.
-* Better treatment of deletion and replace
-* Better incrementality of the index structure
-* Smaller graph representations of the indices - using succinct data
-  structures to reduce memory overhead.
-
-And if you have new ideas we'd love to hear them!
+Apache-2.0 (see `LICENSE`).

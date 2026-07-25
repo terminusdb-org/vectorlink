@@ -1,0 +1,19 @@
+# Exclude everything by default, then whitelist what each Dockerfile needs.
+# This keeps the build context small (especially for Dockerfile.dev where only
+# the stripped binary + tokenizer are needed — ~30MB vs 1.2GB unstripped).
+#
+# Applies to all Dockerfiles (Dockerfile, Dockerfile.dev, Dockerfile.build).
+*
+
+# ── Needed by Dockerfile (release build) ──
+!Cargo.toml
+!Cargo.lock
+!src/
+!benches/
+!assets/tokenizer.json.bz2
+
+# ── Needed by Dockerfile.build (build harness image) ──
+!scripts/
+
+# ── Needed by Dockerfile.dev (fast dev image) ──
+!target/debug/tdb-search-stripped

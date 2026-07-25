@@ -1,0 +1,169 @@
+# Publish multi-arch Docker image to GHCR.
+#
+# Orchestrates per-arch builds (amd64 + arm64), pushes per-arch images, then
+# creates a multi-arch manifest via `docker buildx imagetools create`.
+#
+# TAG LOGIC (mirrors terminusdb-enterprise pattern):
+#   push to main      -> :dev, :dev-<sha>
+#   push tag v1.2.3   -> :v1.2.3, :latest, :v1 (major)
+#   push tag v1.2.3-* -> :v1.2.3-rc1 (prerelease: NO :latest, NO major)
+#   workflow_dispatch  -> same as the triggering ref
+#
+# REGISTRY: ghcr.io/dfrnt-com/tdb-search
+# AUTH: GITHUB_TOKEN (no external secrets required)
+#
+# Required repo settings:
+#   - Package visibility: ensure ghcr.io/dfrnt-com/tdb-search is accessible
+#   - GITHUB_TOKEN permissions: packages:write is declared below (no PAT needed)
+
+name: Publish (AMD64, ARM64)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/dfrnt-com/tdb-search
+
+jobs:
+  # ─── Per-arch builds ─────────────────────────────────────────────────────────
+  build_amd64:
+    uses: ./.github/workflows/docker-amd64-build.yml
+
+  build_arm64:
+    uses: ./.github/workflows/docker-arm64-build.yml
+
+  # ─── Push AMD64 ─────────────────────────────────────────────────────────────
+  publish_amd64:
+    needs: build_amd64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download AMD64 image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tdb-search-amd64
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Load and push AMD64 image
+        run: |
+          docker load < tdb-search-amd64.tar.gz
+          docker tag ghcr.io/dfrnt-com/tdb-search:local ghcr.io/dfrnt-com/tdb-search:dev-amd64-${{ github.sha }}
+          docker push ghcr.io/dfrnt-com/tdb-search:dev-amd64-${{ github.sha }}
+
+  # ─── Push ARM64 ─────────────────────────────────────────────────────────────
+  publish_arm64:
+    needs: build_arm64
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download ARM64 image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tdb-search-arm64
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Load and push ARM64 image
+        run: |
+          docker load < tdb-search-arm64.tar.gz
+          docker tag ghcr.io/dfrnt-com/tdb-search:local ghcr.io/dfrnt-com/tdb-search:dev-arm64-${{ github.sha }}
+          docker push ghcr.io/dfrnt-com/tdb-search:dev-arm64-${{ github.sha }}
+
+  # ─── Create multi-arch manifest ─────────────────────────────────────────────
+  create_manifest:
+    needs: [publish_amd64, publish_arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine image tags
+        id: tags
+        run: |
+          # Extract version from GITHUB_REF
+          if [[ "$GITHUB_REF" == refs/heads/* ]]; then
+            VERSION="${GITHUB_REF#refs/heads/}"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION=$(echo "$GITHUB_REF" | sed -e 's,.*/\(.*\),\1,')
+          fi
+
+          # Replace / with - for Docker tag compatibility
+          VERSION=$(echo "$VERSION" | tr '/' '-')
+
+          # Use 'dev' tag for the main branch
+          if [ "$VERSION" == "main" ]; then
+            VERSION="dev"
+          fi
+
+          # Build tag list
+          TAGS="${{ env.IMAGE_NAME }}:${VERSION}"
+
+          # For main branch: also tag with dev-<sha>
+          if [ "$VERSION" == "dev" ]; then
+            TAGS="${TAGS},${{ env.IMAGE_NAME }}:dev-${{ github.sha }}"
+          fi
+
+          # For version tags (non-prerelease): also tag :latest and :vN (major)
+          IS_PRERELEASE=false
+          case "$VERSION" in
+            *-rc*|*-beta*|*-alpha*|*-dev*)
+              IS_PRERELEASE=true
+              ;;
+          esac
+
+          if echo "$GITHUB_REF" | grep -q "refs/tags/v" && [ "$IS_PRERELEASE" = "false" ]; then
+            VERSION_MAJOR=$(echo "$VERSION" | cut -d '.' -f 1)
+            TAGS="${TAGS},${{ env.IMAGE_NAME }}:latest,${{ env.IMAGE_NAME }}:${VERSION_MAJOR}"
+          fi
+
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Computed tags: ${TAGS}"
+
+      - name: Create multi-arch manifest
+        run: |
+          TAGS="${{ steps.tags.outputs.tags }}"
+          AMD64_IMAGE="${{ env.IMAGE_NAME }}:dev-amd64-${{ github.sha }}"
+          ARM64_IMAGE="${{ env.IMAGE_NAME }}:dev-arm64-${{ github.sha }}"
+
+          for TAG in ${TAGS//,/ }; do
+            echo "Creating manifest for: ${TAG}"
+            docker buildx imagetools create -t "${TAG}" "${AMD64_IMAGE}" "${ARM64_IMAGE}"
+          done

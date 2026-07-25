@@ -1,0 +1,38 @@
+[
+  {
+    "@type": "@context",
+    "@base": "terminusdb:///data/",
+    "@schema": "terminusdb:///schema#"
+  },
+  {
+    "@id": "Abt",
+    "@type": "Class",
+    "@key": { "@type": "Lexical", "@fields": ["record_id"] },
+    "record_id": "xsd:string",
+    "name": "xsd:string",
+    "description": "xsd:string",
+    "price": { "@type": "Optional", "@class": "xsd:string" },
+    "@metadata": {
+      "embedding": {
+        "query": "query ($id: ID) { Abt(id: $id) { name description } }",
+        "template": "{{name}}. {{description}}"
+      }
+    }
+  },
+  {
+    "@id": "Buy",
+    "@type": "Class",
+    "@key": { "@type": "Lexical", "@fields": ["record_id"] },
+    "record_id": "xsd:string",
+    "name": "xsd:string",
+    "description": "xsd:string",
+    "manufacturer": { "@type": "Optional", "@class": "xsd:string" },
+    "price": { "@type": "Optional", "@class": "xsd:string" },
+    "@metadata": {
+      "embedding": {
+        "query": "query ($id: ID) { Buy(id: $id) { manufacturer name description } }",
+        "template": "{{#if manufacturer}}{{manufacturer}}. {{/if}}{{name}}.{{#if description}} {{description}}{{/if}}"
+      }
+    }
+  }
+]

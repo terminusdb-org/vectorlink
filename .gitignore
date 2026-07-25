@@ -1,4 +1,34 @@
-/target
-*~
-.env
+# ── Generated artifacts ──
+# dist/ holds generated, reviewable build output (API docs, bundles) — never
+# hand-edited, always reproducible via `make`. Not committed.
+/dist/
+!/dist/.gitkeep
+
+# ── Rust (Phase 1+) ──
+/target/
+**/*.rs.bk
+*.pdb
+
+# ── Node / tooling caches ──
 **/node_modules/
+.redocly-cache/
+*.log
+
+# ── Embedding model cache (local dev; pulled at runtime) ──
+/models/
+*.gguf
+
+# ── Environment / secrets (never commit — CLAUDE.md) ──
+.env
+.env.*
+!.env.example
+
+# ── Agent memory (per-developer, not committed) ──
+.claude/
+
+# ── OS / editor noise ──
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

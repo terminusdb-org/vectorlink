@@ -1,0 +1,332 @@
+"use strict";
+
+// The v2 entity-resolution matching core (spec 17 section 4). PURE — it consumes
+// the retrieval results (top-K neighbour lists for both cross directions, already
+// gathered by a mode adapter from the engine) and produces resolved pairs. It
+// performs NO I/O and knows nothing about HTTP, modes, or templates: the engine
+// is the fuzzy primitive, this is the generic deterministic post-processing
+// (spec section 7). All side-effecting retrieval lives in the mode adapters.
+//
+// Input shape (mode-agnostic):
+//   setToTarget : Map<setId, Array<{ id: targetId, distance }>>
+//   targetToSet : Map<targetId, Array<{ id: setId, distance }>>
+// Distances are on the reference [0,1] cosine scale (0 identical, 0.5 orthogonal).
+//
+// THREE INDEPENDENT THRESHOLDS (the true precision interface):
+//   tauOneToOne   — closeness for the 1:1 mutual-best CORE (reciprocal pairs)
+//   tauOneToMany  — closeness for ADDITIONAL set-side matches (one set -> many targets)
+//   tauManyToOne  — closeness for ADDITIONAL target-side matches (one target -> many set)
+//
+// Output: { matched, set_only, target_only, grounded, assigned, stats }
+// A "matched" entry is { setId, targetId, distance, stage: "core"|"set_extra"|"target_extra" }.
+
+const { minCostAssignment } = require("./hungarian");
+
+// -- Defaults -----------------------------------------------------------------
+// Recommended ordering (NOT enforced): core loosest, extras tighter. This means
+// the confident reciprocal core is generous (catches most true pairs), while 2nd+
+// matches require a stricter closeness bar to avoid over-production.
+const DEFAULTS = Object.freeze({
+  k: 5,
+  tauOneToOne: 0.45,   // core: just under match-all, catches confident reciprocals
+  tauOneToMany: 0.2,   // set-side extras: strict bar for 2nd+ targets per set record
+  tauManyToOne: 0.2,   // target-side extras: strict bar for 2nd+ set records per target
+  maxComponentSize: 200,
+  cardinality: "many-to-many",
+});
+
+const CARDINALITIES = Object.freeze(["many-to-many", "one-to-many", "one-to-one"]);
+
+// Presets: convenience starting defaults for the three tau. A caller picks a
+// preset OR overrides the three tau directly. Presets are NOT magic constants —
+// just sensible starting points.
+const CARDINALITY_PRESETS = Object.freeze({
+  "many-to-many": { tauOneToOne: 0.45, tauOneToMany: 0.2, tauManyToOne: 0.2 },
+  "one-to-many":  { tauOneToOne: 0.45, tauOneToMany: 0.2, tauManyToOne: null },
+  "one-to-one":   { tauOneToOne: 0.45, tauOneToMany: null, tauManyToOne: null },
+});
+
+// -- Validation ---------------------------------------------------------------
+
+function validateTau(name, value) {
+  if (value === null || value === undefined) return; // disabled tau
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`${name} must be a number in [0, 1] (got ${JSON.stringify(value)})`);
+  }
+}
+
+function resolveThresholds(options) {
+  const cardinality = options.cardinality ?? DEFAULTS.cardinality;
+  if (!CARDINALITIES.includes(cardinality)) {
+    throw new Error(
+      `Unknown cardinality "${cardinality}". Known: ${CARDINALITIES.join(", ")}`,
+    );
+  }
+
+  const preset = CARDINALITY_PRESETS[cardinality];
+
+  // Explicit overrides take precedence over preset defaults.
+  const tauOneToOne = options.tauOneToOne ?? preset.tauOneToOne ?? DEFAULTS.tauOneToOne;
+  const tauOneToMany = options.tauOneToMany !== undefined
+    ? options.tauOneToMany
+    : preset.tauOneToMany;
+  const tauManyToOne = options.tauManyToOne !== undefined
+    ? options.tauManyToOne
+    : preset.tauManyToOne;
+
+  // Validate ranges only. No enforcement of ordering between the three tau —
+  // a caller may legitimately set extras looser than the core.
+  validateTau("tauOneToOne", tauOneToOne);
+  validateTau("tauOneToMany", tauOneToMany);
+  validateTau("tauManyToOne", tauManyToOne);
+
+  return { cardinality, tauOneToOne, tauOneToMany, tauManyToOne };
+}
+
+// -- Build the sparse bipartite candidate graph (tau = max of all active tau) --
+//
+// The candidate graph uses the LOOSEST active tau as its edge cap — we need all
+// edges that ANY of the three thresholds might admit. The per-threshold filtering
+// happens downstream (in the matching stages).
+function maxActiveTau(thresholds) {
+  const values = [thresholds.tauOneToOne];
+  if (thresholds.tauOneToMany !== null && thresholds.tauOneToMany !== undefined) {
+    values.push(thresholds.tauOneToMany);
+  }
+  if (thresholds.tauManyToOne !== null && thresholds.tauManyToOne !== undefined) {
+    values.push(thresholds.tauManyToOne);
+  }
+  return Math.max(...values);
+}
+
+function buildCandidateGraph(setToTarget, targetToSet, k, threshold) {
+  const edges = new Map();
+  const setTopK = new Map();
+  const targetTopK = new Map();
+
+  const edgeKey = (setId, targetId) => `${setId}::${targetId}`;
+
+  const addEdge = (setId, targetId, distance) => {
+    if (distance > threshold) return;
+    const key = edgeKey(setId, targetId);
+    const existing = edges.get(key);
+    if (existing === undefined || distance < existing.distance) {
+      edges.set(key, { setId, targetId, distance });
+    }
+  };
+
+  const topKSlice = (list) => list.slice(0, k);
+
+  for (const [setId, neighbours] of setToTarget) {
+    const members = new Set();
+    for (const n of topKSlice(neighbours)) {
+      members.add(n.id);
+      addEdge(setId, n.id, n.distance);
+    }
+    setTopK.set(setId, members);
+  }
+  for (const [targetId, neighbours] of targetToSet) {
+    const members = new Set();
+    for (const n of topKSlice(neighbours)) {
+      members.add(n.id);
+      addEdge(n.id, targetId, n.distance);
+    }
+    targetTopK.set(targetId, members);
+  }
+
+  return { edges, setTopK, targetTopK };
+}
+
+// -- CORE: mutual top-K grounding (tau_one_to_one) ----------------------------
+//
+// The 1:1 CORE = mutual top-k pairs (reciprocal best) passing tauOneToOne.
+// For each set record, the NEAREST mutual edge <= tauOneToOne is grounded.
+// A target may be the core match for several set records (target reusable in core).
+function groundCore(graph, tauOneToOne) {
+  const corePairs = [];
+  // Collect the NEAREST mutual edge per set record that passes tauOneToOne.
+  const bestBySet = new Map();
+
+  for (const edge of graph.edges.values()) {
+    if (edge.distance > tauOneToOne) continue;
+    const targetInSetTopK = graph.setTopK.get(edge.setId)?.has(edge.targetId) === true;
+    const setInTargetTopK = graph.targetTopK.get(edge.targetId)?.has(edge.setId) === true;
+    if (targetInSetTopK && setInTargetTopK) {
+      const current = bestBySet.get(edge.setId);
+      if (current === undefined || edge.distance < current.distance ||
+          (edge.distance === current.distance && edge.targetId < current.targetId)) {
+        bestBySet.set(edge.setId, edge);
+      }
+    }
+  }
+
+  for (const edge of bestBySet.values()) {
+    corePairs.push({
+      setId: edge.setId,
+      targetId: edge.targetId,
+      distance: edge.distance,
+      stage: "core",
+    });
+  }
+
+  return corePairs;
+}
+
+// -- SET-SIDE EXTRAS (tau_one_to_many) ----------------------------------------
+//
+// Additional matches from the SET side: for each set record, emit other targets
+// within tauOneToMany that the set record "found" (target is in the set record's
+// top-K neighbourhood). Edges contributed only from the target direction are
+// excluded — those belong to targetExtras. This makes tauOneToMany and
+// tauManyToOne genuinely independent thresholds.
+function setExtras(graph, corePairs, tauOneToMany) {
+  if (tauOneToMany === null || tauOneToMany === undefined) return [];
+
+  const corePairKeys = new Set(corePairs.map((p) => `${p.setId}::${p.targetId}`));
+  const extras = [];
+
+  for (const edge of graph.edges.values()) {
+    if (edge.distance > tauOneToMany) continue;
+    const key = `${edge.setId}::${edge.targetId}`;
+    if (corePairKeys.has(key)) continue;
+    // Directional constraint: the SET record must have this target in its top-K.
+    if (graph.setTopK.get(edge.setId)?.has(edge.targetId) !== true) continue;
+    extras.push({
+      setId: edge.setId,
+      targetId: edge.targetId,
+      distance: edge.distance,
+      stage: "set_extra",
+    });
+  }
+
+  return extras;
+}
+
+// -- TARGET-SIDE EXTRAS (tau_many_to_one) -------------------------------------
+//
+// Additional matches from the TARGET side: for each target, emit other set
+// records within tauManyToOne that the target "found" (set record is in the
+// target's top-K neighbourhood). Edges contributed only from the set direction
+// are excluded — those belong to setExtras. This makes tauOneToMany and
+// tauManyToOne genuinely independent thresholds.
+function targetExtras(graph, corePairs, tauManyToOne) {
+  if (tauManyToOne === null || tauManyToOne === undefined) return [];
+
+  const corePairKeys = new Set(corePairs.map((p) => `${p.setId}::${p.targetId}`));
+  const extras = [];
+
+  for (const edge of graph.edges.values()) {
+    if (edge.distance > tauManyToOne) continue;
+    const key = `${edge.setId}::${edge.targetId}`;
+    if (corePairKeys.has(key)) continue;
+    // Directional constraint: the TARGET must have this set record in its top-K.
+    if (graph.targetTopK.get(edge.targetId)?.has(edge.setId) !== true) continue;
+    extras.push({
+      setId: edge.setId,
+      targetId: edge.targetId,
+      distance: edge.distance,
+      stage: "target_extra",
+    });
+  }
+
+  return extras;
+}
+
+// -- Orchestration: the full pipeline (pure) ----------------------------------
+//
+// FUTURE (noted, not built): an auto-fit model that calculates the three tau from
+// a target distribution to force high F1 per dataset.
+function resolve(setToTarget, targetToSet, options = {}) {
+  const k = options.k ?? DEFAULTS.k;
+  const maxComponentSize = options.maxComponentSize ?? DEFAULTS.maxComponentSize;
+  const thresholds = resolveThresholds(options);
+
+  // The candidate graph uses the loosest active tau as its edge cap.
+  const graphTau = maxActiveTau(thresholds);
+  const graph = buildCandidateGraph(setToTarget, targetToSet, k, graphTau);
+
+  // Step 1: Core (1:1 mutual-best, reciprocal pairs passing tauOneToOne).
+  const corePairs = groundCore(graph, thresholds.tauOneToOne);
+
+  // Step 2: Set-side extras (additional targets per set record, passing tauOneToMany).
+  const setExtraPairs = setExtras(graph, corePairs, thresholds.tauOneToMany);
+
+  // Step 3: Target-side extras (additional set records per target, passing tauManyToOne).
+  const targetExtraPairs = targetExtras(graph, corePairs, thresholds.tauManyToOne);
+
+  // Deduplicate: a pair may appear in both set_extra and target_extra (same edge
+  // qualifies under both directions). Keep the higher-confidence origin:
+  //   core > set_extra > target_extra. Ties: keep min distance.
+  const stageRank = Object.freeze({ core: 0, set_extra: 1, target_extra: 2 });
+  const matchedMap = new Map();
+  const pairKey = (setId, targetId) => `${setId}::${targetId}`;
+
+  const addToMatched = (pair) => {
+    const key = pairKey(pair.setId, pair.targetId);
+    const existing = matchedMap.get(key);
+    if (existing === undefined) {
+      matchedMap.set(key, pair);
+    } else {
+      const existingRank = stageRank[existing.stage] ?? 99;
+      const newRank = stageRank[pair.stage] ?? 99;
+      if (newRank < existingRank ||
+          (newRank === existingRank && pair.distance < existing.distance)) {
+        matchedMap.set(key, pair);
+      }
+    }
+  };
+
+  for (const p of corePairs) addToMatched(p);
+  for (const p of setExtraPairs) addToMatched(p);
+  for (const p of targetExtraPairs) addToMatched(p);
+
+  const matched = [...matchedMap.values()];
+
+  // Three-partition output: matched / set_only / target_only
+  const matchedSetIds = new Set(matched.map((m) => m.setId));
+  const matchedTargetIds = new Set(matched.map((m) => m.targetId));
+  const allSetIds = new Set([...setToTarget.keys()]);
+  const allTargetIds = new Set([...targetToSet.keys()]);
+  const setOnly = [...allSetIds].filter((id) => !matchedSetIds.has(id));
+  const targetOnly = [...allTargetIds].filter((id) => !matchedTargetIds.has(id));
+
+  // Stage counts for the scorecard.
+  const coreCount = matched.filter((p) => p.stage === "core").length;
+  const setExtraCount = matched.filter((p) => p.stage === "set_extra").length;
+  const targetExtraCount = matched.filter((p) => p.stage === "target_extra").length;
+
+  return {
+    matched,
+    set_only: setOnly,
+    target_only: targetOnly,
+    // Legacy compatibility: grounded = core, assigned = extras.
+    grounded: matched.filter((p) => p.stage === "core"),
+    assigned: matched.filter((p) => p.stage !== "core"),
+    stats: {
+      k,
+      ...thresholds,
+      maxComponentSize,
+      graphTau,
+      edgeCount: graph.edges.size,
+      coreCount,
+      setExtraCount,
+      targetExtraCount,
+      matchedCount: matched.length,
+      setOnlyCount: setOnly.length,
+      targetOnlyCount: targetOnly.length,
+    },
+  };
+}
+
+module.exports = {
+  resolve,
+  buildCandidateGraph,
+  groundCore,
+  setExtras,
+  targetExtras,
+  resolveThresholds,
+  maxActiveTau,
+  DEFAULTS,
+  CARDINALITIES,
+  CARDINALITY_PRESETS,
+};
