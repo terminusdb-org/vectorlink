@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 #![forbid(unsafe_code)]
 
 //! tdb-search load — offline indexing CLI.
@@ -90,7 +93,7 @@ fn parse_args() -> Result<LoadArgs, String> {
     let embed_url = std::env::var("TDB_SEARCH_EMBED_URL")
         .unwrap_or_else(|_| "http://localhost:11434".to_owned());
     let model = std::env::var("TDB_SEARCH_MODEL")
-        .unwrap_or_else(|_| "nomic-embed-v2".to_owned());
+        .unwrap_or_else(|_| "nomic-embed-text-v2-moe".to_owned());
     let dim: usize = std::env::var("TDB_SEARCH_DIM")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -119,7 +122,7 @@ fn print_usage() {
          \n\
          Environment variables:\n\
          TDB_SEARCH_EMBED_URL       Embedding endpoint (default: http://localhost:11434)\n\
-         TDB_SEARCH_MODEL           Model name (default: nomic-embed-v2)\n\
+         TDB_SEARCH_MODEL           Model name (default: nomic-embed-text-v2-moe)\n\
          TDB_SEARCH_DIM             Embedding dimension (default: 768)\n\
          TDB_SEARCH_TOKENIZER_PATH  Path to tokenizer.json"
     );
@@ -187,7 +190,7 @@ async fn main() -> ExitCode {
 
     // Open the LanceStore at the given directory.
     let data_dir = Path::new(&args.directory);
-    let store = LanceStore::new(data_dir, args.dim);
+    let store = LanceStore::new(data_dir, args.dim, 256 * 1024 * 1024, 128 * 1024 * 1024);
 
     // Configure the embedding provider.
     let provider = embed::Provider::OpenAiCompatible {
@@ -248,6 +251,10 @@ async fn main() -> ExitCode {
             Operation::Error { message } => {
                 eprintln!("  skip {}: operation error — {}", i + 1, message);
                 skipped_count += 1;
+            }
+            Operation::Abort => {
+                eprintln!("  abort: client requested abort at line {}", i + 1);
+                break;
             }
         }
     }
@@ -326,11 +333,11 @@ async fn io_index_one(
 
     // Phase 6A Step 5: embed with BOTH roles (document + query).
     let mut embeddings_doc =
-        embed::io_embed(provider, &chunk_texts, EmbeddingRole::Document, http_client)
+        embed::io_embed(provider, &chunk_texts, EmbeddingRole::Document, http_client, None)
             .await
             .map_err(|e| format!("embedding (doc) failed: {}", e))?;
     let mut embeddings_query =
-        embed::io_embed(provider, &chunk_texts, EmbeddingRole::Query, http_client)
+        embed::io_embed(provider, &chunk_texts, EmbeddingRole::Clustering, http_client, None)
             .await
             .map_err(|e| format!("embedding (query) failed: {}", e))?;
 
@@ -361,7 +368,7 @@ async fn io_index_one(
     let rows: Vec<ChunkRow> = chunks
         .iter()
         .zip(embeddings_doc.into_iter().zip(embeddings_query))
-        .map(|(ch, (embedding, query_embedding))| ChunkRow {
+        .map(|(ch, (embedding, clustering_embedding))| ChunkRow {
             doc_id: doc_id.to_owned(),
             doc_type: doc_type.clone(),
             chunk_index: ch.index as i32,
@@ -369,7 +376,7 @@ async fn io_index_one(
             chunk_token_start: ch.token_start as i32,
             doc_token_len: ch.doc_token_len as i32,
             embedding,
-            query_embedding,
+            clustering_embedding,
             content: ch.text.clone(),
         })
         .collect();

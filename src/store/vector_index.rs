@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 #![forbid(unsafe_code)]
 
 //! Vector ANN index management for LanceDB datasets.
@@ -48,6 +51,7 @@ pub const VECTOR_INDEX_NAME: &str = "embedding_ann";
 pub async fn io_ensure_vector_index(
     ds: &mut Dataset,
     config: &VectorIndexConfig,
+    force: bool,
 ) -> Result<u64, StoreError> {
     let indices = ds
         .load_indices()
@@ -72,20 +76,35 @@ pub async fn io_ensure_vector_index(
             .await
             .map_err(|e| StoreError::Internal(format!("count rows failed: {}", e)))?;
 
+        // Compute adaptive partition count: max(config floor, sqrt(row_count)).
+        let num_partitions = config.recommended_num_partitions(row_count);
+
         // IVF needs num_partitions centroids. SQ's sample_rate is adaptive
         // (works with fewer rows by subsampling). The safe floor is the IVF
         // partitions requirement, with a practical minimum of 256 for stable
         // centroid training (KMeans needs reasonable cluster diversity).
+        // When `force` is true (manual compaction), the 256 floor is skipped
+        // and only the adaptive num_partitions minimum is used.
         let ivf_min_training_vectors: usize = 256;
-        let min_rows_for_index = config.num_partitions.max(ivf_min_training_vectors);
+        let min_rows_for_index = if force {
+            num_partitions
+        } else {
+            num_partitions.max(ivf_min_training_vectors)
+        };
         if row_count < min_rows_for_index {
             // Not enough data to train the index yet — return current version.
             // Search uses flat-scan (correct, higher latency on small corpus is acceptable).
             return Ok(ds.version().version);
         }
 
-        // First time: create the vector index.
-        let params = build_vector_index_params(config);
+        // First time: create the vector index with adaptive partition count.
+        let mut adaptive_config = config.clone();
+        adaptive_config.num_partitions = num_partitions;
+        eprintln!(
+            "[io_ensure_vector_index] creating index: {} partitions for {} rows",
+            num_partitions, row_count
+        );
+        let params = build_vector_index_params(&adaptive_config);
         ds.create_index(
             &["embedding"],
             IndexType::Vector,
@@ -97,9 +116,69 @@ pub async fn io_ensure_vector_index(
         .map_err(|e| StoreError::Internal(format!("vector index creation failed: {}", e)))?;
     } else {
         // Index exists: incrementally index new fragments only.
+        // Per-push uses append() — the incremental merge(3) cascade
+        // (io_incremental_cascade) consolidates deltas after each push.
         ds.optimize_indices(&OptimizeOptions::append())
             .await
             .map_err(|e| StoreError::Internal(format!("vector index optimize failed: {}", e)))?;
+    }
+
+    Ok(ds.version().version)
+}
+
+/// Index name for the vector ANN index on `clustering_embedding`.
+pub const CLUSTERING_INDEX_NAME: &str = "clustering_embedding_ann";
+
+/// Ensure a vector ANN index exists on the `clustering_embedding` column.
+///
+/// Only called when `store_clustering` is enabled for the domain. Uses the same
+/// IVF_HNSW_SQ index type and cosine distance as the document embedding index.
+/// Returns the dataset version after index creation/optimization.
+pub async fn io_ensure_clustering_vector_index(
+    ds: &mut Dataset,
+    config: &VectorIndexConfig,
+    force: bool,
+) -> Result<u64, StoreError> {
+    let indices = ds
+        .load_indices()
+        .await
+        .map_err(|e| StoreError::Internal(format!("load indices failed: {}", e)))?;
+
+    let has_clustering_idx = indices.iter().any(|idx| idx.name == CLUSTERING_INDEX_NAME);
+
+    if !has_clustering_idx {
+        let row_count = ds
+            .count_rows(None)
+            .await
+            .map_err(|e| StoreError::Internal(format!("count rows failed: {}", e)))?;
+
+        let num_partitions = config.recommended_num_partitions(row_count);
+        let ivf_min_training_vectors: usize = 256;
+        let min_rows_for_index = if force {
+            num_partitions
+        } else {
+            num_partitions.max(ivf_min_training_vectors)
+        };
+        if row_count < min_rows_for_index {
+            return Ok(ds.version().version);
+        }
+
+        let mut adaptive_config = config.clone();
+        adaptive_config.num_partitions = num_partitions;
+        let params = build_vector_index_params(&adaptive_config);
+        ds.create_index(
+            &["clustering_embedding"],
+            IndexType::Vector,
+            Some(CLUSTERING_INDEX_NAME.to_owned()),
+            &params,
+            false,
+        )
+        .await
+        .map_err(|e| StoreError::Internal(format!("clustering vector index creation failed: {}", e)))?;
+    } else {
+        ds.optimize_indices(&OptimizeOptions::append())
+            .await
+            .map_err(|e| StoreError::Internal(format!("clustering vector index optimize failed: {}", e)))?;
     }
 
     Ok(ds.version().version)
@@ -157,6 +236,49 @@ pub async fn count_unindexed_fragments(ds: &Dataset) -> Result<u64, StoreError> 
     Ok(unindexed.len())
 }
 
+/// Count total physical rows in unindexed fragments for the vector index.
+/// Sibling to `count_unindexed_fragments` — measures flat-scan cost in rows,
+/// not just fragment count. Returns (fragment_count, total_rows).
+pub async fn count_unindexed_rows(ds: &Dataset) -> Result<(u64, u64), StoreError> {
+    let indices = ds
+        .load_indices()
+        .await
+        .map_err(|e| StoreError::Internal(format!("load indices failed: {}", e)))?;
+
+    let vector_segments: Vec<_> = indices
+        .iter()
+        .filter(|idx| idx.name == VECTOR_INDEX_NAME)
+        .collect();
+
+    if vector_segments.is_empty() {
+        return Ok((0, 0));
+    }
+
+    use roaring::RoaringBitmap;
+    let mut covered = RoaringBitmap::new();
+    for segment in &vector_segments {
+        if let Some(bitmap) = &segment.fragment_bitmap {
+            covered |= bitmap;
+        }
+    }
+
+    let mut unindexed_count = 0u64;
+    let mut unindexed_rows = 0u64;
+    for frag in ds.get_fragments() {
+        let id_u32: u32 = frag.id().try_into().map_err(|_| {
+            StoreError::Internal(format!("fragment id {} exceeds u32", frag.id()))
+        })?;
+        if !covered.contains(id_u32) {
+            unindexed_count += 1;
+            if let Some(rows) = frag.metadata().physical_rows {
+                unindexed_rows += rows as u64;
+            }
+        }
+    }
+
+    Ok((unindexed_count, unindexed_rows))
+}
+
 /// Build VectorIndexParams from config.
 /// Uses IVF_HNSW_SQ with cosine distance metric.
 ///
@@ -182,14 +304,14 @@ fn build_vector_index_params(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::store::lance::LanceStore;
     use crate::store::lance::ChunkRow;
 
     /// Create a seeded, L2-normalised random embedding (deterministic).
     /// Adapted from the reference bench: `terminusdb-semantic-indexer/benches/distance.rs`.
-    fn seeded_normalized_embedding(dim: usize, seed: u64) -> Vec<f32> {
+    pub(crate) fn seeded_normalized_embedding(dim: usize, seed: u64) -> Vec<f32> {
         // Simple seeded PRNG (xorshift64) — deterministic, no rand dependency needed.
         let mut state = seed;
         let raw: Vec<f32> = (0..dim)
@@ -210,13 +332,23 @@ mod tests {
         }
     }
 
-    fn make_test_store(dim: usize) -> (LanceStore, tempfile::TempDir) {
+    pub(crate) fn make_test_store(dim: usize) -> (LanceStore, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("create temp dir");
-        let store = LanceStore::new(tmp.path(), dim);
+        let store = LanceStore::new(tmp.path(), dim, 256 * 1024 * 1024, 128 * 1024 * 1024);
         (store, tmp)
     }
 
-    fn make_chunk_row(doc_id: &str, dim: usize, seed: u64) -> ChunkRow {
+    pub(crate) fn make_test_config(_dim: usize) -> VectorIndexConfig {
+        VectorIndexConfig {
+            num_partitions: 4,
+            m: 16,
+            ef_construction: 100,
+            nprobes: 20,
+            refine_factor: Some(10),
+        }
+    }
+
+    pub(crate) fn make_chunk_row(doc_id: &str, dim: usize, seed: u64) -> ChunkRow {
         ChunkRow {
             doc_id: doc_id.to_owned(),
             doc_type: "TestDoc".to_owned(),
@@ -225,7 +357,7 @@ mod tests {
             chunk_token_start: 0,
             doc_token_len: 100,
             embedding: seeded_normalized_embedding(dim, seed),
-            query_embedding: seeded_normalized_embedding(dim, seed + 10000),
+            clustering_embedding: seeded_normalized_embedding(dim, seed + 10000),
             content: format!("content for {}", doc_id),
         }
     }
@@ -234,7 +366,7 @@ mod tests {
     #[tokio::test]
     async fn vector_index_created_on_first_call() {
         let (store, _tmp) = make_test_store(128);
-        let config = VectorIndexConfig::default_for_dim(128);
+        let config = make_test_config(128);
 
         // Insert enough rows for IVF_PQ to work (needs >= num_partitions rows).
         let rows: Vec<ChunkRow> = (0..300)
@@ -260,7 +392,7 @@ mod tests {
         );
 
         // Create.
-        let version = io_ensure_vector_index(&mut ds, &config).await.unwrap();
+        let version = io_ensure_vector_index(&mut ds, &config, false).await.unwrap();
         assert!(version > 0);
 
         // After: vector index exists.
@@ -275,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn vector_index_incremental_on_subsequent_calls() {
         let (store, _tmp) = make_test_store(128);
-        let config = VectorIndexConfig::default_for_dim(128);
+        let config = make_test_config(128);
 
         // Insert initial batch.
         let rows: Vec<ChunkRow> = (0..300)
@@ -292,7 +424,7 @@ mod tests {
         let mut ds = ds_arc.write().await;
 
         // First call: creates.
-        let v1 = io_ensure_vector_index(&mut ds, &config).await.unwrap();
+        let v1 = io_ensure_vector_index(&mut ds, &config, false).await.unwrap();
 
         // Insert more data.
         drop(ds);
@@ -308,7 +440,7 @@ mod tests {
         let mut ds = ds_arc.write().await;
 
         // Second call: incremental (append), produces a new version.
-        let v2 = io_ensure_vector_index(&mut ds, &config).await.unwrap();
+        let v2 = io_ensure_vector_index(&mut ds, &config, false).await.unwrap();
         assert!(v2 > v1, "optimize should produce a new version");
     }
 
@@ -326,12 +458,16 @@ mod tests {
         let recall_threshold = 0.9; // 90% recall with full-partition scan + refine.
 
         let (mut store, _tmp) = make_test_store(dim);
-        // Use high nprobes = num_partitions for the recall test (scan all partitions).
+        // For the recall test, we want to scan ALL partitions (no IVF approximation).
+        // With adaptive partitions, sqrt(500)/4 ≈ 5, floored to 16 partitions.
+        let corpus_rows = corpus_size;
+        let num_partitions = VectorIndexConfig::default_for_dim(dim)
+            .recommended_num_partitions(corpus_rows);
         let config = VectorIndexConfig {
-            num_partitions: 4, // Few partitions for small corpus.
-            m: 30,             // High connectivity for recall.
+            num_partitions, // Adaptive: sqrt(corpus_size) for the test corpus.
+            m: 30,           // High connectivity for recall.
             ef_construction: 200,
-            nprobes: 4,        // Scan ALL partitions — no approximation in partition selection.
+            nprobes: num_partitions, // Scan ALL partitions — no approximation in partition selection.
             refine_factor: Some(20), // Re-rank top 20x candidates with full vectors.
         };
         // Set the store's search params to match.
@@ -351,7 +487,7 @@ mod tests {
         // Create vector index.
         let ds_arc = store.io_open_dataset("admin/test", "main").await.unwrap();
         let mut ds = ds_arc.write().await;
-        io_ensure_vector_index(&mut ds, &config).await.unwrap();
+        io_ensure_vector_index(&mut ds, &config, false).await.unwrap();
         drop(ds);
 
         // Tag a commit.
@@ -412,7 +548,7 @@ mod tests {
     async fn search_during_indexing_lag_returns_correct_results() {
         let dim = 128;
         let (store, _tmp) = make_test_store(dim);
-        let config = VectorIndexConfig::default_for_dim(dim);
+        let config = make_test_config(dim);
 
         // Insert initial corpus and create index.
         let initial_rows: Vec<ChunkRow> = (0..300)
@@ -428,7 +564,7 @@ mod tests {
         let ds_arc = store.io_open_dataset("admin/test", "main").await.unwrap();
         {
             let mut ds = ds_arc.write().await;
-            io_ensure_vector_index(&mut ds, &config).await.unwrap();
+            io_ensure_vector_index(&mut ds, &config, false).await.unwrap();
         }
 
         // Insert NEW data AFTER index creation (these are unindexed fragments).
@@ -441,7 +577,7 @@ mod tests {
             chunk_token_start: 0,
             doc_token_len: 50,
             embedding: seeded_normalized_embedding(dim, new_doc_seed),
-            query_embedding: seeded_normalized_embedding(dim, new_doc_seed + 10000),
+            clustering_embedding: seeded_normalized_embedding(dim, new_doc_seed + 10000),
             content: "brand new unindexed document".to_owned(),
         };
         store
@@ -489,7 +625,7 @@ mod tests {
     async fn statistics_pending_index_fragments() {
         let dim = 128;
         let (store, _tmp) = make_test_store(dim);
-        let config = VectorIndexConfig::default_for_dim(dim);
+        let config = make_test_config(dim);
 
         // Insert data.
         let rows: Vec<ChunkRow> = (0..300)
@@ -506,7 +642,7 @@ mod tests {
         let ds_arc = store.io_open_dataset("admin/test", "main").await.unwrap();
         {
             let mut ds = ds_arc.write().await;
-            io_ensure_vector_index(&mut ds, &config).await.unwrap();
+            io_ensure_vector_index(&mut ds, &config, false).await.unwrap();
         }
 
         // After index creation: pending should be 0 (or very low).
@@ -537,7 +673,7 @@ mod tests {
         let ds_arc = store.io_open_dataset("admin/test", "main").await.unwrap();
         {
             let mut ds = ds_arc.write().await;
-            io_ensure_vector_index(&mut ds, &config).await.unwrap();
+            io_ensure_vector_index(&mut ds, &config, false).await.unwrap();
         }
         let ds_arc = store.io_open_dataset("admin/test", "main").await.unwrap();
         let ds = ds_arc.read().await;
@@ -548,13 +684,72 @@ mod tests {
         );
     }
 
+    /// Sibling to statistics_pending_index_fragments — verifies count_unindexed_rows
+    /// returns both fragment count and total rows, and both return to 0 after optimize.
+    #[tokio::test]
+    async fn statistics_pending_index_documents() {
+        let dim = 128;
+        let (store, _tmp) = make_test_store(dim);
+        let config = make_test_config(dim);
+
+        let rows: Vec<ChunkRow> = (0..300)
+            .map(|i| make_chunk_row(&format!("doc/{}", i), dim, i as u64 + 1))
+            .collect();
+        for row in &rows {
+            store
+                .io_upsert_chunks("admin/test", "main", &row.doc_id, std::slice::from_ref(row))
+                .await
+                .expect("upsert");
+        }
+
+        let ds_arc = store.io_open_dataset("admin/test", "main").await.unwrap();
+        {
+            let mut ds = ds_arc.write().await;
+            io_ensure_vector_index(&mut ds, &config, false).await.unwrap();
+        }
+        drop(ds_arc);
+
+        for i in 300..310 {
+            let row = make_chunk_row(&format!("doc/{}", i), dim, i as u64 + 1);
+            store
+                .io_upsert_chunks("admin/test", "main", &row.doc_id, std::slice::from_ref(&row))
+                .await
+                .expect("upsert new");
+        }
+
+        let ds_arc = store.io_open_dataset("admin/test", "main").await.unwrap();
+        let ds = ds_arc.read().await;
+        let (pending_frags, pending_rows) = count_unindexed_rows(&ds).await.unwrap();
+        drop(ds);
+
+        assert!(
+            pending_frags > 0,
+            "should have pending fragments after new inserts without optimize"
+        );
+        assert!(
+            pending_rows > 0,
+            "should have pending rows after new inserts without optimize"
+        );
+
+        let ds_arc = store.io_open_dataset("admin/test", "main").await.unwrap();
+        {
+            let mut ds = ds_arc.write().await;
+            io_ensure_vector_index(&mut ds, &config, false).await.unwrap();
+        }
+        let ds_arc = store.io_open_dataset("admin/test", "main").await.unwrap();
+        let ds = ds_arc.read().await;
+        let (pending_frags_after, pending_rows_after) = count_unindexed_rows(&ds).await.unwrap();
+        assert_eq!(pending_frags_after, 0, "pending fragments should be 0 after optimize");
+        assert_eq!(pending_rows_after, 0, "pending rows should be 0 after optimize");
+    }
+
     /// P2.5-6: Vector index is available at the tagged commit version.
     /// (Confirms index travels with the version manifest.)
     #[tokio::test]
     async fn vector_index_available_at_tagged_version() {
         let dim = 128;
         let (store, _tmp) = make_test_store(dim);
-        let config = VectorIndexConfig::default_for_dim(dim);
+        let config = make_test_config(dim);
 
         // Insert data + create index.
         let rows: Vec<ChunkRow> = (0..300)
@@ -570,7 +765,7 @@ mod tests {
         let version_with_index;
         {
             let mut ds = ds_arc.write().await;
-            version_with_index = io_ensure_vector_index(&mut ds, &config).await.unwrap();
+            version_with_index = io_ensure_vector_index(&mut ds, &config, false).await.unwrap();
         }
 
         // Tag commit to the version that includes the index.

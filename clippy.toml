@@ -1,0 +1,19 @@
+# Clippy configuration — enforced via `make clippy` (-D warnings).
+#
+# SECURITY: disallowed-methods prevents reintroduction of string-based SQL
+# filter construction, which is vulnerable to injection via backslash-quote
+# escaping and control characters. All filter construction must use
+# DataFusion Expr values via filter_expr() / DeleteBuilder::from_expr().
+#
+# See CONTRIBUTING.md → Security → Lance filter construction for details.
+
+disallowed-methods = [
+    # Scanner::filter takes a SQL string — use filter_expr(Expr) instead
+    "lance::dataset::scanner::Scanner::filter",
+
+    # Dataset::delete takes a SQL string — use DeleteBuilder::from_expr instead
+    "lance::dataset::Dataset::delete",
+
+    # DeleteBuilder::new takes a SQL string — use DeleteBuilder::from_expr instead
+    "lance::dataset::write::DeleteBuilder::new",
+]

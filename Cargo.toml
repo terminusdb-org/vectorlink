@@ -26,13 +26,18 @@ reqwest = { version = "0.12", features = ["json"] }
 roaring = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+sled = "0.34"
 subtle = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 uuid = { version = "1", features = ["v4"] }
+ruzstd = "0.8"
 
 tempfile = "3"
 

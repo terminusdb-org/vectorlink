@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 #![forbid(unsafe_code)]
 
 //! Store — storage backends.
@@ -12,6 +15,7 @@ pub mod vector_index;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::RwLock;
 
@@ -31,8 +35,8 @@ pub struct InMemoryStore {
 
 #[derive(Debug, Default)]
 struct StoreInner {
-    /// Tasks by task ID.
-    tasks: HashMap<String, TaskStatus>,
+    /// Tasks by task ID, with insertion timestamp.
+    tasks: HashMap<String, (TaskStatus, Instant)>,
     /// Pending push keys (domain, branch) — for concurrency guard.
     pending: HashMap<PendingKey, String>,
     /// Commit assignments: (domain, target_commit) -> source_commit.
@@ -93,10 +97,10 @@ impl InMemoryStore {
         // Mark task as complete immediately (stub — no real indexing).
         inner.tasks.insert(
             task_id.clone(),
-            TaskStatus::Complete {
+            (TaskStatus::Complete {
                 indexed_documents: 0,
                 skipped: Vec::new(),
-            },
+            }, Instant::now()),
         );
         // Update last-indexed.
         let version = inner
@@ -113,7 +117,7 @@ impl InMemoryStore {
     /// Check task status.
     pub async fn check_task(&self, task_id: &str) -> Option<TaskStatus> {
         let inner = self.inner.read().await;
-        inner.tasks.get(task_id).cloned()
+        inner.tasks.get(task_id).map(|(s, _)| s.clone())
     }
 
     /// Assign a target commit to a source commit's index (no recompute).
@@ -149,7 +153,7 @@ impl InMemoryStore {
         let mut inner = self.inner.write().await;
         inner.tasks.insert(
             task_id.to_owned(),
-            TaskStatus::Error { error },
+            (TaskStatus::Error { error }, Instant::now()),
         );
     }
 
@@ -162,6 +166,8 @@ impl InMemoryStore {
             documents: 0,
             chunks: 0,
             pending_index_fragments: 0,
+            pending_index_documents: 0,
+            store_clustering: None,
         }
     }
 }

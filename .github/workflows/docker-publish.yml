@@ -18,10 +18,10 @@
 
 name: Publish (AMD64, ARM64)
 
+# NOTE: Docker publishing for push-to-main and tags is now handled by the
+# unified CI workflow (.github/workflows/ci.yml, docker-publish job).
+# This workflow is kept for manual multi-arch publishing only.
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
   workflow_dispatch:
 
 permissions:

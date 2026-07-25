@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 #![forbid(unsafe_code)]
 
 //! Error taxonomy — explicit, layered error enums.
@@ -23,6 +26,9 @@ pub enum ServiceError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("push aborted by client: {0}")]
+    Abort(String),
 }
 
 /// Ingest (NDJSON parse) errors.

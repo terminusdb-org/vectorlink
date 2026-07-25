@@ -30,7 +30,7 @@ help:
 	@echo "  make dev-image        Assemble dev container from debug binary (seconds)"
 	@echo "  make dev-up           dev + dev-image + docker compose up (full edit-run)"
 	@echo "  make dev-up-release   RELEASE build + compose up (80x faster runtime)"
-	@echo "  make build-release    Production RELEASE build (lto=thin, slow)"
+	@echo "  make build            Production RELEASE build (lto=thin, slow)"
 	@echo "  make lint             Run ALL component linters (must pass before commit)"
 	@echo "  make lint-openapi     Strict OpenAPI 3.1 lint (Redocly $(REDOCLY_VERSION))"
 	@echo "  make clippy           Rust lint (-D warnings) — runs once the crate exists"
@@ -40,6 +40,12 @@ help:
 	@echo "  make docs-rebuild     Clean rebuild of the dist/api API docs"
 	@echo "  make verify           lint + test (no side effects)"
 	@echo "  make pr               Full pre-PR gate: lint + test + release build + docs"
+	@echo "  make pr-light         Pre-PR gate without release build (fast, no Rust recompile)"
+	@echo "  make server-start     Start tdb-search (7372) + TerminusDB (7373)"
+	@echo "  make server-stop      Stop both test servers"
+	@echo "  make server-restart   Restart both test servers"
+	@echo "  make server-clean     Stop, wipe storage, and start fresh"
+	@echo "  make server-status    Show status of both servers"
 	@echo "  make build-image      Build the dev/CI container image (deps pre-baked)"
 	@echo "  make fix-volumes      Remediate named volume ownership for non-root user"
 	@echo "  make clean            Remove generated artifacts ($(DIST)/)"
@@ -86,11 +92,21 @@ DOCKER_RUN := docker run --rm \
 	-w /work \
 	$(BUILD_IMAGE)
 
+# Detect Docker availability. When Docker (or the build image) is absent,
+# cargo targets fall back to running on the host directly.
+DOCKER_AVAILABLE := $(shell command -v docker >/dev/null 2>&1 && docker image inspect $(BUILD_IMAGE) >/dev/null 2>&1 && echo yes || echo no)
+
+# CARGO_RUN: expands to the Docker wrapper when available, or plain cargo when not.
+ifeq ($(DOCKER_AVAILABLE),yes)
+CARGO_RUN := $(DOCKER_RUN)
+else
+CARGO_RUN :=
+endif
+
 .PHONY: clippy
 clippy:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		$(DOCKER_RUN) \
-			cargo clippy --all-targets --all-features -- -D warnings ; \
+		$(CARGO_RUN) cargo clippy --all-targets --all-features -- -D warnings ; \
 	else \
 		echo "• clippy skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
@@ -173,20 +189,18 @@ dev-up: dev dev-image
 # Slower to build (~45s incremental vs ~5s) but 80x faster at runtime for
 # vector compute paths. Use for: benchmarking, /resolve testing, E2E timing.
 .PHONY: dev-up-release
-dev-up-release: build-release
+dev-up-release: build
 	@cp target/release/tdb-search target/debug/tdb-search-stripped
 	docker build -f Dockerfile.dev -t tdb-search:dev .
 	docker compose up -d tdb-search
 
-# build-release: RELEASE build (no LTO). Fast enough for `make pr` gate
+# build: RELEASE build (no LTO). Fast enough for `make pr` gate
 # (incremental relinks). LTO only in `make release-image` (production publish).
-# Binary copied to host target/release/.
-.PHONY: build-release
-build-release:
+# Binary lands in host target/release/.
+.PHONY: build
+build:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		$(DOCKER_RUN) \
-			cargo build --release ; \
-		$(MAKE) copy-binaries PROFILE_DIR=release ; \
+		cargo build --release ; \
 	else \
 		echo "• release build skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
@@ -210,22 +224,36 @@ release-image:
 .PHONY: test
 test:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		$(DOCKER_RUN) \
-			cargo test --all-features ; \
+		$(CARGO_RUN) cargo test --all-features ; \
 	else \
 		echo "• test skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
 
-# Integration tests (mocha) against a LIVE server. Self-contained: builds the
-# engine, starts it in a container on a free host port, waits for readiness,
-# runs the suite, and tears down. Part of the `pr` gate.
+# Integration tests (mocha) against a LIVE tdb-search server. The server and
+# Ollama must already be running — this target only runs the test suite.
+# Set TDB_SEARCH_URL to point at a non-default endpoint (default: localhost:7372).
+# Part of the `pr` gate.
 .PHONY: test-integration
 test-integration:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		CARGO_VOLUME=$(CARGO_VOLUME) TARGET_VOLUME=$(TARGET_VOLUME) BUILD_IMAGE=$(BUILD_IMAGE) ./scripts/run-integration-tests.sh ; \
+		TDB_SEARCH_URL="${TDB_SEARCH_URL:-http://localhost:7372}" \
+		TDB_SEARCH_ADMIN_USER="${TDB_SEARCH_ADMIN_USER:-admin}" \
+		TDB_SEARCH_ADMIN_SECRET="${TDB_SEARCH_ADMIN_SECRET:-root}" \
+		npx mocha --timeout 60000 ; \
 	else \
 		echo "• integration tests skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
+
+# E2e tests (mocha) — require BOTH tdb-search (7372) and TerminusDB (7373)
+# to be running. These tests exercise the TerminusDB plugin endpoints that
+# proxy to tdb-search. NOT part of the `pr` gate (run separately).
+# Use `make server-start` to start both servers.
+.PHONY: test-e2e
+test-e2e:
+	@TDB_SEARCH_URL="${TDB_SEARCH_URL:-http://localhost:7372}" \
+		TDB_SEARCH_ADMIN_USER="${TDB_SEARCH_ADMIN_USER:-admin}" \
+		TDB_SEARCH_ADMIN_SECRET="${TDB_SEARCH_ADMIN_SECRET:-root}" \
+		npx mocha --config .mocharc.e2e.js
 
 # Lint the JS test sources (eslint, TerminusDB-style). Part of `lint`.
 .PHONY: lint-tests
@@ -254,13 +282,52 @@ docs-rebuild:
 verify: lint test
 	@echo "✓ verify passed"
 
+# pr-light: lint + unit tests + integration + e2e + docs. No release build,
+# so no expensive Rust recompile. Use for rapid iteration on JS/tests.
+.PHONY: pr-light
+pr-light: lint test test-integration test-e2e docs
+	@echo "✓ PR-light gate passed (no release build) — review $(DOCS_OUT), then commit (GPG-signed)"
+
 # pr: the full pre-PR gate. Mirrors TerminusDB's `pr` target. Must be green
-# before opening a PR. Runs lint + unit tests + integration tests (debug) +
-# production release build + docs. The release build proves the production
-# binary compiles cleanly but is NOT used for tests (debug binary is used).
+# before opening a PR. Delegates to pr-light, then adds the release build
+# which proves the production binary compiles cleanly (but is NOT used for
+# tests — debug binary is used).
 .PHONY: pr
-pr: lint test test-integration build-release docs
+pr: pr-light build
 	@echo "✓ PR gate passed — review $(DOCS_OUT), then commit (GPG-signed)"
+
+# ──────────────────────── test server ────────────────────────────────────
+# Manage the local test stack: tdb-search (7372) + TerminusDB (7373).
+# Delegates to tests/tdb-search-server.sh which handles both servers.
+.PHONY: server-start
+server-start:
+	tests/tdb-search-server.sh start
+
+.PHONY: server-stop
+server-stop:
+	tests/tdb-search-server.sh stop
+
+.PHONY: server-restart
+server-restart:
+	tests/tdb-search-server.sh restart
+
+.PHONY: server-status
+server-status:
+	tests/tdb-search-server.sh status
+
+.PHONY: server-clean
+server-clean:
+	tests/tdb-search-server.sh stop
+	rm -rf /tmp/tdb-search-data
+	@if [ -n "$$(tests/tdb-search-server.sh status 2>/dev/null | grep -o 'TerminusDB repo not found')" ]; then \
+		echo "• TerminusDB storage clean skipped — repo not found" ; \
+	else \
+		TDB_ROOT="$$(cd "$$(pwd)/../terminusdb" 2>/dev/null && pwd)" ; \
+		if [ -n "$$TDB_ROOT" ] && [ -f "$$TDB_ROOT/tests/terminusdb-test-server.sh" ]; then \
+			"$$TDB_ROOT/tests/terminusdb-test-server.sh" clean ; \
+		fi ; \
+	fi
+	tests/tdb-search-server.sh start
 
 # ──────────────────────── container image ────────────────────────────────
 # Build the dev/CI container image with all deps pre-baked. No apt-at-runtime.

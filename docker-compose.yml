@@ -29,6 +29,8 @@ services:
     environment:
       - TERMINUSDB_SERVER_PORT=6363
       - "TERMINUSDB_ADMIN_PASS=${TERMINUSDB_ADMIN_PASS:-root}"
+      - TERMINUSDB_INDEXER_BACKEND=http_tdb_search
+      - TERMINUSDB_TDB_SEARCH_ENDPOINT=http://tdb-search:8080
     ports:
       # Host 6363/6364 commonly taken by a dev TerminusDB; use 6365.
       - "127.0.0.1:6365:6363"
@@ -51,9 +53,9 @@ services:
       # Keep the model resident indefinitely (never unload on idle). Eliminates
       # the cold-load penalty on every push/bench after an idle gap. Trade-off:
       # the model stays in RAM (~0.7-1.5 GiB for nomic-embed-v2 Q8_0) at all times.
-      - OLLAMA_KEEP_ALIVE=-1
-    ports:
-      - "127.0.0.1:11434:11434"
+      - OLLAMA_KEEP_ALIVE=60m
+    #ports:
+    #  - "127.0.0.1:11434:11434"
     volumes:
       - ollama-models:/root/.ollama
     healthcheck:
@@ -94,9 +96,12 @@ services:
       - TDB_SEARCH_MODEL=nomic-embed-v2
       - TDB_SEARCH_DIM=768
       - TDB_SEARCH_DATA_DIR=/data
+      - TDB_SEARCH_EMBED_CACHE_SIZE=3000000
       - TDB_SEARCH_TOKENIZER_PATH=/opt/tdb-search/tokenizer.json.bz2
+      - TDB_SEARCH_PROMETHEUS_PORT=9090
     ports:
       - "127.0.0.1:8081:8080"
+      - "127.0.0.1:9091:9090"
     volumes:
       - tdb-search-data:/data
     depends_on:

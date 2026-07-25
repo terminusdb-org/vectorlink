@@ -1,0 +1,44 @@
+Business Source License 1.1
+
+Parameters
+
+Licensor:             DFRNT AB
+Licensed Work:        tdb-search Enterprise Edition modules
+                      The Licensed Work is (a) the source modules marked
+                      with SPDX-License-Identifier: BUSL-1.1, and (b) any
+                      additional functionality designated as Enterprise
+                      Edition in future releases.
+Additional Use Grant: None
+Change Date:          2029-01-01
+Change License:       Apache License, Version 2.0
+
+Terms
+
+The Licensor hereby grants you a world-wide, royalty-free, non-exclusive
+license, subject to third party intellectual property claims, to use,
+copy, modify, and distribute this software and its documentation, or any
+work derived from such software, in source or binary form, for any
+purpose, provided that:
+  1. this License and the associated copyright and trademark notices are
+     preserved in all copies and derivative works;
+  2. the Licensed Work is not used in a production, commercial, or
+     revenue-generating context before the Change Date;
+  3. you comply with the Additional Use Grant (if any); and
+  4. you do not remove or alter any copyright, trademark, or patent
+     notices in the Licensed Work.
+
+This license does not authorize use of the trade names, trademarks, or
+product names of the Licensor, except as required for reasonable and
+customary use in describing the origin of the Licensed Work.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE,
+ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+On the Change Date, this license will automatically change to the
+Apache License, Version 2.0, as published by the Apache Software
+Foundation.

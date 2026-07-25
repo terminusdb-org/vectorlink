@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 //! Pure document-level dedup logic (no I/O, no LanceStore dependency).
 
 use std::collections::HashMap;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 #![forbid(unsafe_code)]
 
 //! Ingest — NDJSON push stream parsing.
@@ -99,6 +102,13 @@ mod tests {
         let line = r#"{"op":"Error","message":"render failed"}"#;
         let op = parse_operation_line(line, 1).unwrap();
         assert!(matches!(op, Operation::Error { .. }));
+    }
+
+    #[test]
+    fn parse_abort_operation() {
+        let line = r#"{"op":"Abort"}"#;
+        let op = parse_operation_line(line, 1).unwrap();
+        assert!(matches!(op, Operation::Abort));
     }
 
     #[test]

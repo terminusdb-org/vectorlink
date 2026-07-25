@@ -4,6 +4,9 @@
 /dist/
 !/dist/.gitkeep
 
+# Test data
+data/
+
 # ── Rust (Phase 1+) ──
 /target/
 **/*.rs.bk
@@ -32,3 +35,6 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# Vendor sources
+vendor/

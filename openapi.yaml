@@ -59,7 +59,7 @@ paths:
         (domain, branch) has never been indexed.
       parameters:
         - $ref: '#/components/parameters/Domain'
-        - $ref: '#/components/parameters/Branch'
+        - $ref: '#/components/parameters/BranchOptional'
       responses:
         '200':
           description: The last-indexed commit (or null if none).
@@ -86,7 +86,7 @@ paths:
         `/last-indexed` handshake.
       parameters:
         - $ref: '#/components/parameters/Domain'
-        - $ref: '#/components/parameters/Branch'
+        - $ref: '#/components/parameters/BranchOptional'
         - name: target_commit
           in: query
           required: true
@@ -99,6 +99,23 @@ paths:
             The commit the delta is computed from (the prior last-indexed).
             Absent means the first index of this lineage (every doc is Inserted).
           schema: { type: string }
+        - name: stream
+          in: query
+          required: false
+          description: >
+            When true, the response is an NDJSON stream of progress updates
+            (one JSON object per line) with an `X-Task-Id` header, instead of
+            the default text/plain task-id response. The stream stays open
+            until indexing completes or aborts.
+          schema: { type: boolean, default: false }
+        - name: store_clustering
+          in: query
+          required: false
+          description: >
+            When true, enables clustering embedding generation at index time.
+            Updates the domain's setting (for both new and existing domains).
+            Defaults to false.
+          schema: { type: boolean, default: false }
       requestBody:
         required: true
         content:
@@ -117,11 +134,22 @@ paths:
                   {"op":"Error","message":"Failed to render terminusdb:///star-wars/People/99"}
       responses:
         '200':
-          description: Push accepted; indexing runs asynchronously. Poll `/check`.
+          description: >
+            Push accepted; indexing runs asynchronously. Poll `/check` (or read
+            the NDJSON stream if `stream=true`).
+          headers:
+            X-Task-Id:
+              description: Opaque task id (present in both stream and non-stream modes).
+              schema: { type: string }
           content:
             text/plain:
-              schema: { type: string, description: Opaque task id. }
+              schema: { type: string, description: Opaque task id (non-stream mode). }
               examples: { taskId: { value: "task-7f3a9c" } }
+            application/x-ndjson:
+              schema: { $ref: '#/components/schemas/ProgressUpdate' }
+              examples:
+                progress: { value: { status: "indexing", percentage: 42.5 } }
+                complete: { value: { status: "complete", percentage: 100.0, indexed_documents: 1284 } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '409':
@@ -132,6 +160,15 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: >
+            Abort received in the NDJSON stream. The engine stops processing and
+            returns the line number where the abort was encountered.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                abort: { value: { error: "abort received at line 42" } }
 
   /check:
     get:
@@ -197,6 +234,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
 
   # ───────────────────────────── search ────────────────────────────────────
   /search:
@@ -210,7 +248,7 @@ paths:
         request (long queries, programmatic composition). `doc_type`/`doc_id` are
         repeated params (e.g. `?doc_type=A&doc_type=B`), AND-ed across the two
         sets, OR within each. Results paginate with `start` (default 0) and
-        `count` (default 50). Staleness is reported via the `TerminusDB-Data-Version`
+        `count` (default 10). Staleness is reported via the `TerminusDB-Data-Version`
         response header.
 
 
@@ -220,6 +258,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Domain'
         - $ref: '#/components/parameters/Commit'
+        - $ref: '#/components/parameters/BranchOptional'
         - name: q
           in: query
           required: true
@@ -257,9 +296,11 @@ paths:
         query parameter OR in the JSON body. The JSON body takes precedence — if a
         field is present in the body, the same-named query parameter is discarded
         (not merged). This lets a caller set defaults in the URL and override them
-        in the body. `domain`, `commit` and `q` must be present in the body OR the
-        query — absent in both gives 400. Results paginate with `start` (default
-        0) and `count` (default 50). Staleness is reported via the
+        in the body. `domain` and `q` must be present in the body OR the
+        query — absent in both gives 400. `commit` is optional; when omitted,
+        the engine resolves the latest indexed commit for `branch`. Results
+        paginate with `start` (default
+        0) and `count` (default 10). Staleness is reported via the
         `TerminusDB-Data-Version` response header — the response body stays the
         bare array.
 
@@ -282,6 +323,11 @@ paths:
           required: false
           description: Optional on POST — body `commit` wins (see SearchRequest).
           schema: { type: string }
+        - name: branch
+          in: query
+          required: false
+          description: Optional on POST — body `branch` wins. When `commit` is absent, resolves the latest indexed commit for this branch.
+          schema: { type: string, default: main }
         - $ref: '#/components/parameters/Q'
         - $ref: '#/components/parameters/Start'
         - $ref: '#/components/parameters/Count'
@@ -317,6 +363,75 @@ paths:
         '503': { $ref: '#/components/responses/EmbeddingBackendUnavailable' }
         '500': { $ref: '#/components/responses/UpstreamError' }
 
+  # ─────────────────────────── suggest ─────────────────────────────────────
+  /suggest:
+    get:
+      tags: [search]
+      operationId: suggest
+      summary: Typeahead assist (FTS-only, no embedding).
+      description: >
+        Fast full-text-only typeahead endpoint for UI autocomplete. Given a partial
+        query string, returns an approximate match count, completion suggestions
+        extracted from indexed content, and the first N document IDs (default 11,
+        so the UI can show 10 + a "more" indicator). No embedding call — uses the
+        existing FTS inverted index directly, optimised for sub-100ms responses.
+        `doc_type`/`doc_id` are repeated params, same as `/search`. Staleness is
+        reported via the `TerminusDB-Data-Version` response header.
+      parameters:
+        - name: domain
+          in: query
+          required: true
+          schema: { type: string }
+          description: TerminusDB graphspec domain (e.g. `admin/db`).
+        - $ref: '#/components/parameters/Commit'
+        - $ref: '#/components/parameters/BranchOptional'
+        - name: q
+          in: query
+          required: true
+          schema: { type: string }
+          description: Partial query string for typeahead.
+        - name: count
+          in: query
+          required: false
+          schema: { type: integer, default: 11, minimum: 1 }
+          description: Number of document IDs to return.
+        - name: doc_type
+          in: query
+          required: false
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+          description: Filter by document type(s) (OR within, AND with doc_id).
+        - name: doc_id
+          in: query
+          required: false
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+          description: Filter by document ID(s) (OR within, AND with doc_type).
+        - name: ancestor
+          in: query
+          required: false
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+          description: Nearest-first ancestor window for catch-up resolution.
+        - $ref: '#/components/parameters/ExpectedDataVersion'
+      responses:
+        '200':
+          description: Suggest results.
+          headers:
+            TerminusDB-Data-Version:
+              schema: { type: string }
+              description: The commit actually served (may differ from requested under staleness).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuggestResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NoIndexedLineage' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
+
   /similar:
     get:
       tags: [search]
@@ -335,6 +450,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Domain'
         - $ref: '#/components/parameters/Commit'
+        - $ref: '#/components/parameters/BranchOptional'
         - name: id
           in: query
           required: true
@@ -380,6 +496,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Domain'
         - $ref: '#/components/parameters/Commit'
+        - $ref: '#/components/parameters/BranchOptional'
         - name: id
           in: query
           required: false
@@ -419,6 +536,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NoIndexedLineage' }
         '500': { $ref: '#/components/responses/UpstreamError' }
+        '503': { $ref: '#/components/responses/EmbeddingBackendUnavailable' }
 
   /duplicates:
     get:
@@ -459,6 +577,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Domain'
         - $ref: '#/components/parameters/Commit'
+        - $ref: '#/components/parameters/BranchOptional'
         - name: threshold
           in: query
           required: false
@@ -492,6 +611,7 @@ paths:
         - $ref: '#/components/parameters/Snippet'
         - $ref: '#/components/parameters/Start'
         - $ref: '#/components/parameters/Count'
+        - $ref: '#/components/parameters/Ancestor'
       responses:
         '200':
           description: >
@@ -515,29 +635,27 @@ paths:
                         - { id: "terminusdb:///abt/Product/10", snippet: "Sony 5 disc CD changer ..." }
                         - { id: "terminusdb:///buy/Product/57", snippet: "Sony 5-disc CD player ..." }
                       distance: 0.04
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NoIndexedLineage' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
 
-  /resolve:
+  /candidates:
     post:
       tags: [search]
-      operationId: resolve
-      summary: Batch entity resolution over stored vectors.
+      operationId: candidates
+      summary: Bidirectional KNN candidate gather for entity resolution.
       description: >
-        Server-side batch entity resolution: reciprocal cross-NN retrieval
-        over stored vectors, then a 3-threshold matching algorithm producing
-        a 3-partition output (matched, set_only, target_only). Replaces
-        N sequential /similar HTTP calls with a single in-process batch —
-        the engine holds all vectors and does the full reciprocal-NN +
-        threshold matching in one call.
+        Returns raw candidate pairs from bidirectional KNN search — no matching
+        logic, no tau thresholds, no fusion. The TerminusDB plugin
+        (search_resolve.pl) calls this endpoint, then applies its own matching
+        algorithm (core 1:1, set-extra 1:M, target-extra M:1) client-side.
 
-        k is how many candidates are evaluated per document in the set.
+        k is how many candidates are evaluated per document in each direction.
 
         The SET and TARGET populations are defined by doc_type/doc_id lists
-        (same scoping as /duplicates). When no target is specified, target =
-        set (within-set dedup). The threshold is the GATHER cap (max distance
-        for a candidate NN to be considered); the three tau are independent
-        MATCHING thresholds applied after gathering.
+        (same scoping as /duplicates). Separate `threshold_set` and
+        `threshold_target` control the directional KNN gather caps.
 
 
         **Identical documents:** when two documents contain literally identical
@@ -547,59 +665,182 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/ResolveRequest' }
+            schema: { $ref: '#/components/schemas/CandidatesRequest' }
             examples:
               crossSet:
-                summary: Cross-set entity resolution
+                summary: Cross-set candidate gather
                 value:
                   domain: admin/products
                   commit: c1
                   set_doc_types: ["Product"]
                   target_doc_types: ["Catalogue"]
-                  threshold: 0.5
-                  tau_one_to_one: 0.45
-                  tau_one_to_many: 0.2
-                  tau_many_to_one: 0.2
+                  threshold_set: 0.5
+                  threshold_target: 0.5
                   k: 5
       responses:
         '200':
           description: >
-            3-partition resolve output: matched pairs, unmatched set records,
-            unmatched target records, plus resolution statistics.
+            Bidirectional candidate maps: set→target and target→set neighbour
+            lists with distances, plus gather statistics.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/ResolveResult' }
+              schema: { $ref: '#/components/schemas/CandidatesResult' }
               examples:
                 result:
                   value:
-                    matched:
-                      - set_id: "terminusdb:///prod/Product/A"
-                        target_id: "terminusdb:///cat/Catalogue/X"
-                        distance: 0.12
-                        stage: core
-                    set_only: ["terminusdb:///prod/Product/C"]
-                    target_only: ["terminusdb:///cat/Catalogue/Z"]
+                    set_to_target:
+                      "terminusdb:///prod/Product/A":
+                        - id: "terminusdb:///cat/Catalogue/X"
+                          distance: 0.12
+                    target_to_set:
+                      "terminusdb:///cat/Catalogue/X":
+                        - id: "terminusdb:///prod/Product/A"
+                          distance: 0.12
                     stats:
-                      k: 5
-                      threshold: 0.5
-                      tau_one_to_one: 0.45
-                      tau_one_to_many: 0.2
-                      tau_many_to_one: 0.2
-                      edge_count: 142
-                      core_count: 80
-                      set_extra_count: 12
-                      target_extra_count: 5
-                      matched_count: 97
-                      set_only_count: 15
-                      target_only_count: 8
                       set_points: 1087
                       target_points: 1086
-                      elapsed_ms: 2400
+                      set_to_target_edges: 142
+                      target_to_set_edges: 138
+                      elapsed_ms: 42
         '400':
-          description: Invalid parameters (tau > threshold, out-of-range, missing required).
+          description: Invalid parameters (out-of-range, missing required).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NoIndexedLineage' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
+
+  /embeddings:
+    get:
+      tags: [search]
+      operationId: embeddingsGet
+      summary: Fetch stored embeddings for a domain (JSON or streaming NDJSON).
+      description: >
+        Returns embedding vectors for documents in a domain at a given commit
+        (or latest indexed commit for a branch). When the `Accept` header
+        includes `application/x-ndjson`, the response is a streaming NDJSON
+        body (one embedding record per line) with `X-Served-Commit`,
+        `X-Store-Clustering`, and `X-Total-Count` headers. Otherwise returns a
+        single JSON array.
+      parameters:
+        - name: domain
+          in: query
+          required: true
+          schema: { type: string }
+          description: TerminusDB graphspec domain.
+        - $ref: '#/components/parameters/Commit'
+        - $ref: '#/components/parameters/BranchOptional'
+        - name: doc_ids
+          in: query
+          required: false
+          description: Comma-separated document IDs to fetch embeddings for.
+          schema: { type: string }
+        - name: doc_types
+          in: query
+          required: false
+          description: Comma-separated document types to filter by. When empty along with doc_ids, all embeddings are returned.
+          schema: { type: string }
+        - name: ancestors
+          in: query
+          required: false
+          description: Nearest-first ancestor window (same contract as /search).
+          schema:
+            type: array
+            items: { type: string }
+          style: form
+          explode: true
+        - name: Accept
+          in: header
+          required: false
+          description: >
+            Set to `application/x-ndjson` for streaming NDJSON response (one
+            embedding record per line). Default `application/json` returns a
+            single JSON array.
+          schema:
+            type: string
+            enum: [application/json, application/x-ndjson]
+            default: application/json
+      responses:
+        '200':
+          description: Embedding records (JSON array or NDJSON stream).
+          headers:
+            X-Served-Commit:
+              schema: { type: string }
+              description: The commit actually served.
+            X-Store-Clustering:
+              schema: { type: string }
+              description: Whether clustering embeddings are stored ("true" or "false").
+            X-Total-Count:
+              schema: { type: integer }
+              description: Total number of embedding records in the response.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/EmbeddingRecord' }
+            application/x-ndjson:
+              schema: { $ref: '#/components/schemas/EmbeddingRecord' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NoIndexedLineage' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
+    post:
+      tags: [search]
+      operationId: embeddingsPost
+      summary: Fetch stored embeddings via JSON body or bidirectional NDJSON stream.
+      description: >
+        Three modes based on Content-Type and the `stream` field:
+
+        1. **JSON body, `stream=false` (default)** — single JSON array response.
+        2. **JSON body, `stream=true`** — NDJSON streaming response (same shape
+           as GET with `Accept: application/x-ndjson`).
+        3. **NDJSON request body** — bidirectional streaming: each request line
+           carries a `doc_id` (the first line may also set `domain`, `commit`,
+           `ancestors`, and `doc_types` context). Response is an NDJSON stream.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmbeddingsRequest' }
+            examples:
+              batch:
+                summary: Batch fetch
+                value:
+                  domain: admin/star_wars
+                  commit: abc123
+                  doc_ids: ["terminusdb:///star-wars/People/1"]
+              stream:
+                summary: Streaming fetch
+                value:
+                  domain: admin/star_wars
+                  branch: main
+                  stream: true
+          application/x-ndjson:
+            schema: { $ref: '#/components/schemas/EmbeddingsNdjsonLine' }
+            examples:
+              bidirectional:
+                value: |
+                  {"domain":"admin/star_wars","commit":"abc123","doc_types":["People"]}
+                  {"domain":"admin/star_wars","commit":"abc123","doc_id":"terminusdb:///star-wars/People/1"}
+      responses:
+        '200':
+          description: Embedding records (JSON array or NDJSON stream).
+          headers:
+            X-Served-Commit:
+              schema: { type: string }
+            X-Store-Clustering:
+              schema: { type: string }
+            X-Total-Count:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/EmbeddingRecord' }
+            application/x-ndjson:
+              schema: { $ref: '#/components/schemas/EmbeddingRecord' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NoIndexedLineage' }
         '500': { $ref: '#/components/responses/UpstreamError' }
@@ -614,7 +855,7 @@ paths:
         Embeds `source` (Query role) and `target` (Document role), L2-normalises
         both vectors, and returns the normalized cosine distance on the same
         [0, 1] reference scale as `/search`, `/similar`, `/duplicates`, and
-        `/resolve` (0 = identical, ~0.5 = unrelated, 1 = opposite).
+        `/candidates` (0 = identical, ~0.5 = unrelated, 1 = opposite).
 
 
         **Identical-input shortcircuit**: if `source` and `target` are the exact
@@ -644,6 +885,20 @@ paths:
           schema:
             type: string
             enum: [embedding]
+        - name: role
+          in: query
+          required: false
+          description: >
+            Optional embedding role selecting the nomic task prefix for both texts.
+            When `query` (default), source uses `search_query:` and target uses
+            `search_document:` (asymmetric retrieval embedding). For any other
+            role, both sides use the same prefix (symmetric comparison):
+            `document` → `search_document:`, `clustering` → `clustering:`,
+            `classification` → `classification:`. Unsupported values give 400.
+          schema:
+            type: string
+            enum: [query, document, clustering, classification]
+            default: query
       requestBody:
         required: true
         content:
@@ -734,6 +989,7 @@ paths:
                     chunks: 51234
                     pending_index_fragments: 0
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/UpstreamError' }
 
   /domain:
     delete:
@@ -765,7 +1021,7 @@ paths:
           description: >
             The database footprint has been removed (or was already absent —
             idempotent).
-        '400': { $ref: '#/components/responses/SearchBadRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '500': { $ref: '#/components/responses/UpstreamError' }
 
@@ -842,22 +1098,26 @@ components:
           • `org/db/<repo>`                   → `org/db/<repo>/branch/main`
           • `org/db/<repo>/branch/<branch>`   → that branch
           • `org/db/<repo>/commit/<commit>`   → that snapshot, directly
-        A branch is resolved to a concrete commit by the caller (TerminusDB owns
-        branch heads); the searched snapshot is always explicit (`commit`), never
-        an implicit "latest".
+        When `commit` is omitted, the engine resolves the latest indexed commit
+        for the given `branch` (defaulting to `main`).
       schema: { type: string }
       example: admin/star_wars
-    Branch:
+    BranchOptional:
       name: branch
       in: query
-      required: true
-      description: Branch name.
+      required: false
+      description: >
+        Branch name. When `commit` is omitted, the engine resolves the latest
+        indexed commit for this branch (defaulting to `main`).
       schema: { type: string, default: main }
     Commit:
       name: commit
       in: query
-      required: true
-      description: Opaque commit hash; the searched snapshot.
+      required: false
+      description: >
+        Opaque commit hash — the searched snapshot. When omitted, the engine
+        resolves the latest indexed commit for the given `branch` (defaulting
+        to `main`).
       schema: { type: string }
     Q:
       name: q
@@ -879,7 +1139,7 @@ components:
       in: query
       required: false
       description: Max results to return (pagination page size).
-      schema: { type: integer, minimum: 1, default: 50 }
+      schema: { type: integer, minimum: 1, default: 10 }
     Mode:
       name: mode
       in: query
@@ -1055,6 +1315,7 @@ components:
     LastIndexed:
       type: object
       required: [branch, commit, version]
+      additionalProperties: false
       properties:
         branch:  { type: string }
         commit:  { type: [string, "null"], description: "Last-indexed commit, or null if none." }
@@ -1067,6 +1328,7 @@ components:
         - $ref: '#/components/schemas/OpChanged'
         - $ref: '#/components/schemas/OpDeleted'
         - $ref: '#/components/schemas/OpError'
+        - $ref: '#/components/schemas/OpAbort'
       discriminator:
         propertyName: op
         mapping:
@@ -1074,9 +1336,11 @@ components:
           Changed:  '#/components/schemas/OpChanged'
           Deleted:  '#/components/schemas/OpDeleted'
           Error:    '#/components/schemas/OpError'
+          Abort:    '#/components/schemas/OpAbort'
     OpInserted:
       type: object
       required: [op, id, string]
+      additionalProperties: false
       properties:
         op:     { type: string, const: Inserted }
         id:     { type: string, description: Full document IRI. }
@@ -1084,6 +1348,7 @@ components:
     OpChanged:
       type: object
       required: [op, id, string]
+      additionalProperties: false
       properties:
         op:     { type: string, const: Changed }
         id:     { type: string }
@@ -1091,41 +1356,158 @@ components:
     OpDeleted:
       type: object
       required: [op, id]
+      additionalProperties: false
       properties:
         op: { type: string, const: Deleted }
         id: { type: string, description: "Removes all chunk rows for this id." }
     OpError:
       type: object
       required: [op, message]
+      additionalProperties: false
       properties:
         op:      { type: string, const: Error }
         message: { type: string, description: "Upstream per-doc render failure; skipped and recorded, never silently dropped." }
+    OpAbort:
+      type: object
+      required: [op]
+      additionalProperties: false
+      properties:
+        op: { type: string, const: Abort, description: "Signals abort of the current push. The engine stops processing and returns 422." }
 
     TaskPending:
       type: object
       required: [status, percentage]
+      additionalProperties: false
       properties:
         status:     { type: string, const: Pending }
         percentage: { type: number, format: float, minimum: 0, maximum: 100 }
     TaskComplete:
       type: object
       required: [status, indexed_documents]
+      additionalProperties: false
       properties:
         status:            { type: string, const: Complete }
         indexed_documents: { type: integer }
         skipped:
           type: array
           description: "Per-doc errors skipped during this push — visible, never silent."
-          items:
-            type: object
-            required: [id, message]
-            properties:
-              id:      { type: string }
-              message: { type: string }
+          items: { $ref: '#/components/schemas/SkippedItem' }
+
+    SkippedItem:
+      type: object
+      required: [id, message]
+      additionalProperties: false
+      properties:
+        id:      { type: string, description: "Document IRI that failed." }
+        message: { type: string, description: "Error message for the skipped document." }
+
+    Chunk:
+      type: object
+      required: [index, count, token_start, doc_token_len, location]
+      additionalProperties: false
+      description: >
+        Which part of the document matched. The document's score is its
+        best-matching chunk; this object locates that chunk so a caller can
+        jump to the relevant passage.
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          description: 0-based index of the best-matching chunk within the document.
+        count:
+          type: integer
+          minimum: 1
+          description: Total number of chunks the document was split into (1 if it fit in a single chunk).
+        token_start:
+          type: integer
+          minimum: 0
+          description: >
+            Start token offset of the matched chunk within the document (in the
+            embedding model's tokens). The raw numerator behind `location`, for
+            callers that want exact offsets rather than a fraction.
+        doc_token_len:
+          type: integer
+          minimum: 0
+          description: >
+            Document length in the embedding model's tokens — the denominator
+            behind `location`. `token_start` and `doc_token_len` are token
+            offsets, not character offsets.
+        location:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: >
+            Convenience fraction = `token_start / doc_token_len` (0.0 = very
+            beginning, 1.0 = very end; ×100 for a percentage). `0.0` when
+            `doc_token_len` is 0. Approximate position, not a character index.
+        snippet:
+          type: string
+          description: >
+            The matched chunk's text. Present only when `snippet=true` is
+            requested (omitted by default to keep responses small).
+
+    ProgressUpdate:
+      type: object
+      additionalProperties: false
+      description: >
+        One NDJSON line in the streaming /push response (when stream=true).
+      properties:
+        status:
+          type: string
+          enum: [indexing, complete, error]
+          description: Current indexing phase.
+        percentage:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+          description: Progress percentage (0–100).
+        indexed_documents:
+          type: integer
+          description: Documents indexed so far (present on 'complete' status).
+        error:
+          type: string
+          description: Error message (present on 'error' status).
+
+    SuggestResult:
+      type: object
+      required: [served_commit, total_approx, completions, hits]
+      additionalProperties: false
+      description: Response from /suggest (FTS-only typeahead).
+      properties:
+        served_commit:
+          type: string
+          description: The commit whose snapshot was actually searched.
+        total_approx:
+          type: integer
+          description: Approximate number of matching documents.
+        completions:
+          type: array
+          items: { type: string }
+          description: Completion suggestions extracted from matched content.
+        hits:
+          type: array
+          items: { $ref: '#/components/schemas/SuggestHit' }
+          description: First N document hits (default 11).
+
+    SuggestHit:
+      type: object
+      required: [id, distance]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          description: Document ID.
+        distance:
+          type: number
+          format: float
+          description: FTS distance (lower = more relevant).
 
     SearchHit:
       type: object
       required: [id, distance, chunk]
+      additionalProperties: false
       properties:
         id: { type: string, description: "Document IRI. Results always dedup to one hit per document; chunk ids are never separate result rows." }
         distance:
@@ -1135,49 +1517,7 @@ components:
           maximum: 1
           description: "Normalised cosine distance: 0 identical, 0.5 unrelated, 1 opposite. Smaller is closer. This is the distance of the document's BEST-matching chunk."
         chunk:
-          type: object
-          description: >
-            Which part of the document matched. The document's score is its
-            best-matching chunk; this object locates that chunk so a caller can
-            jump to the relevant passage.
-          required: [index, count, token_start, doc_token_len, location]
-          properties:
-            index:
-              type: integer
-              minimum: 0
-              description: 0-based index of the best-matching chunk within the document.
-            count:
-              type: integer
-              minimum: 1
-              description: Total number of chunks the document was split into (1 if it fit in a single chunk).
-            token_start:
-              type: integer
-              minimum: 0
-              description: >
-                Start token offset of the matched chunk within the document (in the
-                embedding model's tokens). The raw numerator behind `location`, for
-                callers that want exact offsets rather than a fraction.
-            doc_token_len:
-              type: integer
-              minimum: 0
-              description: >
-                Document length in the embedding model's tokens — the denominator
-                behind `location`. `token_start` and `doc_token_len` are token
-                offsets, not character offsets.
-            location:
-              type: number
-              format: float
-              minimum: 0
-              maximum: 1
-              description: >
-                Convenience fraction = `token_start / doc_token_len` (0.0 = very
-                beginning, 1.0 = very end; ×100 for a percentage). `0.0` when
-                `doc_token_len` is 0. Approximate position, not a character index.
-            snippet:
-              type: string
-              description: >
-                The matched chunk's text. Present only when `snippet=true` is
-                requested (omitted by default to keep responses small).
+          $ref: '#/components/schemas/Chunk'
     SearchResults:
       type: array
       description: Ranked nearest-first; empty array means genuinely no match (never an error).
@@ -1185,11 +1525,13 @@ components:
 
     SearchRequest:
       type: object
+      required: [domain, q]
       description: >
         POST /search body. Every field may also be supplied as a query parameter;
         when a field is present here it wins and the same-named query parameter is
-        discarded (not merged). `domain`, `commit` and `q` must be present here or
-        in the query.
+        discarded (not merged). `domain` and `q` must be present here or in the
+        query. `commit` is optional; when omitted, the engine resolves the
+        latest indexed commit for `branch`.
       properties:
         domain:
           type: string
@@ -1199,7 +1541,11 @@ components:
           example: admin/star_wars
         commit:
           type: string
-          description: Opaque commit hash — the searched snapshot.
+          description: Opaque commit hash — the searched snapshot. When omitted, the engine resolves the latest indexed commit for `branch`.
+        branch:
+          type: string
+          default: main
+          description: Branch name — used to resolve the latest indexed commit when `commit` is absent.
         q:
           type: string
           description: Query text (embedded for vector; full-text terms for fts/hybrid).
@@ -1216,7 +1562,7 @@ components:
         count:
           type: integer
           minimum: 1
-          default: 50
+          default: 10
           description: Max results to return (pagination page size).
         doc_type:
           type: array
@@ -1243,11 +1589,14 @@ components:
 
     SimilarRequest:
       type: object
+      required: [domain]
       description: >
         POST /similar body. Every field may also be supplied as a query parameter;
         when a field is present here it wins and the same-named query parameter is
-        discarded (not merged). `domain`, `commit` and `id` must be present here
-        or in the query. Use this when the candidate pool (`doc_id`) is large.
+        discarded (not merged). `domain` and `commit` must be present here
+        or in the query. Either `id` (document IRI) or `text` (raw text to
+        embed) must be provided. Use this when the candidate pool (`doc_id`)
+        is large.
       properties:
         domain:
           type: string
@@ -1257,11 +1606,23 @@ components:
           example: admin/star_wars
         commit:
           type: string
-          description: Opaque commit hash — the searched snapshot.
+          description: Opaque commit hash — the searched snapshot. When omitted, the engine resolves the latest indexed commit for `branch`.
+        branch:
+          type: string
+          default: main
+          description: Branch name — used to resolve the latest indexed commit when `commit` is absent.
         id:
           type: string
           description: Full document IRI to find neighbours of.
           example: "terminusdb:///star-wars/People/1"
+        text:
+          type: string
+          description: >
+            Text to embed and find neighbours of (alternative to `id`). When
+            `id` is empty and `text` is present, the engine embeds the text
+            with Document role and runs vector search. Either `id` or `text`
+            must be provided.
+          example: "A wise old Jedi master"
         start:
           type: integer
           minimum: 0
@@ -1297,39 +1658,45 @@ components:
         Near-duplicate groups, sorted nearest-first. The `group` array is
         symmetric (member order is canonical: lower id first) and extends to
         clusters of more than two members without a shape change.
-      items:
-        type: object
-        required: [group, distance]
-        properties:
-          group:
-            type: array
-            minItems: 2
-            description: The member documents of this near-duplicate group.
-            items:
-              type: object
-              required: [id]
-              properties:
-                id:
-                  type: string
-                  description: The member document id.
-                snippet:
-                  type: string
-                  description: >
-                    The member's matched chunk text. Present only when
-                    `snippet=true` was requested.
-          distance:
-            type: number
-            format: float
-            description: >
-              The [0, 1] cosine distance of the group's best matching chunks
-              (0 = identical, 0.5 = unrelated, 1 = opposite).
+      items: { $ref: '#/components/schemas/DuplicateGroup' }
+
+    DuplicateGroup:
+      type: object
+      required: [group, distance]
+      additionalProperties: false
+      properties:
+        group:
+          type: array
+          minItems: 2
+          description: The member documents of this near-duplicate group.
+          items: { $ref: '#/components/schemas/DuplicateMember' }
+        distance:
+          type: number
+          format: float
+          description: >
+            The [0, 1] cosine distance of the group's best matching chunks
+            (0 = identical, 0.5 = unrelated, 1 = opposite).
+
+    DuplicateMember:
+      type: object
+      required: [id]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          description: The member document id.
+        snippet:
+          type: string
+          description: >
+            The member's matched chunk text. Present only when
+            `snippet=true` was requested.
 
     CompareRequest:
       type: object
       required: [source, target]
       description: >
         Request body for POST /compare. Both fields are plain text strings
-        to be embedded and compared.
+        to be embedded and compared. Both are required (empty strings give 400).
       properties:
         source:
           type: string
@@ -1347,6 +1714,7 @@ components:
     CompareResult:
       type: object
       required: [distance, source_role, target_role]
+      additionalProperties: false
       properties:
         distance:
           type: number
@@ -1355,7 +1723,7 @@ components:
           maximum: 1
           description: >
             Normalized cosine distance on the [0, 1] reference scale — the SAME
-            scale as `/search`, `/similar`, `/duplicates`, and `/resolve`.
+            scale as `/search`, `/similar`, `/duplicates`, and `/candidates`.
             0 = identical, ~0.5 = unrelated/orthogonal, 1 = opposite.
         source_role:
           type: string
@@ -1368,9 +1736,10 @@ components:
             The embedding role applied to the target text. Currently always "document".
           example: document
 
-    ResolveRequest:
+    CandidatesRequest:
       type: object
-      required: [domain, commit, threshold, tau_one_to_one]
+      required: [domain, commit, threshold_set]
+      additionalProperties: false
       properties:
         domain:
           type: string
@@ -1378,7 +1747,7 @@ components:
           example: admin/products
         commit:
           type: string
-          description: Opaque commit hash — the snapshot to resolve against.
+          description: Opaque commit hash — the snapshot to gather candidates from.
         set_doc_types:
           type: array
           items: { type: string }
@@ -1386,7 +1755,7 @@ components:
         set_doc_ids:
           type: array
           items: { type: string }
-          description: Document IDs defining the SET population.
+          description: Document IDs defining the SET population (empty = all of set_doc_types).
         target_doc_types:
           type: array
           items: { type: string }
@@ -1394,98 +1763,176 @@ components:
         target_doc_ids:
           type: array
           items: { type: string }
-          description: Document IDs defining the TARGET population.
-        threshold:
+          description: Document IDs defining the TARGET population (empty = all of target_doc_types).
+        threshold_set:
           type: number
           format: float
           minimum: 0
           maximum: 1
           description: >
-            GATHER cap: max [0,1] cosine distance for a candidate NN to be
-            considered. The recall lever — widening recovers more-distant matches.
-        tau_one_to_one:
+            GATHER cap for set→target direction: max [0,1] cosine distance
+            for a candidate NN from set to target. Required.
+        threshold_target:
           type: number
           format: float
           minimum: 0
           maximum: 1
           description: >
-            1:1 mutual-best CORE threshold. Must be <= threshold.
-        tau_one_to_many:
-          type: [number, "null"]
-          format: float
-          minimum: 0
-          maximum: 1
-          description: >
-            Set-side extras threshold. Null to disable. Must be <= threshold.
-        tau_many_to_one:
-          type: [number, "null"]
-          format: float
-          minimum: 0
-          maximum: 1
-          description: >
-            Target-side extras threshold. Null to disable. Must be <= threshold.
+            GATHER cap for target→set direction: max [0,1] cosine distance
+            for a candidate NN from target to set. Defaults to `threshold_set`.
         k:
           type: integer
           minimum: 1
           default: 5
-          description: NN fan-out per point (how many documents to evaluate per document).
+          description: NN fan-out per point (how many candidates to evaluate per document).
+        include:
+          type: string
+          description: >
+            Comma-separated list of extra fields to include per candidate:
+            `embeddings` adds the raw vector, `content` adds the chunk text.
+            Empty (default) = id + distance only.
+          example: "embeddings,content"
         ancestors:
           type: array
           items: { type: string }
           description: Nearest-first ancestor window for catch-up resolution.
 
-    ResolveResult:
+    CandidatesResult:
       type: object
-      required: [matched, set_only, target_only, stats]
+      required: [set_to_target, target_to_set, stats]
+      additionalProperties: false
       properties:
-        matched:
-          type: array
-          description: Resolved match pairs with stage and distance.
-          items:
-            type: object
-            required: [set_id, target_id, distance, stage]
-            properties:
-              set_id:    { type: string, description: The matched set record. }
-              target_id: { type: string, description: The matched target record. }
-              distance:
-                type: number
-                format: float
-                description: "[0,1] cosine distance between matched records."
-              stage:
-                type: string
-                enum: [core, set_extra, target_extra]
-                description: Which resolution stage produced this match.
-        set_only:
-          type: array
-          items: { type: string }
-          description: Set records with no match under any active tau.
-        target_only:
-          type: array
-          items: { type: string }
-          description: Target records with no match under any active tau.
-        stats:
+        set_to_target:
           type: object
-          description: Resolution statistics.
-          properties:
-            k:                 { type: integer }
-            threshold:         { type: number, format: float }
-            tau_one_to_one:    { type: number, format: float }
-            tau_one_to_many:   { type: [number, "null"], format: float }
-            tau_many_to_one:   { type: [number, "null"], format: float }
-            edge_count:        { type: integer }
-            core_count:        { type: integer }
-            set_extra_count:   { type: integer }
-            target_extra_count: { type: integer }
-            matched_count:     { type: integer }
-            set_only_count:    { type: integer }
-            target_only_count: { type: integer }
-            set_points:        { type: integer }
-            target_points:     { type: integer }
-            elapsed_ms:        { type: integer, description: "Wall-clock milliseconds for the batch resolve." }
+          description: >
+            Map from set document ID to its k nearest target neighbours,
+            sorted by distance (nearest first). Each neighbour has an `id`
+            and `distance`; optionally `embedding` and/or `content` if requested.
+          additionalProperties:
+            type: array
+            items: { $ref: '#/components/schemas/CandidateNeighbour' }
+        target_to_set:
+          type: object
+          description: >
+            Map from target document ID to its k nearest set neighbours,
+            sorted by distance (nearest first). Same neighbour shape as
+            set_to_target.
+          additionalProperties:
+            type: array
+            items: { $ref: '#/components/schemas/CandidateNeighbour' }
+        stats: { $ref: '#/components/schemas/CandidatesStats' }
+
+    CandidateNeighbour:
+      type: object
+      required: [id, distance]
+      additionalProperties: false
+      properties:
+        id:       { type: string, description: "Document IRI of the candidate." }
+        distance: { type: number, format: float, description: "[0,1] cosine distance." }
+        embedding:
+          type: array
+          items: { type: number, format: float }
+          description: Raw embedding vector (present when `include` contains `embeddings`).
+        content:
+          type: string
+          description: Matched chunk text (present when `include` contains `content`).
+
+    CandidatesStats:
+      type: object
+      required: [set_points, target_points, elapsed_ms]
+      additionalProperties: false
+      description: Gather statistics.
+      properties:
+        set_points:            { type: integer, description: Number of set documents scanned. }
+        target_points:         { type: integer, description: Number of target documents scanned. }
+        set_to_target_edges:   { type: integer, description: Total candidate edges from set to target. }
+        target_to_set_edges:   { type: integer, description: Total candidate edges from target to set. }
+        elapsed_ms:            { type: integer, description: "Wall-clock milliseconds for the gather." }
+
+    EmbeddingRecord:
+      type: object
+      additionalProperties: false
+      description: >
+        One embedding record. In NDJSON streaming mode, each line is one record.
+      required: [doc_id, embedding]
+      properties:
+        doc_id:
+          type: string
+          description: Document IRI.
+        embedding:
+          type: array
+          items: { type: number, format: float }
+          description: Embedding vector.
+        clustering_embedding:
+          type: array
+          items: { type: number, format: float }
+          description: Clustering embedding vector (present only when store_clustering is enabled for the domain).
+
+    EmbeddingsRequest:
+      type: object
+      required: [domain]
+      description: POST /embeddings JSON body (batch and streaming modes).
+      additionalProperties: false
+      properties:
+        domain:
+          type: string
+          description: TerminusDB graphspec domain.
+        commit:
+          type: string
+          description: Commit hash. When omitted, resolves the latest indexed commit for `branch`.
+        branch:
+          type: string
+          default: main
+          description: Branch name — used when `commit` is absent.
+        doc_ids:
+          type: array
+          items: { type: string }
+          description: Document IDs to fetch embeddings for. Empty = all (filtered by doc_types).
+        doc_types:
+          type: array
+          items: { type: string }
+          description: Document types to filter by. Empty = all.
+        ancestors:
+          type: array
+          items: { type: string }
+          description: Nearest-first ancestor window (same contract as /search).
+        stream:
+          type: boolean
+          default: false
+          description: When true, response is NDJSON stream; when false, single JSON array.
+
+    EmbeddingsNdjsonLine:
+      type: object
+      additionalProperties: false
+      description: >
+        One NDJSON line for bidirectional streaming mode (POST /embeddings with
+        Content-Type: application/x-ndjson). The first line may set domain,
+        commit, ancestors, and doc_types context. Subsequent lines each carry
+        a single doc_id (domain and commit inherited from the first line).
+      properties:
+        domain:
+          type: string
+          description: TerminusDB graphspec domain (required on first line).
+        commit:
+          type: string
+          description: Commit hash (required on first line).
+        doc_id:
+          type: string
+          description: Single document ID to fetch embedding for.
+        doc_types:
+          type: array
+          items: { type: string }
+          description: Document types to filter by (first line only).
+        ancestors:
+          type: array
+          items: { type: string }
+          description: Nearest-first ancestor window (first line only).
+
 
     Statistics:
       type: object
       required: [domains, branches, indexed_commits, documents, chunks, pending_index_fragments]
+      additionalProperties: false
       properties:
         domains:         { type: integer, description: Databases with at least one index. }
         branches:        { type: integer, description: Distinct branches across all domains. }
@@ -1504,12 +1951,14 @@ components:
     Liveness:
       type: object
       required: [status]
+      additionalProperties: false
       properties:
         status: { type: string, const: ok }
 
     Readiness:
       type: object
       required: [ready, index, search]
+      additionalProperties: false
       properties:
         ready:  { type: boolean, description: Coarse flag — true if any capability is serveable. }
         index:  { type: boolean, description: Store reachable → can accept /push. }

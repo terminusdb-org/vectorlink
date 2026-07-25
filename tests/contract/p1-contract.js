@@ -241,5 +241,54 @@ describe("P1-CON: Contract shapes", function () {
         expect(res.body).to.be.an("array")
       }
     })
+
+    it("/suggest returns 200 (object with suggest shape), 404, or 503", async function () {
+      const res = await agent()
+        .get("/suggest")
+        .query({ domain: "admin/star_wars", commit: "abc123", q: "wise" })
+        .set("Authorization", authHeader())
+
+      expect([200, 404, 503]).to.include(res.status)
+      if (res.status === 200) {
+        expect(res.body).to.be.an("object")
+        expect(res.body).to.have.property("served_commit")
+        expect(res.body).to.have.property("total_approx")
+        expect(res.body.total_approx).to.be.a("number")
+        expect(res.body).to.have.property("completions")
+        expect(res.body.completions).to.be.an("array")
+        expect(res.body).to.have.property("hits")
+        expect(res.body.hits).to.be.an("array")
+        // Verify new hit fields when hits are present
+        if (res.body.hits.length > 0) {
+          const hit = res.body.hits[0]
+          expect(hit).to.have.property("id")
+          expect(hit).to.have.property("distance")
+          // snippet, match_start, match_end, next_words are optional but should
+          // be present when the query text is found in the matched content.
+          if (hit.snippet !== undefined) {
+            expect(hit.snippet).to.be.a("string")
+          }
+          if (hit.match_start !== undefined) {
+            expect(hit.match_start).to.be.a("number")
+          }
+          if (hit.match_end !== undefined) {
+            expect(hit.match_end).to.be.a("number")
+          }
+          if (hit.next_words !== undefined) {
+            expect(hit.next_words).to.be.an("array")
+          }
+        }
+      }
+    })
+
+    it("/suggest returns 400 when missing required q parameter", async function () {
+      const res = await agent()
+        .get("/suggest")
+        .query({ domain: "admin/star_wars", commit: "abc123" })
+        .set("Authorization", authHeader())
+        .expect(400)
+
+      expect(res.body).to.have.property("error")
+    })
   })
 })

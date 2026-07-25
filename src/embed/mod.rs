@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 #![forbid(unsafe_code)]
 
 //! Embed — configurable embedding provider with role-based task prefixes.
@@ -6,31 +9,47 @@
 //! io entry point for the actual HTTP call. Fail-loud on dimension mismatch
 //! and provider errors.
 
+pub mod cache;
+
+use cache::EmbedCache;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Embedding role determines which task prefix is applied.
+///
+/// Nomic-embed-text-v2-moe supports four task prefixes for different purposes:
+/// - `search_document: ` — for documents being indexed (retrieval corpus)
+/// - `search_query: ` — for search queries (retrieval queries)
+/// - `clustering: ` — for clustering / duplicate detection / entity resolution
+/// - `classification: ` — for classification / categorization tasks
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddingRole {
     Document,
     Query,
+    Clustering,
+    Classification,
 }
 
-/// Task prefix pair for a model (document prefix, query prefix).
+/// Task prefix set for a model (all four nomic prefixes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskPrefix {
     pub document: &'static str,
     pub query: &'static str,
+    pub clustering: &'static str,
+    pub classification: &'static str,
 }
 
 /// Hard-coded model → prefix table. Returns None for unknown models (no prefix).
 pub fn prefixes_for_model(model: &str) -> Option<TaskPrefix> {
     match model {
         "nomic-ai/nomic-embed-text-v2-moe"
+        | "nomic-embed-text-v2-moe"
         | "nomic-embed-v2"
         | "nomic-ai/nomic-embed-text-v1.5" => Some(TaskPrefix {
             document: "search_document: ",
             query: "search_query: ",
+            clustering: "clustering: ",
+            classification: "classification: ",
         }),
         _ => None,
     }
@@ -41,6 +60,8 @@ pub fn prefix_for_role(prefix: &TaskPrefix, role: EmbeddingRole) -> &'static str
     match role {
         EmbeddingRole::Document => prefix.document,
         EmbeddingRole::Query => prefix.query,
+        EmbeddingRole::Clustering => prefix.clustering,
+        EmbeddingRole::Classification => prefix.classification,
     }
 }
 
@@ -167,22 +188,58 @@ pub fn parse_embedding_response(
 
 /// Fetch embeddings from the provider (the single io entry point).
 /// Applies the task prefix per role before sending.
+///
+/// When `cache` is `Some`, checks the cache for each text before making an HTTP
+/// call. Only cache misses are sent to the provider. Results from the provider
+/// are stored in the cache for future lookups.
 pub async fn io_embed(
     provider: &Provider,
     texts: &[String],
     role: EmbeddingRole,
     client: &reqwest::Client,
+    cache: Option<&EmbedCache>,
 ) -> Result<Vec<Vec<f32>>, EmbedError> {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
 
     let prefixed = apply_prefix(texts, provider.model_name(), role);
+    let dim = provider.expected_dim();
+    let model = provider.model_name();
+
+    // Partition texts into cache hits and misses.
+    let mut results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+    let mut miss_indices: Vec<usize> = Vec::new();
+
+    if let Some(cache) = cache {
+        for (i, prefixed_text) in prefixed.iter().enumerate() {
+            let key = EmbedCache::cache_key(model, prefixed_text);
+            if let Some(emb) = cache.get(&key, dim) {
+                results[i] = Some(emb);
+            } else {
+                miss_indices.push(i);
+            }
+        }
+        let hits = texts.len() - miss_indices.len();
+        eprintln!(
+            "[embed] cache: role={:?} hits={} misses={} of {}",
+            role, hits, miss_indices.len(), texts.len()
+        );
+    } else {
+        miss_indices = (0..texts.len()).collect();
+    }
+
+    if miss_indices.is_empty() {
+        return Ok(results.into_iter().map(|o| o.unwrap()).collect());
+    }
+
+    // Build the request with only the missed (prefixed) texts.
+    let miss_prefixed: Vec<String> = miss_indices.iter().map(|&i| prefixed[i].clone()).collect();
     let url = format!("{}/v1/embeddings", provider.base_url().trim_end_matches('/'));
 
     let request_body = EmbedRequest {
-        model: provider.model_name().to_owned(),
-        input: prefixed,
+        model: model.to_owned(),
+        input: miss_prefixed,
     };
 
     let response = client
@@ -206,21 +263,28 @@ pub async fn io_embed(
         .await
         .map_err(|e| EmbedError::ParseError(e.to_string()))?;
 
-    let embeddings = parse_embedding_response(&body_bytes, provider.expected_dim())?;
+    let embeddings = parse_embedding_response(&body_bytes, dim)?;
 
     // Count-parity guard: the provider MUST return exactly one embedding per input.
-    // A short response would silently corrupt the scatter mapping in the batched
-    // pipeline (wrong embeddings assigned to wrong docs). Fail loud here so the
-    // io_embed_batched retry path isolates the offending batch.
-    if embeddings.len() != texts.len() {
+    if embeddings.len() != miss_indices.len() {
         return Err(EmbedError::ParseError(format!(
             "count mismatch: sent {} texts, received {} embeddings",
-            texts.len(),
+            miss_indices.len(),
             embeddings.len()
         )));
     }
 
-    Ok(embeddings)
+    // Store misses in cache and merge into results.
+    for (miss_offset, &result_idx) in miss_indices.iter().enumerate() {
+        let emb = &embeddings[miss_offset];
+        if let Some(cache) = cache {
+            let key = EmbedCache::cache_key(model, &prefixed[result_idx]);
+            cache.put(&key, emb);
+        }
+        results[result_idx] = Some(emb.clone());
+    }
+
+    Ok(results.into_iter().map(|o| o.unwrap()).collect())
 }
 
 /// Result of batched embedding: either a successful embedding vector or an error
@@ -249,6 +313,7 @@ pub async fn io_embed_batched(
     batch_size: usize,
     role: EmbeddingRole,
     client: &reqwest::Client,
+    cache: Option<&EmbedCache>,
 ) -> Vec<EmbedResult> {
     assert!(batch_size > 0, "embed_batch_size must be > 0 (configuration error)");
 
@@ -259,7 +324,7 @@ pub async fn io_embed_batched(
     let mut results: Vec<EmbedResult> = Vec::with_capacity(texts.len());
 
     for batch in texts.chunks(batch_size) {
-        match io_embed(provider, batch, role, client).await {
+        match io_embed(provider, batch, role, client, cache).await {
             Ok(embeddings) => {
                 // Happy path: batch succeeded. Push all embeddings.
                 for emb in embeddings {
@@ -283,7 +348,7 @@ pub async fn io_embed_batched(
                 );
                 for text in batch {
                     let single = std::slice::from_ref(text);
-                    match io_embed(provider, single, role, client).await {
+                    match io_embed(provider, single, role, client, cache).await {
                         Ok(mut embeddings) => {
                             if let Some(emb) = embeddings.pop() {
                                 results.push(EmbedResult::Ok(emb));
@@ -314,18 +379,29 @@ mod tests {
 
     // --- prefix lookup for known and unknown models ---
     #[test]
-    fn nomic_v2_has_search_prefixes() {
+    fn nomic_v2_has_all_four_prefixes() {
         let prefix = prefixes_for_model("nomic-ai/nomic-embed-text-v2-moe");
         assert!(prefix.is_some());
         let p = prefix.unwrap();
         assert_eq!(p.document, "search_document: ");
         assert_eq!(p.query, "search_query: ");
+        assert_eq!(p.clustering, "clustering: ");
+        assert_eq!(p.classification, "classification: ");
     }
 
     #[test]
     fn nomic_v2_short_name_has_prefixes() {
         let prefix = prefixes_for_model("nomic-embed-v2");
         assert!(prefix.is_some());
+    }
+
+    #[test]
+    fn nomic_v2_moe_short_name_has_prefixes() {
+        let prefix = prefixes_for_model("nomic-embed-text-v2-moe");
+        assert!(prefix.is_some());
+        let p = prefix.unwrap();
+        assert_eq!(p.document, "search_document: ");
+        assert_eq!(p.query, "search_query: ");
     }
 
     #[test]
@@ -354,6 +430,35 @@ mod tests {
         let texts = vec!["hello world".to_owned()];
         let result = apply_prefix(&texts, "unknown-model", EmbeddingRole::Document);
         assert_eq!(result, vec!["hello world"]);
+    }
+
+    // --- clustering and classification roles ---
+    #[test]
+    fn apply_prefix_clustering_role() {
+        let texts = vec!["hello world".to_owned()];
+        let result = apply_prefix(&texts, "nomic-ai/nomic-embed-text-v2-moe", EmbeddingRole::Clustering);
+        assert_eq!(result, vec!["clustering: hello world"]);
+    }
+
+    #[test]
+    fn apply_prefix_classification_role() {
+        let texts = vec!["hello world".to_owned()];
+        let result = apply_prefix(&texts, "nomic-ai/nomic-embed-text-v2-moe", EmbeddingRole::Classification);
+        assert_eq!(result, vec!["classification: hello world"]);
+    }
+
+    #[test]
+    fn apply_prefix_clustering_short_name() {
+        let texts = vec!["test".to_owned()];
+        let result = apply_prefix(&texts, "nomic-embed-v2", EmbeddingRole::Clustering);
+        assert_eq!(result, vec!["clustering: test"]);
+    }
+
+    #[test]
+    fn apply_prefix_classification_short_name() {
+        let texts = vec!["test".to_owned()];
+        let result = apply_prefix(&texts, "nomic-embed-v2", EmbeddingRole::Classification);
+        assert_eq!(result, vec!["classification: test"]);
     }
 
     // --- dimension mismatch in parse ---

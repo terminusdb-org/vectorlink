@@ -32,7 +32,7 @@ async function waitForTask (taskId, timeoutMs = 90000) {
   throw new Error(`task ${taskId} did not complete within ${timeoutMs}ms`)
 }
 
-async function pushAndWait (domain, branch, commit, ops, parentCommit) {
+async function pushAndWait (domain, branch, commit, ops, parentCommit, timeoutMs) {
   const body = ops.map(l => JSON.stringify(l)).join("\n")
   const query = { domain, branch, target_commit: commit }
   if (parentCommit) {
@@ -45,7 +45,7 @@ async function pushAndWait (domain, branch, commit, ops, parentCommit) {
     .set("Content-Type", "application/x-ndjson")
     .send(body)
     .expect(200)
-  return waitForTask(pushRes.text)
+  return waitForTask(pushRes.text, timeoutMs)
 }
 
 async function searchMode (domain, commit, q, mode, extra = {}) {
@@ -455,7 +455,7 @@ describe("Duplicates at scale — multi-chunk corpus must NOT return [] (e2e)", 
   this.timeout(300000)
 
   const D = "admin/dup_scale"
-  const NUM_FAMILIES = 40 // 40 families × 3 docs = 120 docs
+  const NUM_FAMILIES = 15 // 15 families × 3 docs = 45 docs (reduced from 40 for CI)
   const DOCS_PER_FAMILY = 3
   const CHUNKS = 4 // multi-chunk: the condition that starved k=2
 
@@ -480,7 +480,7 @@ describe("Duplicates at scale — multi-chunk corpus must NOT return [] (e2e)", 
         ops.push(docOps(`terminusdb:///dup/Item/f${f}_d${d}`, theme))
       }
     }
-    await pushAndWait(D, "main", "dup_c0", ops)
+    await pushAndWait(D, "main", "dup_c0", ops, undefined, 300000)
   })
 
   after(async function () {

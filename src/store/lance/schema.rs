@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 //! Types and constants for the Lance store schema.
 
 use crate::kernel::model::SearchMode;
@@ -12,10 +15,11 @@ pub struct ChunkRow {
     pub chunk_token_start: i32,
     pub doc_token_len: i32,
     pub embedding: Vec<f32>,
-    /// Query-role embedding (search_query: prefix). STORED but NOT INDEXED — the
-    /// only ANN index remains on `embedding`. Used by /resolve and /duplicates to
-    /// probe with the asymmetric query→document signal (Phase 6A Step 5).
-    pub query_embedding: Vec<f32>,
+    /// Clustering-role embedding (clustering: prefix). STORED but NOT INDEXED by
+    /// default — the only ANN index remains on `embedding`. When clustering is
+    /// enabled for the domain, an ANN index is also created on this column.
+    /// Populated with zeros when `store_clustering` is disabled.
+    pub clustering_embedding: Vec<f32>,
     pub content: String,
 }
 
@@ -30,6 +34,45 @@ pub struct SearchQuery {
     pub doc_type_filter: Vec<String>,
     pub doc_id_filter: Vec<String>,
     pub snippet: bool,
+}
+
+/// Suggest (typeahead) query parameters.
+/// FTS-only (no embedding), optimised for sub-100ms partial-query responses.
+#[derive(Debug, Clone)]
+pub struct SuggestQuery {
+    pub query_text: String,
+    pub count: usize,
+    pub doc_type_filter: Vec<String>,
+    pub doc_id_filter: Vec<String>,
+}
+
+/// A document-level suggest hit with snippet and next-words for smart compose.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SuggestHit {
+    pub id: String,
+    pub distance: f32,
+    /// The matched chunk content snippet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    /// Start byte offset of the query match within `snippet` (for UI highlighting).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_start: Option<usize>,
+    /// End byte offset of the query match within `snippet` (for UI highlighting).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_end: Option<usize>,
+    /// Likely next words after the query match, ordered by proximity.
+    /// The first entry is the most likely next word. A tab key can cycle
+    /// through these to advance the cursor word by word.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub next_words: Vec<String>,
+}
+
+/// Result of a suggest (typeahead) operation.
+#[derive(Debug, Clone)]
+pub struct SuggestResult {
+    pub total_approx: usize,
+    pub completions: Vec<String>,
+    pub hits: Vec<SuggestHit>,
 }
 
 /// Whether a ChunkHit's distance is raw (needs transform) or already normalised.
@@ -58,16 +101,45 @@ pub struct ChunkHit {
     /// vector directly instead of re-embedding the source text. Ranked search/FTS
     /// paths leave this empty (they rank by `_distance`/`_score`, not the raw vector).
     pub embedding: Vec<f32>,
-    /// The L2-normalised QUERY-role embedding vector as STORED at insert time.
-    /// Populated only by the plain doc-chunk lookup path (`io_lookup_doc_chunks`),
-    /// so `/similar` can use the asymmetric query→document probe signal. Ranked
-    /// search/FTS paths leave this empty.
-    pub query_embedding: Vec<f32>,
+    /// The L2-normalised CLUSTERING-role embedding vector as STORED at insert
+    /// time. Populated only by the plain doc-chunk lookup path
+    /// (`io_lookup_doc_chunks`). Ranked search/FTS paths leave this empty.
+    pub clustering_embedding: Vec<f32>,
 }
 
 /// Default Lance branch name. Layout (A) maps TerminusDB's `main` branch to
 /// the Lance dataset's native default branch.
 pub const MAIN_BRANCH: &str = "main";
+
+/// Reserved prefix for internal tdb-search branches. The `.-` namespace is
+/// reserved for internal use and must not be accepted from external requests
+/// (push, search, compact, etc.).
+pub const RESERVED_PREFIX: &str = ".-";
+
+/// Reserved prefix for rebuild branches used by delta-fork retagging during
+/// compaction. Each compaction creates a fresh branch named
+/// `.-compact_rebuild_<epoch>` to avoid colliding with the previous
+/// compaction's branch (which still owns live tagged versions). After
+/// retagging, older epoch branches are deleted. If the process crashes,
+/// an unreferenced branch lingers until startup cleanup.
+pub const COMPACT_REBUILD_PREFIX: &str = ".-compact_rebuild_";
+
+/// Generate a rebuild branch name with an epoch component.
+pub fn compact_rebuild_branch_name(epoch: u64) -> String {
+    format!("{}{}", COMPACT_REBUILD_PREFIX, epoch)
+}
+
+/// Check whether a branch name belongs to the reserved rebuild namespace.
+pub fn is_compact_rebuild_branch(branch: &str) -> bool {
+    branch.starts_with(COMPACT_REBUILD_PREFIX)
+}
+
+/// Check whether a branch name is in the reserved `.-` namespace.
+/// Branch names starting with `.-` are internal to tdb-search and must not
+/// be accepted from external requests.
+pub fn is_reserved_branch_name(branch: &str) -> bool {
+    branch.starts_with(RESERVED_PREFIX)
+}
 
 /// Hard upper bound on the number of indexed points (chunk vectors) the
 /// near-duplicate scan will consider in a single snapshot. The scan issues ONE

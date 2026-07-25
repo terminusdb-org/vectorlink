@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 #![forbid(unsafe_code)]
 
 //! Domain types — the vocabulary every module speaks.
@@ -168,6 +171,7 @@ pub enum Operation {
     Changed { id: String, string: String },
     Deleted { id: String },
     Error { message: String },
+    Abort,
 }
 
 /// Task status for async push operations.
@@ -177,6 +181,33 @@ pub enum TaskStatus {
     Pending { percentage: f64 },
     Complete { indexed_documents: u64, skipped: Vec<SkippedDoc> },
     Error { error: String },
+}
+
+/// Progress update sent via the streaming push response (NDJSON, one line per update).
+///
+/// When `stream=true` is sent to `POST /push`, the response body is an NDJSON stream
+/// of `ProgressUpdate` objects. The pipeline emits `Progress` after each embedding
+/// batch, then a terminal `Complete`, `Error`, or `Aborted` as the final line.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum ProgressUpdate {
+    /// Incremental progress: docs embedded so far.
+    Progress {
+        indexed: u64,
+        total_seen: u64,
+        skipped: u64,
+    },
+    /// Terminal success: all docs processed, written to Lance, commit tagged.
+    Complete {
+        indexed_documents: u64,
+        skipped: Vec<SkippedDoc>,
+    },
+    /// Terminal error: pipeline failed (e.g. Lance write error).
+    Error {
+        error: String,
+    },
+    /// Terminal abort: client sent `{"op":"Abort"}` in the NDJSON request body.
+    Aborted,
 }
 
 /// A document skipped during indexing.
@@ -221,12 +252,59 @@ pub struct Statistics {
     pub branches: u64,
     pub indexed_commits: u64,
     pub documents: u64,
+    /// Live chunks (excludes soft-deleted rows). This is the accurate count
+    /// of searchable text segments.
     pub chunks: u64,
     /// Number of data fragments not yet covered by the vector ANN index.
     /// Reflects the indexing backlog — higher values mean more fragments are
     /// being flat-scanned (correct but slower). Returns to 0 after
     /// `optimize_indices(append())` drains the queue.
     pub pending_index_fragments: u64,
+    /// Total rows (chunks) in fragments not yet covered by the vector ANN index.
+    /// Measures flat-scan cost in rows, complementing `pending_index_fragments`
+    /// which measures it in fragment count. Returns to 0 after
+    /// `optimize_indices(append())` drains the queue.
+    pub pending_index_documents: u64,
+    /// Whether clustering embeddings are stored for this domain (domain-scoped only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_clustering: Option<bool>,
+}
+
+/// Internal instrumentation stats — sizes of in-memory data structures.
+/// Exposed via the global /statistics endpoint (no domain filter) for
+/// memory leak monitoring. Not included in domain-scoped stats.
+#[derive(Debug, Clone, Serialize)]
+pub struct InternalStats {
+    /// Number of cached dataset handles (Lance Dataset objects).
+    pub cached_datasets: usize,
+    /// Number of tracked tasks in the tasks HashMap.
+    pub tasks: usize,
+    /// Number of per-(domain, branch) branch index entries.
+    pub branch_indexes: usize,
+    /// Number of per-(domain, branch) pipeline locks.
+    pub pipeline_locks: usize,
+    /// Number of per-domain guard mutexes.
+    pub domain_guards: usize,
+    /// Number of in-flight commit reservations.
+    pub inflight_commits: usize,
+    /// Pipeline progress: chunks chunked but not yet embedded.
+    pub pipeline_pending_chunks: u64,
+    /// Pipeline progress: chunks embedded but not yet written to Lance.
+    pub pipeline_embedded_chunks: u64,
+    /// Pipeline progress: chunks written to Lance (append committed).
+    pub pipeline_written_chunks: u64,
+    /// Number of pipeline tasks currently running (spawned but not completed).
+    pub pipeline_active_tasks: u64,
+    /// Total count of fresh Dataset::open calls (cumulative counter).
+    pub fresh_open_count: u64,
+    /// Number of entries in the embedding cache.
+    pub embed_cache_entries: usize,
+    /// Approximate memory usage of the embedding cache in bytes.
+    pub embed_cache_size_bytes: usize,
+    /// Configured Lance index cache capacity in bytes.
+    pub lance_index_cache_capacity_bytes: usize,
+    /// Configured Lance metadata cache capacity in bytes.
+    pub lance_metadata_cache_capacity_bytes: usize,
 }
 
 /// A single member of a near-duplicate group: the document id, and its chunk
@@ -297,5 +375,83 @@ mod tests {
     fn parse_domain_incomplete_ref() {
         let result = parse_domain("org/db/local/branch");
         assert!(matches!(result, Err(ParseError::IncompleteRef(_))));
+    }
+
+    // ── ProgressUpdate serialization tests ──
+
+    #[test]
+    fn progress_update_progress_serializes_correctly() {
+        let update = ProgressUpdate::Progress {
+            indexed: 32,
+            total_seen: 64,
+            skipped: 1,
+        };
+        let json = serde_json::to_string(&update).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"status":"progress","indexed":32,"total_seen":64,"skipped":1}"#
+        );
+    }
+
+    #[test]
+    fn progress_update_complete_serializes_correctly() {
+        let update = ProgressUpdate::Complete {
+            indexed_documents: 100,
+            skipped: vec![SkippedDoc {
+                id: "doc/bad".to_owned(),
+                message: "chunking failed: empty".to_owned(),
+            }],
+        };
+        let json = serde_json::to_string(&update).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"status":"complete","indexed_documents":100,"skipped":[{"id":"doc/bad","message":"chunking failed: empty"}]}"#
+        );
+    }
+
+    #[test]
+    fn progress_update_complete_with_empty_skipped() {
+        let update = ProgressUpdate::Complete {
+            indexed_documents: 50,
+            skipped: vec![],
+        };
+        let json = serde_json::to_string(&update).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"status":"complete","indexed_documents":50,"skipped":[]}"#
+        );
+    }
+
+    #[test]
+    fn progress_update_error_serializes_correctly() {
+        let update = ProgressUpdate::Error {
+            error: "batch delete-append failed: I/O error".to_owned(),
+        };
+        let json = serde_json::to_string(&update).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"status":"error","error":"batch delete-append failed: I/O error"}"#
+        );
+    }
+
+    #[test]
+    fn progress_update_aborted_serializes_correctly() {
+        let update = ProgressUpdate::Aborted;
+        let json = serde_json::to_string(&update).expect("serialize");
+        assert_eq!(json, r#"{"status":"aborted"}"#);
+    }
+
+    #[test]
+    fn progress_update_progress_zero_values() {
+        let update = ProgressUpdate::Progress {
+            indexed: 0,
+            total_seen: 0,
+            skipped: 0,
+        };
+        let json = serde_json::to_string(&update).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"status":"progress","indexed":0,"total_seen":0,"skipped":0}"#
+        );
     }
 }

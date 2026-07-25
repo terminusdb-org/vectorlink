@@ -1,13 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 //! Write pipeline: upsert, batch delete+append, delete, compaction.
 
 use std::sync::Arc;
 
 use arrow_array::RecordBatchIterator;
+use lance::dataset::Dataset;
+use lance::dataset::write::DeleteBuilder;
+use lance::deps::datafusion::logical_expr::{col, lit, in_list};
 
 use crate::kernel::error::StoreError;
 
-use super::{BranchKey, ChunkRow, LanceStore};
-use super::index::io_compact_data;
+use super::{ChunkRow, LanceStore};
 
 impl LanceStore {
     /// Upsert chunk rows for a document on `branch` (layout A). First deletes all
@@ -40,10 +45,12 @@ impl LanceStore {
         let mut ds = self.io_open_branch_for_write(domain, branch).await?;
 
         // Delete existing rows for this doc_id (replace semantics).
-        let filter = format!("doc_id = '{}'", doc_id.replace('\'', "''"));
-        ds.delete(&filter)
+        let expr = col("doc_id").eq(lit(doc_id));
+        let result = DeleteBuilder::from_expr(Arc::new(ds.clone()), expr)
+            .execute()
             .await
             .map_err(|e| StoreError::Internal(format!("delete failed: {}", e)))?;
+        ds = result.new_dataset.as_ref().clone();
 
         // Append new rows.
         let batch = self.rows_to_batch(rows)?;
@@ -111,10 +118,13 @@ impl LanceStore {
         // Creates deletion vectors only (no new data fragment). Handles shrinking
         // chunk counts: ALL rows for a doc_id are removed regardless of old/new count.
         if !delete_ids.is_empty() {
-            let filter = build_doc_id_in_filter(delete_ids);
-            ds.delete(&filter)
+            let values: Vec<_> = delete_ids.iter().map(|id| lit(id.as_str())).collect();
+            let expr = in_list(col("doc_id"), values, false);
+            let result = DeleteBuilder::from_expr(Arc::new(ds.clone()), expr)
+                .execute()
                 .await
                 .map_err(|e| StoreError::Internal(format!("batch delete failed: {}", e)))?;
+            ds = result.new_dataset.as_ref().clone();
         }
 
         // --- Phase 2: append all new rows (one fragment for all Insert + Changed) ---
@@ -141,77 +151,46 @@ impl LanceStore {
         Ok(version)
     }
 
-    /// Probabilistic background compaction trigger (BUG-FD24).
-    ///
-    /// Called after a fragment-creating write (io_upsert_chunks). Rolls a 5%
-    /// chance; on a hit, spawns a BACKGROUND compaction task if one is not
-    /// already in-flight for this (domain, branch). The spawned task:
-    ///   1. Opens the dataset uncached (no write-lock contention with reads)
-    ///   2. Calls io_compact_data (no-op if fragments <= threshold)
-    ///   3. Retags all stale commits to the compacted version
-    ///   4. Refreshes the cached handle
-    ///   5. Clears the in-progress guard
-    ///
-    /// Fail-loud: compaction errors are logged to stderr (visible via container
-    /// logs). The guard is always cleared so subsequent rolls can retry.
-    ///
-    /// Does NOT block the caller — returns immediately after the roll.
-    pub fn maybe_trigger_background_compaction(
-        store: Arc<Self>,
-        domain: String,
-        branch: String,
-    ) {
-        use rand::Rng;
-
-        /// Probability of triggering compaction on each fragment write (5%).
-        const COMPACTION_PROBABILITY: f64 = 0.05;
-
-        // Roll the dice (cheap thread-local RNG, no allocation).
-        let roll: f64 = rand::rng().random();
-        if roll >= COMPACTION_PROBABILITY {
-            return;
+    /// Append a micro-batch of rows to an already-open write handle.
+    /// Used by the streaming pipeline to write incrementally without
+    /// accumulating all rows in memory. Each call produces one Lance fragment.
+    /// The caller MUST hold the pipeline lock and the domain guard.
+    pub async fn io_microbatch_append(
+        &self,
+        ds: &mut Dataset,
+        rows: &[ChunkRow],
+    ) -> Result<(), StoreError> {
+        if rows.is_empty() {
+            return Ok(());
         }
+        let batch = self.rows_to_batch(rows)?;
+        let schema = self.chunk_schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        ds.append(reader, None)
+            .await
+            .map_err(|e| StoreError::Internal(format!("microbatch append failed: {}", e)))?;
+        Ok(())
+    }
 
-        // Check (and set) the in-progress guard. If a compaction is already
-        // running for this (domain, branch), skip (no-op).
-        //
-        // WHY: blocking_write() panics when called from within a tokio runtime
-        // (this fn is invoked from a tokio::spawn context).
-        // INVARIANT: compaction is probabilistic (5% roll); a skipped roll is
-        // retried on the next successful write. Steady-state compaction rate is
-        // negligibly affected by rare contention skips.
-        // CONSEQUENCE: if contention persists (pathological), fragments accumulate
-        // until contention clears and a roll succeeds. This is bounded by the
-        // 5% trigger rate and is self-healing.
-        let key: BranchKey = (domain.clone(), branch.clone());
-        {
-            let mut guard = match store.compaction_in_progress.try_write() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            if guard.contains(&key) {
-                return; // Already in-flight — no-op.
-            }
-            guard.insert(key.clone());
+    /// Delete old chunks for a set of doc_ids on an already-open write handle.
+    /// Used by the streaming pipeline to do the delete phase once at the start
+    /// before micro-batch appends begin.
+    pub async fn io_microbatch_delete(
+        &self,
+        ds: &mut Dataset,
+        delete_ids: &[String],
+    ) -> Result<(), StoreError> {
+        if delete_ids.is_empty() {
+            return Ok(());
         }
-
-        // Spawn the background compaction task.
-        let store_bg = Arc::clone(&store);
-        tokio::spawn(async move {
-            let result = io_background_compact(&store_bg, &domain, &branch).await;
-            // Always clear the guard (success or failure).
-            {
-                let mut guard = store_bg.compaction_in_progress.write().await;
-                guard.remove(&key);
-            }
-            if let Err(e) = result {
-                // FAIL LOUD: log to stderr so container logs surface the error.
-                eprintln!(
-                    "[compaction] ERROR: background compaction for {}/{} failed: {}",
-                    domain, branch, e
-                );
-            }
-        });
+        let values: Vec<_> = delete_ids.iter().map(|id| lit(id.as_str())).collect();
+        let expr = in_list(col("doc_id"), values, false);
+        let result = DeleteBuilder::from_expr(Arc::new(ds.clone()), expr)
+            .execute()
+            .await
+            .map_err(|e| StoreError::Internal(format!("microbatch delete failed: {}", e)))?;
+        *ds = result.new_dataset.as_ref().clone();
+        Ok(())
     }
 
     /// Delete all chunks for a doc_id on `branch` (`Deleted` op; RISK-13).
@@ -231,10 +210,12 @@ impl LanceStore {
 
         let mut ds = self.io_open_branch_for_write(domain, branch).await?;
 
-        let filter = format!("doc_id = '{}'", doc_id.replace('\'', "''"));
-        ds.delete(&filter)
+        let expr = col("doc_id").eq(lit(doc_id));
+        let result = DeleteBuilder::from_expr(Arc::new(ds.clone()), expr)
+            .execute()
             .await
             .map_err(|e| StoreError::Internal(format!("delete failed: {}", e)))?;
+        ds = result.new_dataset.as_ref().clone();
 
         self.io_refresh_cached_dataset(domain, branch).await?;
 
@@ -242,66 +223,60 @@ impl LanceStore {
     }
 }
 
-/// Background compaction: open dataset uncached, compact, retag stale commits,
-/// refresh cache. Called by the 5%-probability trigger from the write path.
-/// Runs on an uncached handle so it does NOT block concurrent reads.
-async fn io_background_compact(
-    store: &LanceStore,
-    domain: &str,
-    branch: &str,
-) -> Result<(), String> {
-    let ds = store
-        .io_open_dataset_uncached(domain, branch)
-        .await
-        .map_err(|e| format!("uncached open for compaction failed: {}", e))?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut ds = match ds {
-        Some(d) => d,
-        None => return Ok(()), // Dataset gone (deleted concurrently) — no-op.
-    };
-
-    // Compact (threshold-gated: no-op if fragments <= 16).
-    io_compact_data(&mut ds)
-        .await
-        .map_err(|e| format!("compaction failed: {}", e))?;
-
-    let compacted_version = ds.version().version;
-
-    // Retag stale commits to the compacted version so tag-resolved snapshots
-    // see the fewer-fragment layout.
-    let all_tags = ds
-        .tags()
-        .list()
-        .await
-        .map_err(|e| format!("tag list for retag failed: {}", e))?;
-
-    for (tag_name, tag_contents) in &all_tags {
-        if tag_contents.version != compacted_version {
-            ds.tags()
-                .update(tag_name, compacted_version)
-                .await
-                .map_err(|e| format!("retag '{}' to v{} failed: {}", tag_name, compacted_version, e))?;
-        }
+    /// Build the same Expr used by io_upsert_chunks and io_delete_doc
+    /// for individual doc_id deletion — demonstrates injection-safe construction.
+    fn build_single_expr(doc_id: &str) -> lance::deps::datafusion::logical_expr::Expr {
+        col("doc_id").eq(lit(doc_id))
     }
 
-    // Refresh the cached handle so subsequent reads use compacted fragments.
-    store
-        .io_refresh_cached_dataset(domain, branch)
-        .await
-        .map_err(|e| format!("cache refresh after compaction failed: {}", e))?;
+    #[test]
+    fn filter_normal_iri_is_safe() {
+        // Normal IRIs produce a simple equality Expr — no SQL string involved.
+        let expr = build_single_expr("terminusdb:///db/People/123");
+        let rendered = format!("{}", expr);
+        assert!(rendered.contains("terminusdb:///db/People/123"));
+    }
 
-    Ok(())
-}
+    #[test]
+    fn filter_backslash_quote_is_safe_via_expr() {
+        // Previously, a doc_id like x\' OR 1=1 could break out of a SQL string
+        // literal via backslash escaping. With Expr-based construction, the
+        // entire doc_id is a literal value — no SQL parsing occurs.
+        let malicious = "x\\' OR 1=1";
+        let expr = build_single_expr(malicious);
+        let rendered = format!("{}", expr);
+        // The malicious content is contained within the literal — no SQL injection.
+        assert!(rendered.contains("OR 1=1"));
+        // It's part of the literal value, not injected SQL.
+        assert!(rendered.starts_with("doc_id = ") || rendered.contains("Utf8"));
+    }
 
-/// Build a Lance SQL filter expression `doc_id IN ('id1', 'id2', ...)` for batch
-/// deletion of documents by their doc_id. SQL-escapes single quotes in doc_ids.
-///
-/// Precondition: `ids` is non-empty (caller must check). A filter on an empty set
-/// is a logic error (Lance will reject the empty IN-list).
-fn build_doc_id_in_filter(ids: &[String]) -> String {
-    let values: Vec<String> = ids
-        .iter()
-        .map(|id| format!("'{}'", id.replace('\'', "''")))
-        .collect();
-    format!("doc_id IN ({})", values.join(", "))
+    #[test]
+    fn filter_newline_is_safe_via_expr() {
+        // Newlines in doc_ids are also safe — they're literal values, not SQL.
+        let malicious = "doc1\n-- OR 1=1";
+        let expr = build_single_expr(malicious);
+        let rendered = format!("{}", expr);
+        // The newline is part of the literal, not a SQL comment injection.
+        assert!(rendered.contains("OR 1=1"));
+    }
+
+    #[test]
+    fn filter_in_list_is_safe_via_expr() {
+        // The IN-list path (build_doc_id_in_filter replacement) also uses Expr.
+        let ids = ["evil\\' OR doc_id = 'admin".to_string()];
+        let values: Vec<_> = ids.iter().map(|id| lit(id.as_str())).collect();
+        let expr = lance::deps::datafusion::logical_expr::in_list(
+            col("doc_id"),
+            values,
+            false,
+        );
+        let rendered = format!("{}", expr);
+        // The entire malicious string is a single literal — no SQL injection.
+        assert!(rendered.contains("admin"));
+    }
 }

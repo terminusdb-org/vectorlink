@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
 //! Resolution/duplicates: near-duplicate grouping and cross-neighbour resolution.
 
 use std::collections::HashMap;
@@ -20,7 +23,7 @@ use super::{
     DEFAULT_DUPLICATE_MAX_PAIRS,
 };
 use super::dedup::pairs_from_neighbours;
-use super::search::{build_filter_expression, extract_embedding_row};
+use super::search::{build_filter_expr, extract_embedding_row};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Performance markers — cheap Instant::now() timing for pipeline diagnosis.
@@ -91,20 +94,21 @@ impl LanceStore {
     ) -> Result<Vec<DuplicateGroup>, StoreError> {
         let snapshot = self.io_open_snapshot(domain, branch, commit).await?;
 
-        let set_filter = build_filter_expression(&scope.set_doc_types, &scope.set_doc_ids);
-        let set_filter_opt = if set_filter.is_empty() {
-            None
-        } else {
-            Some(set_filter)
-        };
+        let set_filter = build_filter_expr(&scope.set_doc_types, &scope.set_doc_ids);
 
         // Bound on the SET population (the points we iterate), not the whole
         // snapshot — a filtered run over a small set inside a huge corpus is still
         // safely bounded.
-        let set_point_count = snapshot
-            .count_rows(set_filter_opt.clone())
-            .await
-            .map_err(|e| StoreError::Internal(format!("count_rows for duplicates failed: {}", e)))?;
+        let set_point_count = if let Some(expr) = &set_filter {
+            let mut scanner = snapshot.scan();
+            scanner.filter_expr(expr.clone());
+            scanner.count_rows().await
+                .map_err(|e| StoreError::Internal(format!("count_rows for duplicates failed: {}", e)))? as usize
+        } else {
+            snapshot.count_rows(None)
+                .await
+                .map_err(|e| StoreError::Internal(format!("count_rows for duplicates failed: {}", e)))?
+        };
 
         if set_point_count > max_points {
             return Err(StoreError::Internal(format!(
@@ -114,7 +118,7 @@ impl LanceStore {
             )));
         }
 
-        let points = io_scan_points(&snapshot, set_filter_opt.as_deref(), snippet).await?;
+        let points = io_scan_points(&snapshot, set_filter, snippet).await?;
         let observations = io_collect_neighbours(&snapshot, &points, scope, snippet).await?;
 
         Ok(pairs_from_neighbours(
@@ -148,7 +152,8 @@ impl LanceStore {
         commit: &str,
         scope: &DuplicateScope,
         k: usize,
-        threshold: f32,
+        threshold_set: f32,
+        threshold_target: f32,
         max_points: usize,
     ) -> Result<ResolveNeighbourMaps, StoreError> {
         let t0 = Instant::now();
@@ -156,23 +161,22 @@ impl LanceStore {
         perf_mark!(t0, "snapshot_open");
 
         // Build filters for set and target populations.
-        let set_filter = build_filter_expression(&scope.set_doc_types, &scope.set_doc_ids);
-        let set_filter_opt = if set_filter.is_empty() { None } else { Some(set_filter) };
+        let set_filter = build_filter_expr(&scope.set_doc_types, &scope.set_doc_ids);
+        let set_filter_opt = set_filter;
 
         let target_filter =
-            build_filter_expression(&scope.target_doc_types, &scope.target_doc_ids);
-        let target_filter_opt =
-            if target_filter.is_empty() { None } else { Some(target_filter) };
+            build_filter_expr(&scope.target_doc_types, &scope.target_doc_ids);
+        let target_filter_opt = target_filter;
 
-        // Scan set points (query_embedding + doc_id, no snippets).
+        // Scan set points (embedding + doc_id, no snippets).
         let t1 = Instant::now();
-        let set_points = io_scan_points(&snapshot, set_filter_opt.as_deref(), false).await?;
+        let set_points = io_scan_points(&snapshot, set_filter_opt, false).await?;
         perf_mark!(t1, "scan_set_points", "n={}", set_points.len());
 
         // Scan target points. If no explicit target, target = set (within-set dedup).
         let t2 = Instant::now();
         let target_points = if scope.has_target() {
-            io_scan_points(&snapshot, target_filter_opt.as_deref(), false).await?
+            io_scan_points(&snapshot, target_filter_opt, false).await?
         } else {
             set_points.clone()
         };
@@ -209,13 +213,13 @@ impl LanceStore {
         // For each set point: top-K filtered to target doc_ids.
         let t3 = Instant::now();
         let set_to_target =
-            io_collect_top_k_cross(&snapshot, &set_points, &target_doc_ids, k, threshold).await?;
+            io_collect_top_k_cross(&snapshot, &set_points, &target_doc_ids, k, threshold_set).await?;
         perf_mark!(t3, "cross_set_to_target", "probes={}, candidates={}", set_points.len(), target_doc_ids.len());
 
         // For each target point: top-K filtered to set doc_ids.
         let t4 = Instant::now();
         let target_to_set =
-            io_collect_top_k_cross(&snapshot, &target_points, &set_doc_ids, k, threshold).await?;
+            io_collect_top_k_cross(&snapshot, &target_points, &set_doc_ids, k, threshold_target).await?;
         perf_mark!(t4, "cross_target_to_set", "probes={}, candidates={}", target_points.len(), set_doc_ids.len());
 
         perf_mark!(t0, "resolve_total", "set={}, target={}", set_points.len(), target_points.len());
@@ -332,7 +336,7 @@ async fn io_collect_top_k_cross_flat(
     for batch in points.chunks(COMPUTE_BATCH_SIZE) {
         for point in batch {
             let neighbours =
-                flat_knn_top_k(&point.query_embedding, &point.doc_id, &candidates, k, threshold);
+                flat_knn_top_k(&point.embedding, &point.doc_id, &candidates, k, threshold);
 
             if !neighbours.is_empty() {
                 result
@@ -375,7 +379,10 @@ async fn io_materialise_candidate_embeddings(
 
     // Reuse the shared filter builder (same escaping as /search, /duplicates paths).
     let t_filter = Instant::now();
-    let filter = build_filter_expression(&[], candidate_doc_ids);
+    let filter = build_filter_expr(&[], candidate_doc_ids)
+        .ok_or_else(|| StoreError::Internal(
+            "candidate filter unexpectedly empty (non-empty doc_ids list produced no Expr)".to_owned()
+        ))?;
     perf_mark!(t_filter, "materialise_build_filter", "ids={}", candidate_doc_ids.len());
 
     let t_scan_setup = Instant::now();
@@ -383,9 +390,7 @@ async fn io_materialise_candidate_embeddings(
     scanner
         .project(&["doc_id", "embedding"])
         .map_err(|e| StoreError::Internal(format!("candidate scan projection failed: {}", e)))?;
-    scanner
-        .filter(&filter)
-        .map_err(|e| StoreError::Internal(format!("candidate scan filter failed: {}", e)))?;
+    scanner.filter_expr(filter);
     perf_mark!(t_scan_setup, "materialise_scanner_setup");
 
     let t_stream = Instant::now();
@@ -395,16 +400,19 @@ async fn io_materialise_candidate_embeddings(
         .map_err(|e| StoreError::Internal(format!("candidate scan stream failed: {}", e)))?;
     perf_mark!(t_stream, "materialise_try_into_stream");
 
+    // STREAMING: process each batch as it arrives, extract embeddings, then
+    // drop the batch before reading the next. This avoids holding all
+    // RecordBatches AND all MaterialisedCandidates in memory simultaneously
+    // (halves peak memory for the 30k-candidate path).
     let t_collect = Instant::now();
-    let batches: Vec<RecordBatch> = stream
-        .try_collect()
-        .await
-        .map_err(|e| StoreError::Internal(format!("candidate scan collect failed: {}", e)))?;
-    perf_mark!(t_collect, "materialise_collect_batches", "batches={}", batches.len());
-
-    let t_extract = Instant::now();
+    let mut batch_count = 0usize;
     let mut candidates = Vec::new();
-    for batch in &batches {
+    tokio::pin!(stream);
+    while let Some(batch_result) = futures::StreamExt::next(&mut stream).await {
+        let batch = batch_result
+            .map_err(|e| StoreError::Internal(format!("candidate scan stream batch failed: {}", e)))?;
+        batch_count += 1;
+
         if batch.num_rows() == 0 {
             continue;
         }
@@ -428,8 +436,10 @@ async fn io_materialise_candidate_embeddings(
                 embedding,
             });
         }
+        // batch is dropped here — Arrow buffers freed before next batch arrives.
     }
-    perf_mark!(t_extract, "materialise_extract_vectors", "rows={}", candidates.len());
+    perf_mark!(t_collect, "materialise_stream_batches", "batches={}", batch_count);
+    perf_mark!(t_collect, "materialise_extract_vectors", "rows={}", candidates.len());
 
     Ok(candidates)
 }
@@ -550,11 +560,10 @@ async fn io_collect_top_k_cross_ann(
             scanner
                 .nearest(
                     "embedding",
-                    // Probe vector: the stored QUERY-role embedding (Phase 6A Step 5).
-                    // Asymmetric signal: set.query_embedding probes target.embedding
-                    // ANN index. Lifts /resolve recall from ~27% to ~94% at k=1
-                    // (spike evidence: dual-embed-spike.md).
-                    &Float32Array::from(point.query_embedding.clone()),
+                    // Probe vector: the stored DOCUMENT-role embedding (doc→doc
+                    // same-role probe). The asymmetric query→document probe has been
+                    // removed in favour of same-role doc→doc comparison.
+                    &Float32Array::from(point.embedding.clone()),
                     fetch_k,
                 )
                 .map_err(|e| {
@@ -678,41 +687,38 @@ fn merge_neighbours(
 }
 
 /// A single indexed point in the SET population: its owning document id, its
-/// query-role embedding (for the asymmetric probe), and (when snippets are
-/// requested) its chunk text.
+/// document-role embedding (for same-role doc→doc probe), and (when snippets
+/// are requested) its chunk text.
 #[derive(Clone)]
 pub(super) struct IndexedPoint {
     pub(super) doc_id: String,
-    /// Query-role embedding for asymmetric probe (Phase 6A Step 5: dual-vector).
-    /// Used by /resolve and /duplicates to probe set.query_embedding against
-    /// target.embedding ANN index, lifting recall ~27%→94% at k=1.
-    pub(super) query_embedding: Vec<f32>,
+    /// Document-role embedding (search_document: prefix). Used by /resolve and
+    /// /duplicates to probe set.embedding against target.embedding ANN index
+    /// (same-role doc→doc comparison).
+    pub(super) embedding: Vec<f32>,
     pub(super) content: Option<String>,
 }
 
-/// Scan the SET population's points (doc_id + query_embedding, plus content for
+/// Scan the SET population's points (doc_id + embedding, plus content for
 /// snippets) from a versioned snapshot, optionally filtered to the set scope.
-/// Projects ONLY `query_embedding` (not `embedding`) — YAGNI: the doc-role
-/// vector is not needed by the probe path (Phase 6A Step 5 dual-vector).
+/// Projects `embedding` (document-role) for same-role doc→doc probing.
 async fn io_scan_points(
     snapshot: &Dataset,
-    set_filter: Option<&str>,
+    set_filter: Option<Expr>,
     snippet: bool,
 ) -> Result<Vec<IndexedPoint>, StoreError> {
     let t_setup = Instant::now();
     let mut scanner = snapshot.scan();
     let projection: &[&str] = if snippet {
-        &["doc_id", "query_embedding", "content"]
+        &["doc_id", "embedding", "content"]
     } else {
-        &["doc_id", "query_embedding"]
+        &["doc_id", "embedding"]
     };
     scanner
         .project(projection)
         .map_err(|e| StoreError::Internal(format!("duplicates projection failed: {}", e)))?;
     if let Some(filter) = set_filter {
-        scanner
-            .filter(filter)
-            .map_err(|e| StoreError::Internal(format!("duplicates set filter failed: {}", e)))?;
+        scanner.filter_expr(filter);
     }
     perf_mark!(t_setup, "scan_points_setup");
 
@@ -738,7 +744,7 @@ async fn io_scan_points(
 }
 
 /// Extract `IndexedPoint`s from projected RecordBatches (doc_id +
-/// query_embedding, plus content when snippets requested).
+/// embedding, plus content when snippets requested).
 /// FAIL-LOUD: a batch missing a required column, or an embedding row that is null,
 /// is a real schema/corruption error — never silently skipped (which would drop
 /// points and yield quietly-incomplete duplicate results).
@@ -754,11 +760,11 @@ fn batches_to_points(batches: &[RecordBatch], snippet: bool) -> Result<Vec<Index
             .ok_or_else(|| {
                 StoreError::Internal("duplicates scan: missing `doc_id` column".to_owned())
             })?;
-        let query_embeddings = batch
-            .column_by_name("query_embedding")
+        let embeddings = batch
+            .column_by_name("embedding")
             .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
             .ok_or_else(|| {
-                StoreError::Internal("duplicates scan: missing `query_embedding` column".to_owned())
+                StoreError::Internal("duplicates scan: missing `embedding` column".to_owned())
             })?;
         let contents = if snippet {
             Some(
@@ -774,10 +780,10 @@ fn batches_to_points(batches: &[RecordBatch], snippet: bool) -> Result<Vec<Index
         };
 
         for i in 0..n {
-            let query_embedding = extract_embedding_row(query_embeddings, i, doc_ids.value(i))?;
+            let embedding = extract_embedding_row(embeddings, i, doc_ids.value(i))?;
             points.push(IndexedPoint {
                 doc_id: doc_ids.value(i).to_owned(),
-                query_embedding,
+                embedding,
                 content: contents.map(|c| c.value(i).to_owned()),
             });
         }
@@ -831,9 +837,9 @@ async fn io_nearest_neighbour(
     scanner
         .nearest(
             "embedding",
-            // Dual-vector probe (Phase 6A Step 5): use the query-role embedding to
-            // probe the document-role ANN index. Same asymmetric signal as /resolve.
-            &Float32Array::from(point.query_embedding.clone()),
+            // Same-role doc→doc probe: use the document-role embedding to probe
+            // the document-role ANN index.
+            &Float32Array::from(point.embedding.clone()),
             NEIGHBOUR_K,
         )
         .map_err(|e| StoreError::Internal(format!("duplicates nearest setup failed: {}", e)))?;
@@ -846,9 +852,7 @@ async fn io_nearest_neighbour(
     scanner
         .project(projection)
         .map_err(|e| StoreError::Internal(format!("duplicates nearest projection failed: {}", e)))?;
-    scanner
-        .filter(&filter)
-        .map_err(|e| StoreError::Internal(format!("duplicates nearest filter failed: {}", e)))?;
+    scanner.filter_expr(filter);
 
     let batches: Vec<RecordBatch> = scanner
         .try_into_stream()
@@ -864,14 +868,16 @@ async fn io_nearest_neighbour(
 /// Build the ANN filter for a set point's neighbour query. The query point's own
 /// document is excluded in BOTH modes (a doc is never its own duplicate); in
 /// cross-set mode the target population's IN-list is AND-ed on so the neighbour is
-/// drawn only from the target. Single-quotes in ids are escaped (SQL string).
-fn build_neighbour_filter(self_doc_id: &str, scope: &DuplicateScope) -> String {
-    let exclude_self = format!("doc_id != '{}'", self_doc_id.replace('\'', "''"));
+/// drawn only from the target.
+///
+/// SECURITY: Uses DataFusion Expr values — no SQL string interpolation.
+fn build_neighbour_filter(self_doc_id: &str, scope: &DuplicateScope) -> Expr {
+    let exclude_self = col("doc_id").not_eq(lit(self_doc_id));
     if scope.has_target() {
-        let target = build_filter_expression(&scope.target_doc_types, &scope.target_doc_ids);
+        let target = build_filter_expr(&scope.target_doc_types, &scope.target_doc_ids);
         // has_target() guaranteed at least one of the target lists is non-empty,
         // so `target` is non-empty here.
-        format!("{} AND ({})", exclude_self, target)
+        exclude_self.and(target.expect("has_target guarantees non-empty filter"))
     } else {
         exclude_self
     }
