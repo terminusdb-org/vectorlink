@@ -227,7 +227,7 @@ impl LanceStore {
 
         // Extract hits from non-FTS batches, filtering by substring in Rust.
         let mut hits = Vec::new();
-        for (batch_idx, batch) in batches.iter().enumerate() {
+        for batch in batches.iter() {
             let n = batch.num_rows();
             let doc_ids = batch
                 .column_by_name("doc_id")

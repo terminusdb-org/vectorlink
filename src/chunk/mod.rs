@@ -221,9 +221,8 @@ mod tests {
 
     fn test_tokenizer() -> Tokenizer {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("spikes")
-            .join("tokenizer")
-            .join("tokenizer.json");
+            .join("assets")
+            .join("tokenizer.json.bz2");
         io_load_tokenizer(&path).expect("test tokenizer must load")
     }
 

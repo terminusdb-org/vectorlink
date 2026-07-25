@@ -99,7 +99,7 @@ fn parse_args() -> Result<LoadArgs, String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(768);
     let tokenizer_path = std::env::var("TDB_SEARCH_TOKENIZER_PATH")
-        .unwrap_or_else(|_| "spikes/tokenizer/tokenizer.json".to_owned());
+        .unwrap_or_else(|_| "assets/tokenizer.json.bz2".to_owned());
 
     Ok(LoadArgs {
         directory,
@@ -124,7 +124,7 @@ fn print_usage() {
          TDB_SEARCH_EMBED_URL       Embedding endpoint (default: http://localhost:11434)\n\
          TDB_SEARCH_MODEL           Model name (default: nomic-embed-text-v2-moe)\n\
          TDB_SEARCH_DIM             Embedding dimension (default: 768)\n\
-         TDB_SEARCH_TOKENIZER_PATH  Path to tokenizer.json"
+         TDB_SEARCH_TOKENIZER_PATH  Path to tokenizer.json.bz2"
     );
 }
 

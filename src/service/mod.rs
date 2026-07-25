@@ -2909,9 +2909,8 @@ mod tests_risk26 {
     /// Build a test tokenizer from the checked-in fixture.
     fn test_tokenizer() -> Tokenizer {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("spikes")
-            .join("tokenizer")
-            .join("tokenizer.json");
+            .join("assets")
+            .join("tokenizer.json.bz2");
         crate::chunk::io_load_tokenizer(&path).expect("test tokenizer must load")
     }
 
@@ -3292,9 +3291,8 @@ mod tests_streaming {
 
     fn test_tokenizer() -> Tokenizer {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("spikes")
-            .join("tokenizer")
-            .join("tokenizer.json");
+            .join("assets")
+            .join("tokenizer.json.bz2");
         crate::chunk::io_load_tokenizer(&path).expect("test tokenizer must load")
     }
 
@@ -3590,7 +3588,7 @@ mod tests_exact_duplicate_override {
                 dim,
             },
             data_dir: "/tmp/test".to_owned(),
-            tokenizer_path: "spikes/tokenizer/tokenizer.json".to_owned(),
+            tokenizer_path: "assets/tokenizer.json.bz2".to_owned(),
             embed_batch_size: 32,
             embed_cache_size: None,
             prometheus_port: None,
@@ -3598,9 +3596,8 @@ mod tests_exact_duplicate_override {
             lance_metadata_cache_bytes: 128 * 1024 * 1024,
         };
         let tokenizer_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("spikes")
-            .join("tokenizer")
-            .join("tokenizer.json");
+            .join("assets")
+            .join("tokenizer.json.bz2");
         let tokenizer =
             crate::chunk::io_load_tokenizer(&tokenizer_path).expect("test tokenizer must load");
         let svc = SearchService::new(store, config, tokenizer);
@@ -4482,9 +4479,8 @@ mod tests_concurrent_search {
     #[allow(dead_code)]
     fn test_tokenizer() -> Tokenizer {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("spikes")
-            .join("tokenizer")
-            .join("tokenizer.json");
+            .join("assets")
+            .join("tokenizer.json.bz2");
         crate::chunk::io_load_tokenizer(&path).expect("test tokenizer must load")
     }
 
