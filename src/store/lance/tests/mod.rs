@@ -1644,7 +1644,7 @@ fn rrf_merge_combines_ranked_lists() {
     let fts_hits = vec![
         ChunkHit {
             doc_id: "B".to_owned(),
-            distance: 0.1, // FTS distance (from BM25 conversion).
+            distance: 1.0 / (1.0 + 10.0), // High BM25 score → low distance.
             distance_kind: DistanceKind::Normalised,
             chunk_index: 0,
             chunk_count: 1,
@@ -1656,7 +1656,7 @@ fn rrf_merge_combines_ranked_lists() {
         },
         ChunkHit {
             doc_id: "C".to_owned(),
-            distance: 0.2,
+            distance: 1.0 / (1.0 + 5.0),
             distance_kind: DistanceKind::Normalised,
             chunk_index: 0,
             chunk_count: 1,
@@ -1668,7 +1668,7 @@ fn rrf_merge_combines_ranked_lists() {
         },
         ChunkHit {
             doc_id: "D".to_owned(),
-            distance: 0.3,
+            distance: 1.0 / (1.0 + 2.0),
             distance_kind: DistanceKind::Normalised,
             chunk_index: 0,
             chunk_count: 1,
@@ -1686,19 +1686,44 @@ fn rrf_merge_combines_ranked_lists() {
     // = 1/(60+2) + 1/(60+1) = 1/62 + 1/61
     assert_eq!(merged[0].doc_id, "B", "B should rank first (appears high in both lists)");
 
-    // All 4 unique docs should appear.
+    // All 4 unique docs should appear — FTS-only hits are kept with their BM25 distance.
     let ids: Vec<&str> = merged.iter().map(|h| h.doc_id.as_str()).collect();
     assert!(ids.contains(&"A"));
     assert!(ids.contains(&"B"));
     assert!(ids.contains(&"C"));
-    assert!(ids.contains(&"D"));
+    assert!(ids.contains(&"D"), "FTS-only hit D must be kept with its BM25 distance");
     assert_eq!(ids.len(), 4);
+
+    // Hits in both lists (B, C) must retain their original vector cosine distance.
+    // Order is B, C, A, D by RRF score (B and C both appear in vector + FTS).
+    assert!(
+        (merged[0].distance - 0.3).abs() < f32::EPSILON,
+        "B should retain its original vector distance 0.3, got {}",
+        merged[0].distance
+    );
+    assert!(
+        (merged[1].distance - 0.5).abs() < f32::EPSILON,
+        "C should retain its original vector distance 0.5, got {}",
+        merged[1].distance
+    );
+    assert!(
+        (merged[2].distance - 0.1).abs() < f32::EPSILON,
+        "A should retain its original vector distance 0.1, got {}",
+        merged[2].distance
+    );
+    // D is FTS-only — must retain its BM25-derived distance.
+    assert!(
+        (merged[3].distance - 1.0 / (1.0 + 2.0)).abs() < f32::EPSILON,
+        "D should retain its BM25-derived distance {}, got {}",
+        1.0 / (1.0 + 2.0),
+        merged[3].distance
+    );
 }
 
-// RRF distances should scale smoothly from 0.0, not create a bimodal
-// 0.0 / 0.5 cliff caused by normalising against the theoretical max.
+// RRF merge must preserve original vector distances, not replace them with
+// synthetic rank-normalised values. The first result must NOT always be 0.0.
 #[test]
-fn rrf_merge_distances_scale_smoothly() {
+fn rrf_merge_preserves_original_vector_distances() {
     // Only vector hits, no FTS — all items in a single list.
     let vector_hits = vec![
         ChunkHit {
@@ -1729,30 +1754,24 @@ fn rrf_merge_distances_scale_smoothly() {
 
     let merged = rrf_merge(vector_hits, Vec::new());
 
-    // Rank 1 (A) should have distance 0.0 (normalised by actual max).
+    // A is rank 1 but must retain its original distance 0.1, NOT 0.0.
     assert!(
-        (merged[0].distance - 0.0).abs() < f32::EPSILON,
-        "top result should have distance 0.0, got {}",
+        (merged[0].distance - 0.1).abs() < f32::EPSILON,
+        "top result should retain original distance 0.1, got {}",
         merged[0].distance
     );
 
-    // Rank 2 (B) should have a smooth distance, NOT 0.5.
-    // RRF: A = 1/61, B = 1/62. Normalised by max (1/61):
-    // B distance = 1 - (1/62)/(1/61) = 1 - 61/62 ≈ 0.0161
-    let expected_b = 1.0 - (1.0 / 62.0) / (1.0 / 61.0);
+    // B must retain its original distance 0.3, NOT a synthetic rank-based value.
     assert!(
-        (merged[1].distance - expected_b as f32).abs() < 0.001,
-        "second result should scale smoothly to ~{}, got {}",
-        expected_b,
+        (merged[1].distance - 0.3).abs() < f32::EPSILON,
+        "second result should retain original distance 0.3, got {}",
         merged[1].distance
     );
 
-    // The gap between A and B should be small, not a 0.5 cliff.
-    let gap = merged[1].distance - merged[0].distance;
+    // The first result must NOT have distance 0.0 (would mean rank-normalised).
     assert!(
-        gap < 0.1,
-        "distance gap should be small (<0.1), got {} — no bimodal cliff",
-        gap
+        merged[0].distance > 0.0,
+        "first result must not have distance 0.0 (would indicate rank normalisation)"
     );
 }
 

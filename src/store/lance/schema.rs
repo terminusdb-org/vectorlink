@@ -47,10 +47,10 @@ pub struct SuggestQuery {
 }
 
 /// A document-level suggest hit with snippet and next-words for smart compose.
+/// Suggest is a typeahead endpoint — ordering is meaningful, distance is not.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SuggestHit {
     pub id: String,
-    pub distance: f32,
     /// The matched chunk content snippet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,

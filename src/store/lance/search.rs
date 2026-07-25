@@ -163,12 +163,11 @@ impl LanceStore {
         let hits: Vec<SuggestHit> = sorted_hits
             .iter()
             .take(query.count)
-            .map(|(id, dist, content)| {
+            .map(|(id, _dist, content)| {
                 let (match_start, match_end, next_words) =
                     find_match_and_next_words(content, &query_lower);
                 SuggestHit {
                     id: id.clone(),
-                    distance: *dist,
                     snippet: Some(content.clone()),
                     match_start,
                     match_end,
@@ -257,11 +256,13 @@ impl LanceStore {
                     if !content.to_lowercase().contains(&query_lower) {
                         continue;
                     }
-                    // Assign a pseudo-distance based on position — earlier hits rank better.
-                    let distance = 0.5 + (batch_idx as f32 + i as f32 / n as f32) * 0.1;
+                    // Positive text match — query substring found in content.
+                    // No embedding or BM25 score available; distance 0.0 reflects
+                    // "this is a match" on the [0, 0.5, 1] scale.
+                    let distance: f32 = 0.0;
                     hits.push(ChunkHit {
                         doc_id: ids.value(i).to_owned(),
-                        distance: distance.min(1.0),
+                        distance,
                         distance_kind: DistanceKind::Normalised,
                         chunk_index: ci.value(i),
                         chunk_count: cc.value(i),
@@ -1130,6 +1131,8 @@ pub(super) fn batches_to_vector_hits(
 
 /// Extract ChunkHit records from RecordBatches (FTS search — reads `_score`).
 /// BM25 scores are converted to distances: `distance = 1/(1+score)` so 0=best.
+/// This maps strong text matches to low distances (near 0) and weak ones toward
+/// 0.5+, consistent with the [0, 0.5, 1] reference scale.
 /// Results are preserved in stream order (BM25 rank order from Lance).
 pub(super) fn batches_to_fts_hits(batches: &[RecordBatch]) -> Vec<ChunkHit> {
     let mut hits = Vec::new();
@@ -1336,7 +1339,13 @@ pub(super) fn extract_completions(query: &str, snippets: Vec<&str>) -> Vec<Strin
 /// RRF score = sum of 1/(k + rank) across all lists where the item appears.
 /// k=60 is the standard constant. Items are keyed by (doc_id, chunk_index).
 /// The output is sorted by descending RRF score (highest relevance first).
-/// Distance is set to 1.0 - normalized_rrf_score (so smaller = more relevant).
+///
+/// Distances are NOT replaced with synthetic rank-normalised values. Each hit
+/// retains its original distance: vector hits keep their RawCosine distance
+/// (in [0, 2], normalised to [0, 1] by dedup), FTS-only hits keep their
+/// BM25-derived distance (Normalised, in [0, 1]). For hits appearing in both
+/// lists, the vector hit's distance is preferred (it has a real geometric
+/// distance).
 pub(super) fn rrf_merge(vector_hits: Vec<ChunkHit>, fts_hits: Vec<ChunkHit>) -> Vec<ChunkHit> {
     use std::collections::HashMap;
     const K: f32 = 60.0;
@@ -1350,19 +1359,21 @@ pub(super) fn rrf_merge(vector_hits: Vec<ChunkHit>, fts_hits: Vec<ChunkHit>) -> 
         let rrf_score = 1.0 / (K + rank as f32 + 1.0);
         let entry = scores.entry(key).or_insert_with(|| (0.0, hit.clone()));
         entry.0 += rrf_score;
-        // Keep the hit with the better (smaller) original distance.
-        if hit.distance < entry.1.distance {
-            entry.1 = hit;
-        }
+        // Always keep the vector hit — it has a real cosine distance.
+        entry.1 = hit;
     }
 
     // Score FTS results by rank (already sorted by relevance — best first).
+    // FTS contributes to RRF ranking. For hits also in the vector list, the
+    // vector distance is preferred. For FTS-only hits, the BM25-derived
+    // distance is kept.
     for (rank, hit) in fts_hits.into_iter().enumerate() {
         let key = (hit.doc_id.clone(), hit.chunk_index);
         let rrf_score = 1.0 / (K + rank as f32 + 1.0);
         let entry = scores.entry(key).or_insert_with(|| (0.0, hit.clone()));
         entry.0 += rrf_score;
-        if hit.distance < entry.1.distance {
+        // Only use the FTS hit if there is no vector hit for this key.
+        if entry.1.distance_kind != DistanceKind::RawCosine {
             entry.1 = hit;
         }
     }
@@ -1371,24 +1382,10 @@ pub(super) fn rrf_merge(vector_hits: Vec<ChunkHit>, fts_hits: Vec<ChunkHit>) -> 
     let mut ranked: Vec<(f32, ChunkHit)> = scores.into_values().collect();
     ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Convert RRF score into a synthetic distance (lower = better).
-    // Normalise by the ACTUAL max score in this result set so distances
-    // scale smoothly from 0.0. Using the theoretical max (2/(K+1)) creates
-    // a bimodal distribution: items in both lists get ~0.0, items in only
-    // one list jump to ~0.5 — a misleading cliff that doesn't reflect
-    // actual relevance gradation.
-    let max_score = ranked
-        .first()
-        .map(|(s, _)| *s)
-        .filter(|s| *s > 0.0)
-        .unwrap_or(1.0);
+    // Return hits in RRF order, preserving each hit's original distance.
     ranked
         .into_iter()
-        .map(|(score, mut hit)| {
-            hit.distance = (1.0 - score / max_score).clamp(0.0, 1.0);
-            hit.distance_kind = DistanceKind::Normalised;
-            hit
-        })
+        .map(|(_, hit)| hit)
         .collect()
 }
 
