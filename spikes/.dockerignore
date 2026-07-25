@@ -1,6 +1,0 @@
-# Keep the build context tiny + reproducible.
-target/
-**/target/
-evidence/logs/
-# The 17MB tokenizer.json is bind-mounted at run time, not baked into the image.
-tokenizer/tokenizer.json
