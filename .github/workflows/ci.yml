@@ -9,10 +9,15 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, vectorlink-2.0]
   pull_request:
-    branches: [main]
+    branches: [main, vectorlink-2.0]
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or SHA to run CI against"
+        required: false
+        default: "main"
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,6 +31,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install system dependencies
         run: |
@@ -66,6 +73,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -85,6 +94,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
