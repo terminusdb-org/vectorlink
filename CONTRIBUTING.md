@@ -43,7 +43,7 @@ The rust debug build is 10x slower than the release build. The release build is 
 
 ### Local test servers
 
-`tests/tdb-search-server.sh` starts both tdb-search (port 7372) and a paired TerminusDB test server (port 7373), in ../terminusdb:
+`tests/vectorlink-server.sh` starts both vectorlink (port 7372) and a paired TerminusDB test server (port 7373), in ../terminusdb:
 
 ```bash
 make server-start     # start both

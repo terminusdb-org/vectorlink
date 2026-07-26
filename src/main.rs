@@ -3,7 +3,7 @@
 
 #![forbid(unsafe_code)]
 
-//! tdb-search server — standalone semantic search engine.
+//! vectorlink server — standalone semantic search engine.
 //!
 //! Binds [::]:8080, answers liveness immediately, defers all heavy work.
 //!
@@ -18,15 +18,15 @@ use std::sync::Arc;
 use arrow_array::{Array, FixedSizeListArray, Float32Array, StringArray};
 use futures::TryStreamExt;
 use lance::dataset::Dataset;
-use tdb_search::chunk;
-use tdb_search::config::Config;
-use tdb_search::embed::{self, EmbeddingRole};
-use tdb_search::embed::cache::EmbedCache;
-use tdb_search::http_api;
-use tdb_search::kernel::model::{parse_domain, Domain};
-use tdb_search::metrics;
-use tdb_search::service::SearchService;
-use tdb_search::store::lance::{encode_domain_path, LanceStore};
+use vectorlink::chunk;
+use vectorlink::config::Config;
+use vectorlink::embed::{self, EmbeddingRole};
+use vectorlink::embed::cache::EmbedCache;
+use vectorlink::http_api;
+use vectorlink::kernel::model::{parse_domain, Domain};
+use vectorlink::metrics;
+use vectorlink::service::SearchService;
+use vectorlink::store::lance::{encode_domain_path, LanceStore};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -69,7 +69,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "[startup] cleaned {} stale {} branch(es) from crashed compaction(s)",
             cleaned.len(),
-            tdb_search::store::lance::COMPACT_REBUILD_PREFIX
+            vectorlink::store::lance::COMPACT_REBUILD_PREFIX
         );
     }
 
@@ -93,9 +93,9 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port));
-    eprintln!("[tdb-search] starting on port {} | data_dir={} | model={}", port, data_dir, model_name);
+    eprintln!("[vectorlink] starting on port {} | data_dir={} | model={}", port, data_dir, model_name);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    eprintln!("[tdb-search] listening on {}", addr);
+    eprintln!("[vectorlink] listening on {}", addr);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -200,7 +200,7 @@ async fn prime_embed_cache(args: &[String]) -> Result<(), Box<dyn std::error::Er
 
     // Open sled cache.
     let cache_dir = data_dir.join("embed_cache");
-    let cache_size: Option<usize> = match std::env::var("TDB_SEARCH_EMBED_CACHE_SIZE") {
+    let cache_size: Option<usize> = match std::env::var("VECTORLINK_EMBED_CACHE_SIZE") {
         Ok(s) if s.eq_ignore_ascii_case("none") => None,
         Ok(s) => Some(s.parse::<usize>().unwrap_or(20_000)),
         Err(_) => Some(20_000),
@@ -210,7 +210,7 @@ async fn prime_embed_cache(args: &[String]) -> Result<(), Box<dyn std::error::Er
     let cache = EmbedCache::open(&cache_dir, cache_size);
 
     if !cache.is_enabled() {
-        return Err("cache is disabled (TDB_SEARCH_EMBED_CACHE_SIZE=None). Cannot prime.".into());
+        return Err("cache is disabled (VECTORLINK_EMBED_CACHE_SIZE=None). Cannot prime.".into());
     }
 
     // Open the Lance dataset.

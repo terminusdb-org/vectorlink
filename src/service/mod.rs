@@ -185,7 +185,7 @@ impl SearchService {
             .unwrap_or(ChunkParams { max_tokens: 480, overlap: 64 });
 
         let ready_index = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let search_ready = std::env::var("TDB_SEARCH_SEARCH_READY")
+        let search_ready = std::env::var("VECTORLINK_SEARCH_READY")
             .map(|v| v != "false")
             .unwrap_or(true);
         let ready_search = Arc::new(std::sync::atomic::AtomicBool::new(search_ready));

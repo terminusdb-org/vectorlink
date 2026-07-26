@@ -3,7 +3,7 @@
 
 #![forbid(unsafe_code)]
 
-//! tdb-search library — shared modules for server and CLI binaries.
+//! vectorlink library — shared modules for server and CLI binaries.
 
 pub mod chunk;
 pub mod config;

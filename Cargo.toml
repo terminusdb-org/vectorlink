@@ -1,6 +1,6 @@
 [package]
-name = "tdb-search"
-version = "0.1.0"
+name = "vectorlink"
+version = "2.0.0"
 edition = "2021"
 description = "Standalone semantic search engine — push-indexed, versioned per commit."
 license = "Apache-2.0"
@@ -45,11 +45,11 @@ tempfile = "3"
 tokio-test = "0.4"
 
 [[bin]]
-name = "tdb-search"
+name = "vectorlink"
 path = "src/main.rs"
 
 [[bin]]
-name = "tdb-search-load"
+name = "vectorlink-load"
 path = "src/bin/load.rs"
 
 # Note: throwaway measurement tools (scale_evidence, crossover_measurement)

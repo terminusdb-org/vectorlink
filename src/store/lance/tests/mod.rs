@@ -5287,7 +5287,7 @@ async fn cleanup_compaction_branches_only_cleans_affected() {
     );
 }
 
-/// The `.-compact_rebuild_` prefix is reserved for internal tdb-search branches.
+/// The `.-compact_rebuild_` prefix is reserved for internal vectorlink branches.
 /// This test documents the contract: is_compact_rebuild_branch identifies
 /// branches used by delta-fork retagging, and is_reserved_branch_name
 /// identifies the broader `.-` namespace for future reserved prefixes.
@@ -5330,7 +5330,7 @@ fn reserved_branch_namespace_contract() {
 }
 
 /// Internal compaction branches (.-compact_rebuild_) are created and cleaned
-/// up by tdb-search itself. This test verifies that a stale internal branch
+/// up by vectorlink itself. This test verifies that a stale internal branch
 /// (simulating a crashed compaction) is correctly identified and deleted by
 /// io_cleanup_compaction_branches, while a normal user branch is left intact.
 ///
@@ -9610,21 +9610,21 @@ async fn second_compaction_cycle_preserves_tagged_manifests() {
     assert_tags_resolve(&store, domain, "cycle2 after orphan cleanup").await;
 }
 
-/// Diagnostic: open the PRODUCTION store at /tmp/tdb-search-data and print
+/// Diagnostic: open the PRODUCTION store at /tmp/vectorlink-data and print
 /// the manifest branch, tag branch distribution, and cross-reference
 /// tag versions with on-disk manifests. #[ignore] — run manually with:
 ///   cargo test --lib store::lance::tests -- production_store_branch_field --ignored --nocapture
 #[tokio::test]
 #[ignore]
 async fn production_store_branch_field() {
-    let path = "/tmp/tdb-search-data/admin__product_assortment.lance";
+    let path = "/tmp/vectorlink-data/admin__product_assortment.lance";
     if !std::path::Path::new(path).exists() {
         eprintln!("Production store not found at {}, skipping", path);
         return;
     }
 
     let store = LanceStore::new(
-        std::path::Path::new("/tmp/tdb-search-data"),
+        std::path::Path::new("/tmp/vectorlink-data"),
         8,
         256 * 1024 * 1024,
         128 * 1024 * 1024,
@@ -9748,7 +9748,7 @@ async fn production_store_branch_field() {
 async fn production_store_historic_searchability() {
     use std::time::Instant;
 
-    let base_dir = "/tmp/tdb-search-data";
+    let base_dir = "/tmp/vectorlink-data";
     let path = format!("{base_dir}/admin__product_assortment.lance");
     if !std::path::Path::new(&path).exists() {
         eprintln!("Production store not found at {path}, skipping");
@@ -10105,7 +10105,7 @@ async fn production_store_historic_searchability() {
 #[tokio::test]
 #[ignore]
 async fn production_store_index_coverage() {
-    let base_dir = "/tmp/tdb-search-data";
+    let base_dir = "/tmp/vectorlink-data";
     let path = format!("{base_dir}/admin__product_assortment.lance");
     if !std::path::Path::new(&path).exists() {
         eprintln!("Production store not found at {path}, skipping");

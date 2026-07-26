@@ -120,39 +120,39 @@ pub struct Config {
     pub data_dir: String,
     pub tokenizer_path: String,
     /// Number of texts to batch per embedding HTTP call (cross-document batching).
-    /// Configurable via `TDB_SEARCH_EMBED_BATCH_SIZE`; default 32.
+    /// Configurable via `VECTORLINK_EMBED_BATCH_SIZE`; default 32.
     pub embed_batch_size: usize,
     /// Maximum entries for the disk-backed embedding cache (sled + zstd).
     /// `None` disables the cache (passthrough to embedding provider).
-    /// Configurable via `TDB_SEARCH_EMBED_CACHE_SIZE`; default 20,000.
+    /// Configurable via `VECTORLINK_EMBED_CACHE_SIZE`; default 20,000.
     pub embed_cache_size: Option<usize>,
     /// Optional Prometheus metrics endpoint port. When set, a separate HTTP
     /// server listens on this port and exposes `/metrics` in Prometheus text
     /// exposition format. When `None`, no metrics server is started.
-    /// Configurable via `TDB_SEARCH_PROMETHEUS_PORT`; default None (disabled).
+    /// Configurable via `VECTORLINK_PROMETHEUS_PORT`; default None (disabled).
     pub prometheus_port: Option<u16>,
     /// Lance index cache capacity in bytes. Controls how much RAM Lance uses
     /// to cache vector index data for fast ANN queries. Lance's own default is
     /// 6 GiB; we use 2 GiB as a balanced default for typical deployments.
-    /// Configurable via `TDB_SEARCH_LANCE_INDEX_CACHE_BYTES`; default 2 GiB.
+    /// Configurable via `VECTORLINK_LANCE_INDEX_CACHE_BYTES`; default 2 GiB.
     pub lance_index_cache_bytes: usize,
     /// Lance metadata cache capacity in bytes. Controls how much RAM Lance
     /// uses to cache dataset metadata (manifests, fragment info). Lance's own
     /// default is 1 GiB; we use 512 MiB as a balanced default.
-    /// Configurable via `TDB_SEARCH_LANCE_METADATA_CACHE_BYTES`; default 512 MiB.
+    /// Configurable via `VECTORLINK_LANCE_METADATA_CACHE_BYTES`; default 512 MiB.
     pub lance_metadata_cache_bytes: usize,
 }
 
 impl Config {
     /// Load configuration from environment variables with defaults.
     pub fn from_env() -> Self {
-        let provider_str = std::env::var("TDB_SEARCH_EMBED_PROVIDER")
+        let provider_str = std::env::var("VECTORLINK_EMBED_PROVIDER")
             .unwrap_or_else(|_| "openai_compatible".to_owned());
-        let embed_url = std::env::var("TDB_SEARCH_EMBED_URL")
+        let embed_url = std::env::var("VECTORLINK_EMBED_URL")
             .unwrap_or_else(|_| "http://localhost:11434".to_owned());
-        let model = std::env::var("TDB_SEARCH_MODEL")
+        let model = std::env::var("VECTORLINK_MODEL")
             .unwrap_or_else(|_| "nomic-embed-text-v2-moe".to_owned());
-        let dim: usize = std::env::var("TDB_SEARCH_DIM")
+        let dim: usize = std::env::var("VECTORLINK_DIM")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(768);
@@ -175,7 +175,7 @@ impl Config {
             },
         };
 
-        let embed_batch_size: usize = std::env::var("TDB_SEARCH_EMBED_BATCH_SIZE")
+        let embed_batch_size: usize = std::env::var("VECTORLINK_EMBED_BATCH_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_EMBED_BATCH_SIZE);
@@ -184,37 +184,37 @@ impl Config {
         // Surface the misconfiguration immediately with a clear diagnostic.
         assert!(
             embed_batch_size > 0,
-            "TDB_SEARCH_EMBED_BATCH_SIZE must be >= 1, got 0 (check environment)"
+            "VECTORLINK_EMBED_BATCH_SIZE must be >= 1, got 0 (check environment)"
         );
 
         Self {
-            admin_user: std::env::var("TDB_SEARCH_ADMIN_USER")
+            admin_user: std::env::var("VECTORLINK_ADMIN_USER")
                 .unwrap_or_else(|_| "admin".to_owned()),
-            admin_secret: std::env::var("TDB_SEARCH_ADMIN_SECRET")
+            admin_secret: std::env::var("VECTORLINK_ADMIN_SECRET")
                 .unwrap_or_else(|_| "root".to_owned()),
-            port: std::env::var("TDB_SEARCH_PORT")
+            port: std::env::var("VECTORLINK_PORT")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8080),
             embed_provider,
-            data_dir: std::env::var("TDB_SEARCH_DATA_DIR")
+            data_dir: std::env::var("VECTORLINK_DATA_DIR")
                 .unwrap_or_else(|_| "/data".to_owned()),
-            tokenizer_path: std::env::var("TDB_SEARCH_TOKENIZER_PATH")
+            tokenizer_path: std::env::var("VECTORLINK_TOKENIZER_PATH")
                 .unwrap_or_else(|_| "/data/tokenizer.json.bz2".to_owned()),
             embed_batch_size,
-            embed_cache_size: match std::env::var("TDB_SEARCH_EMBED_CACHE_SIZE") {
+            embed_cache_size: match std::env::var("VECTORLINK_EMBED_CACHE_SIZE") {
                 Ok(s) if s.eq_ignore_ascii_case("none") => None,
                 Ok(s) => Some(s.parse::<usize>().unwrap_or(20_000)),
                 Err(_) => Some(20_000),
             },
-            prometheus_port: std::env::var("TDB_SEARCH_PROMETHEUS_PORT")
+            prometheus_port: std::env::var("VECTORLINK_PROMETHEUS_PORT")
                 .ok()
                 .and_then(|s| s.parse::<u16>().ok()),
-            lance_index_cache_bytes: std::env::var("TDB_SEARCH_LANCE_INDEX_CACHE_BYTES")
+            lance_index_cache_bytes: std::env::var("VECTORLINK_LANCE_INDEX_CACHE_BYTES")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(2 * 1024 * 1024 * 1024),
-            lance_metadata_cache_bytes: std::env::var("TDB_SEARCH_LANCE_METADATA_CACHE_BYTES")
+            lance_metadata_cache_bytes: std::env::var("VECTORLINK_LANCE_METADATA_CACHE_BYTES")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(512 * 1024 * 1024),
@@ -232,7 +232,7 @@ impl Config {
                 model: "nomic-embed-text-v2-moe".to_owned(),
                 dim: 768,
             },
-            data_dir: "/tmp/tdb-search-test".to_owned(),
+            data_dir: "/tmp/vectorlink-test".to_owned(),
             tokenizer_path: "assets/tokenizer.json.bz2".to_owned(),
             embed_batch_size: DEFAULT_EMBED_BATCH_SIZE,
             embed_cache_size: None,
@@ -254,7 +254,7 @@ impl Default for Config {
                 model: "nomic-embed-text-v2-moe".to_owned(),
                 dim: 768,
             },
-            data_dir: "/tmp/tdb-search-test".to_owned(),
+            data_dir: "/tmp/vectorlink-test".to_owned(),
             tokenizer_path: "assets/tokenizer.json.bz2".to_owned(),
             embed_batch_size: DEFAULT_EMBED_BATCH_SIZE,
             embed_cache_size: None,

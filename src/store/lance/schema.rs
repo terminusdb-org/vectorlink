@@ -111,7 +111,7 @@ pub struct ChunkHit {
 /// the Lance dataset's native default branch.
 pub const MAIN_BRANCH: &str = "main";
 
-/// Reserved prefix for internal tdb-search branches. The `.-` namespace is
+/// Reserved prefix for internal vectorlink branches. The `.-` namespace is
 /// reserved for internal use and must not be accepted from external requests
 /// (push, search, compact, etc.).
 pub const RESERVED_PREFIX: &str = ".-";
@@ -135,7 +135,7 @@ pub fn is_compact_rebuild_branch(branch: &str) -> bool {
 }
 
 /// Check whether a branch name is in the reserved `.-` namespace.
-/// Branch names starting with `.-` are internal to tdb-search and must not
+/// Branch names starting with `.-` are internal to vectorlink and must not
 /// be accepted from external requests.
 pub fn is_reserved_branch_name(branch: &str) -> bool {
     branch.starts_with(RESERVED_PREFIX)

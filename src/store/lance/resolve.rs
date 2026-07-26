@@ -28,14 +28,14 @@ use super::search::{build_filter_expr, extract_embedding_row};
 // ────────────────────────────────────────────────────────────────────────────
 // Performance markers — cheap Instant::now() timing for pipeline diagnosis.
 // Left in production code; guarded by RESOLVE_PERF env var (zero cost when off).
-// Enable: `TDB_SEARCH_RESOLVE_PERF=1`
+// Enable: `VECTORLINK_RESOLVE_PERF=1`
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Returns true when resolve performance markers are enabled.
 /// Checked once per call (branch-predicted constant after first check).
 fn perf_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("TDB_SEARCH_RESOLVE_PERF").is_ok())
+    *ENABLED.get_or_init(|| std::env::var("VECTORLINK_RESOLVE_PERF").is_ok())
 }
 
 /// Emit a performance marker to stderr (cheap, no allocation when disabled).
