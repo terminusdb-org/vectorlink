@@ -9,11 +9,11 @@
 #   push tag v1.2.3-* -> :v1.2.3-rc1 (prerelease: NO :latest, NO major)
 #   workflow_dispatch  -> same as the triggering ref
 #
-# REGISTRY: ghcr.io/dfrnt-com/tdb-search
+# REGISTRY: ghcr.io/terminusdb-org/vectorlink
 # AUTH: GITHUB_TOKEN (no external secrets required)
 #
 # Required repo settings:
-#   - Package visibility: ensure ghcr.io/dfrnt-com/tdb-search is accessible
+#   - Package visibility: ensure ghcr.io/terminusdb-org/vectorlink is accessible
 #   - GITHUB_TOKEN permissions: packages:write is declared below (no PAT needed)
 
 name: Publish (AMD64, ARM64)
@@ -30,7 +30,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ghcr.io/dfrnt-com/tdb-search
+  IMAGE_NAME: ghcr.io/terminusdb-org/vectorlink
 
 jobs:
   # ─── Per-arch builds ─────────────────────────────────────────────────────────
@@ -64,8 +64,8 @@ jobs:
       - name: Load and push AMD64 image
         run: |
           docker load < tdb-search-amd64.tar.gz
-          docker tag ghcr.io/dfrnt-com/tdb-search:local ghcr.io/dfrnt-com/tdb-search:dev-amd64-${{ github.sha }}
-          docker push ghcr.io/dfrnt-com/tdb-search:dev-amd64-${{ github.sha }}
+          docker tag ghcr.io/terminusdb-org/vectorlink:local ghcr.io/terminusdb-org/vectorlink:dev-amd64-${{ github.sha }}
+          docker push ghcr.io/terminusdb-org/vectorlink:dev-amd64-${{ github.sha }}
 
   # ─── Push ARM64 ─────────────────────────────────────────────────────────────
   publish_arm64:
@@ -91,8 +91,8 @@ jobs:
       - name: Load and push ARM64 image
         run: |
           docker load < tdb-search-arm64.tar.gz
-          docker tag ghcr.io/dfrnt-com/tdb-search:local ghcr.io/dfrnt-com/tdb-search:dev-arm64-${{ github.sha }}
-          docker push ghcr.io/dfrnt-com/tdb-search:dev-arm64-${{ github.sha }}
+          docker tag ghcr.io/terminusdb-org/vectorlink:local ghcr.io/terminusdb-org/vectorlink:dev-arm64-${{ github.sha }}
+          docker push ghcr.io/terminusdb-org/vectorlink:dev-arm64-${{ github.sha }}
 
   # ─── Create multi-arch manifest ─────────────────────────────────────────────
   create_manifest:

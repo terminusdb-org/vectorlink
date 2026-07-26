@@ -26,7 +26,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          tags: ghcr.io/dfrnt-com/tdb-search:local
+          tags: ghcr.io/terminusdb-org/vectorlink:local
           outputs: type=docker,dest=tdb-search-amd64.tar
           cache-from: type=gha
           cache-to: type=gha,mode=max

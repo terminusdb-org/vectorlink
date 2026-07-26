@@ -21,12 +21,12 @@ jobs:
       - name: Build Docker image
         run: |
           docker build \
-            -t ghcr.io/dfrnt-com/tdb-search:local \
+            -t ghcr.io/terminusdb-org/vectorlink:local \
             -f ./Dockerfile \
             .
 
       - name: Save and compress image
-        run: docker save ghcr.io/dfrnt-com/tdb-search:local | gzip > tdb-search-arm64.tar.gz
+        run: docker save ghcr.io/terminusdb-org/vectorlink:local | gzip > tdb-search-arm64.tar.gz
 
       - name: Upload Docker image artifact
         uses: actions/upload-artifact@v4
