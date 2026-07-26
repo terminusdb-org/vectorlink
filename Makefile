@@ -1,4 +1,4 @@
-# tdb-search — verification & build orchestration.
+# vectorlink — verification & build orchestration.
 #
 # Conventions adopted from the TerminusDB repo Makefile (lint / clippy /
 # lint-openapi / test / pr aggregate gate) so the two projects feel the same.
@@ -24,7 +24,7 @@ CARGO_MANIFEST  := Cargo.toml
 # ─────────────────────────────── help ────────────────────────────────────
 .PHONY: help
 help:
-	@echo "tdb-search — make targets"
+	@echo "vectorlink — make targets"
 	@echo ""
 	@echo "  make dev              Incremental DEBUG build (fast iteration)"
 	@echo "  make dev-image        Assemble dev container from debug binary (seconds)"
@@ -41,7 +41,7 @@ help:
 	@echo "  make verify           lint + test (no side effects)"
 	@echo "  make pr               Full pre-PR gate: lint + test + release build + docs"
 	@echo "  make pr-light         Pre-PR gate without release build (fast, no Rust recompile)"
-	@echo "  make server-start     Start tdb-search (7372) + TerminusDB (7373)"
+	@echo "  make server-start     Start vectorlink (7372) + TerminusDB (7373)"
 	@echo "  make server-stop      Stop both test servers"
 	@echo "  make server-restart   Restart both test servers"
 	@echo "  make server-clean     Stop, wipe storage, and start fresh"
@@ -74,9 +74,9 @@ lint-openapi:
 # pre-baked. No apt-at-runtime, no GPG workarounds.
 # TARGET_VOLUME: Docker volume for target/ (avoids virtiofs execute-bit issues on Lima,
 # and provides fast overlay-backed I/O for incremental builds).
-CARGO_VOLUME := tdb-search-cargo
-TARGET_VOLUME := tdb-search-target
-BUILD_IMAGE  := tdb-search-build:local
+CARGO_VOLUME := vectorlink-cargo
+TARGET_VOLUME := vectorlink-target
+BUILD_IMAGE  := vectorlink-build:local
 
 # Run containers as the host user so bind-mounted files are owned correctly.
 # CARGO_HOME=/cargo-registry maps to the named cargo volume mount point.
@@ -115,7 +115,7 @@ clippy:
 # BINARIES: the crate's two bin targets, copied to the host target/ after a
 # build so artifacts land where developers expect (the build itself runs
 # against the named volume for Lima speed; see copy-binaries below).
-BINARIES := tdb-search tdb-search-load
+BINARIES := vectorlink vectorlink-load
 
 # copy-binaries: copy built bin artifacts from the named target VOLUME out to
 # the host ./target/$(PROFILE_DIR)/ so they are visible on the host. The build
@@ -156,12 +156,12 @@ dev:
 # binary. Strips debug symbols for the container copy (1.2GB → ~30MB) while
 # keeping the full debug binary on host for local debugging/backtraces.
 # This is a simple COPY into debian:trixie-slim — no cargo build runs inside
-# the image. Requires target/debug/tdb-search to exist (run `make dev` first,
+# the image. Requires target/debug/vectorlink to exist (run `make dev` first,
 # or use `make dev-up` which chains both). Assembles in ~5 seconds.
 .PHONY: dev-image
 dev-image:
-	@if [ ! -f target/debug/tdb-search ]; then \
-		echo "ERROR: target/debug/tdb-search not found. Run 'make dev' first." >&2 ; \
+	@if [ ! -f target/debug/vectorlink ]; then \
+		echo "ERROR: target/debug/vectorlink not found. Run 'make dev' first." >&2 ; \
 		exit 1 ; \
 	fi
 	@echo "→ stripping debug binary for container (host copy unchanged)"
@@ -169,13 +169,13 @@ dev-image:
 		--user "$$(id -u):$$(id -g)" \
 		-v "$$(pwd)/target/debug":/host \
 		$(BUILD_IMAGE) \
-		bash -c 'cp /host/tdb-search /host/tdb-search-stripped && strip /host/tdb-search-stripped'
-	docker build -f Dockerfile.dev -t tdb-search:dev .
+		bash -c 'cp /host/vectorlink /host/vectorlink-stripped && strip /host/vectorlink-stripped'
+	docker build -f Dockerfile.dev -t vectorlink:dev .
 
 # dev-up: the full edit-run cycle in one command. Builds the debug binary
 # (incremental, seconds), assembles the dev container image, and brings up
 # the compose stack. The compose override (docker-compose.override.yml) points
-# tdb-search at Dockerfile.dev so `docker compose up --build` also works after
+# vectorlink at Dockerfile.dev so `docker compose up --build` also works after
 # `make dev` has produced the binary.
 #
 # WARNING: debug builds are ~80x SLOWER for compute-heavy paths (flat-KNN in
@@ -183,16 +183,16 @@ dev-image:
 # testing or benchmarking, use `make dev-up-release` instead.
 .PHONY: dev-up
 dev-up: dev dev-image
-	docker compose up -d tdb-search
+	docker compose up -d vectorlink
 
 # dev-up-release: same as dev-up but uses the RELEASE binary (optimised SIMD).
 # Slower to build (~45s incremental vs ~5s) but 80x faster at runtime for
 # vector compute paths. Use for: benchmarking, /resolve testing, E2E timing.
 .PHONY: dev-up-release
 dev-up-release: build
-	@cp target/release/tdb-search target/debug/tdb-search-stripped
-	docker build -f Dockerfile.dev -t tdb-search:dev .
-	docker compose up -d tdb-search
+	@cp target/release/vectorlink target/debug/vectorlink-stripped
+	docker build -f Dockerfile.dev -t vectorlink:dev .
+	docker compose up -d vectorlink
 
 # build: RELEASE build (no LTO). Fast enough for `make pr` gate
 # (incremental relinks). LTO only in `make release-image` (production publish).
@@ -229,7 +229,7 @@ test:
 		echo "• test skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
 
-# Integration tests (mocha) against a LIVE tdb-search server. The server and
+# Integration tests (mocha) against a LIVE vectorlink server. The server and
 # Ollama must already be running — this target only runs the test suite.
 # Set TDB_SEARCH_URL to point at a non-default endpoint (default: localhost:7372).
 # Part of the `pr` gate.
@@ -244,9 +244,9 @@ test-integration:
 		echo "• integration tests skipped — no $(CARGO_MANIFEST) yet" ; \
 	fi
 
-# E2e tests (mocha) — require BOTH tdb-search (7372) and TerminusDB (7373)
+# E2e tests (mocha) — require BOTH vectorlink (7372) and TerminusDB (7373)
 # to be running. These tests exercise the TerminusDB plugin endpoints that
-# proxy to tdb-search. NOT part of the `pr` gate (run separately).
+# proxy to vectorlink. NOT part of the `pr` gate (run separately).
 # Use `make server-start` to start both servers.
 .PHONY: test-e2e
 test-e2e:
@@ -297,29 +297,29 @@ pr: pr-light build
 	@echo "✓ PR gate passed — review $(DOCS_OUT), then commit (GPG-signed)"
 
 # ──────────────────────── test server ────────────────────────────────────
-# Manage the local test stack: tdb-search (7372) + TerminusDB (7373).
-# Delegates to tests/tdb-search-server.sh which handles both servers.
+# Manage the local test stack: vectorlink (7372) + TerminusDB (7373).
+# Delegates to tests/vectorlink-server.sh which handles both servers.
 .PHONY: server-start
 server-start:
-	tests/tdb-search-server.sh start
+	tests/vectorlink-server.sh start
 
 .PHONY: server-stop
 server-stop:
-	tests/tdb-search-server.sh stop
+	tests/vectorlink-server.sh stop
 
 .PHONY: server-restart
 server-restart:
-	tests/tdb-search-server.sh restart
+	tests/vectorlink-server.sh restart
 
 .PHONY: server-status
 server-status:
-	tests/tdb-search-server.sh status
+	tests/vectorlink-server.sh status
 
 .PHONY: server-clean
 server-clean:
-	tests/tdb-search-server.sh stop
-	rm -rf /tmp/tdb-search-data
-	@if [ -n "$$(tests/tdb-search-server.sh status 2>/dev/null | grep -o 'TerminusDB repo not found')" ]; then \
+	tests/vectorlink-server.sh stop
+	rm -rf /tmp/vectorlink-data
+	@if [ -n "$$(tests/vectorlink-server.sh status 2>/dev/null | grep -o 'TerminusDB repo not found')" ]; then \
 		echo "• TerminusDB storage clean skipped — repo not found" ; \
 	else \
 		TDB_ROOT="$$(cd "$$(pwd)/../terminusdb" 2>/dev/null && pwd)" ; \
@@ -327,7 +327,7 @@ server-clean:
 			"$$TDB_ROOT/tests/terminusdb-test-server.sh" clean ; \
 		fi ; \
 	fi
-	tests/tdb-search-server.sh start
+	tests/vectorlink-server.sh start
 
 # ──────────────────────── container image ────────────────────────────────
 # Build the dev/CI container image with all deps pre-baked. No apt-at-runtime.

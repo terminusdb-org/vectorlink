@@ -5,12 +5,12 @@
 
 const supertest = require("supertest")
 
-const BASE_URL = process.env.TDB_SEARCH_URL || "http://localhost:7372"
-const ADMIN_USER = process.env.TDB_SEARCH_ADMIN_USER || "admin"
-const ADMIN_SECRET = process.env.TDB_SEARCH_ADMIN_SECRET || "root"
+const BASE_URL = process.env.VECTORLINK_URL || "http://localhost:7372"
+const ADMIN_USER = process.env.VECTORLINK_ADMIN_USER || "admin"
+const ADMIN_SECRET = process.env.VECTORLINK_ADMIN_SECRET || "root"
 
 /**
- * Create an authenticated supertest agent for tdb-search.
+ * Create an authenticated supertest agent for vectorlink.
  */
 function agent () {
   return supertest(BASE_URL)

@@ -3,11 +3,11 @@
 
 #![forbid(unsafe_code)]
 
-//! tdb-search load — offline indexing CLI.
+//! vectorlink load — offline indexing CLI.
 //!
 //! Reads an NDJSON file and runs the same chunk→embed→store→tag pipeline as /push.
 //! Usage:
-//!   tdb-search-load --directory D --domain org/db --commit C \
+//!   vectorlink-load --directory D --domain org/db --commit C \
 //!                   [--previous P] [--branch B] --input ops.jsonl
 //!
 //! Same failure modes as /push: malformed NDJSON halts; Operation::Error skips
@@ -16,12 +16,12 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use tdb_search::chunk;
-use tdb_search::embed::{self, EmbeddingRole};
-use tdb_search::ingest;
-use tdb_search::kernel::distance::l2_normalize;
-use tdb_search::kernel::model::Operation;
-use tdb_search::store::lance::{ChunkRow, LanceStore};
+use vectorlink::chunk;
+use vectorlink::embed::{self, EmbeddingRole};
+use vectorlink::ingest;
+use vectorlink::kernel::distance::l2_normalize;
+use vectorlink::kernel::model::Operation;
+use vectorlink::store::lance::{ChunkRow, LanceStore};
 
 /// Parsed CLI arguments.
 struct LoadArgs {
@@ -90,15 +90,15 @@ fn parse_args() -> Result<LoadArgs, String> {
     let commit = commit.ok_or("--commit is required")?;
     let input = input.ok_or("--input is required")?;
 
-    let embed_url = std::env::var("TDB_SEARCH_EMBED_URL")
+    let embed_url = std::env::var("VECTORLINK_EMBED_URL")
         .unwrap_or_else(|_| "http://localhost:11434".to_owned());
-    let model = std::env::var("TDB_SEARCH_MODEL")
+    let model = std::env::var("VECTORLINK_MODEL")
         .unwrap_or_else(|_| "nomic-embed-text-v2-moe".to_owned());
-    let dim: usize = std::env::var("TDB_SEARCH_DIM")
+    let dim: usize = std::env::var("VECTORLINK_DIM")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(768);
-    let tokenizer_path = std::env::var("TDB_SEARCH_TOKENIZER_PATH")
+    let tokenizer_path = std::env::var("VECTORLINK_TOKENIZER_PATH")
         .unwrap_or_else(|_| "assets/tokenizer.json.bz2".to_owned());
 
     Ok(LoadArgs {
@@ -116,15 +116,15 @@ fn parse_args() -> Result<LoadArgs, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: tdb-search-load --directory D --domain org/db --commit C [--previous P] [--branch B] --input ops.jsonl\n\
+        "Usage: vectorlink-load --directory D --domain org/db --commit C [--previous P] [--branch B] --input ops.jsonl\n\
          \n\
          Offline indexing CLI. Runs the same pipeline as /push.\n\
          \n\
          Environment variables:\n\
-         TDB_SEARCH_EMBED_URL       Embedding endpoint (default: http://localhost:11434)\n\
-         TDB_SEARCH_MODEL           Model name (default: nomic-embed-text-v2-moe)\n\
-         TDB_SEARCH_DIM             Embedding dimension (default: 768)\n\
-         TDB_SEARCH_TOKENIZER_PATH  Path to tokenizer.json.bz2"
+         VECTORLINK_EMBED_URL       Embedding endpoint (default: http://localhost:11434)\n\
+         VECTORLINK_MODEL           Model name (default: nomic-embed-text-v2-moe)\n\
+         VECTORLINK_DIM             Embedding dimension (default: 768)\n\
+         VECTORLINK_TOKENIZER_PATH  Path to tokenizer.json.bz2"
     );
 }
 

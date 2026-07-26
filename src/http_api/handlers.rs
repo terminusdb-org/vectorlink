@@ -340,7 +340,7 @@ fn validate_pagination(start: Option<i64>, count: Option<i64>) -> Result<(), Res
 }
 
 /// Validate that a branch name is not a reserved internal compaction branch.
-/// Branch names starting with `.-compact_rebuild_` are internal to tdb-search
+/// Branch names starting with `.-compact_rebuild_` are internal to vectorlink
 /// (used by delta-fork retagging during compaction) and must not be accepted
 /// from external requests. Accepting them would allow a malicious user to
 /// create branches that collide with internal compaction branches, causing

@@ -56,7 +56,7 @@ impl VectorIndexConfig {
     /// Panics if `dim == 0`. This is called at service startup; a zero-dim
     /// embedding is a configuration error that must fail loud at boot.
     pub fn default_for_dim(dim: usize) -> Self {
-        assert!(dim > 0, "embedding dimension must be > 0 (check TDB_SEARCH_DIM)");
+        assert!(dim > 0, "embedding dimension must be > 0 (check VECTORLINK_DIM)");
         // dim is used to validate the caller's intent; SQ doesn't need
         // per-dimension configuration beyond ensuring non-zero.
         let _ = dim;
