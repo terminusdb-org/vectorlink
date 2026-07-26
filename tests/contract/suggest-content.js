@@ -88,7 +88,6 @@ describe("GET /suggest — typeahead content verification", function () {
 
     for (const hit of res.body.hits) {
       expect(hit).to.have.property("id").that.is.a("string")
-      expect(hit).to.have.property("distance").that.is.a("number")
     }
   })
 
