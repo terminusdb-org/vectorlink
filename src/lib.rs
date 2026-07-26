@@ -1,7 +1,18 @@
-pub mod embedding;
-pub mod indexer;
-pub mod ollama;
-pub mod openai;
-pub mod server;
-pub mod vecmath;
-pub mod vectors;
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 DFRNT AB
+
+#![forbid(unsafe_code)]
+
+//! tdb-search library — shared modules for server and CLI binaries.
+
+pub mod chunk;
+pub mod config;
+pub mod embed;
+pub mod http_api;
+pub mod ingest;
+pub mod kernel;
+pub mod layeridx;
+pub mod metrics;
+pub mod resolve;
+pub mod service;
+pub mod store;

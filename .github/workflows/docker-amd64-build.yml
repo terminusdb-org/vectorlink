@@ -1,0 +1,42 @@
+# Native AMD64 Docker image build for tdb-search.
+#
+# Builds the production Dockerfile on ubuntu-latest (amd64), saves the image
+# as a gzipped tarball artifact for the publish workflow to consume.
+
+name: AMD64 Image Build
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  amd64_build:
+    name: Build (amd64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: ghcr.io/dfrnt-com/tdb-search:local
+          outputs: type=docker,dest=tdb-search-amd64.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Compress image
+        run: gzip tdb-search-amd64.tar
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdb-search-amd64
+          path: tdb-search-amd64.tar.gz
+          retention-days: 1

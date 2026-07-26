@@ -1,26 +1,123 @@
-version: "3"
+# tdb-search self-contained stack (3-service, CPU-only).
+#
+# Canonical deployment: terminusdb + tdb-search + embeddings (Ollama).
+# No external network dependency after the one-time model pull.
+# The embedding sidecar is Ollama serving nomic-embed-text-v2-moe (Q8_0 GGUF).
+#
+# TerminusDB build-from-source notes:
+#   The canonical path builds TerminusDB from the sibling submodule (../terminusdb/).
+#   This is a HEAVY build (SWI-Prolog + Rust/Cargo): ~15-30 min first time, ~5 min
+#   incremental. Requires >= 12 GB free Docker filesystem space. If the build OOMs
+#   or disk-fills: `docker builder prune` and ensure /mnt/lima-colima has >= 12 GB.
+#
+#   FALLBACK (pre-built image, for quick iteration when NOT modifying TerminusDB):
+#   Replace the `build:` block on the terminusdb service with:
+#     image: terminusdb/terminusdb-server:latest
+#     pull_policy: missing
 
 services:
+  # TerminusDB — renders embedding text, pushes deltas to the indexer, fronts search.
+  # Built from source (../terminusdb submodule) so Phase 6 can modify internals.
   terminusdb:
-    image: terminusdb/terminusdb-server:dev
-    container_name: terminusdb-server
-    tty: true
-    ports:
-      - 6363:6363
+    build:
+      context: ../terminusdb
+      dockerfile: Dockerfile
+      args:
+        SKIP_TESTS: "true"
+        SWIPL_VERSION: "10.0.1"
+    image: terminusdb/terminusdb-server:local
     environment:
       - TERMINUSDB_SERVER_PORT=6363
-      - TERMINUSDB_INSECURE_USER_HEADER=X-User-Forward
-      - TERMINUSDB_INSECURE_USER_HEADER_ENABLED=true
-    volumes:
-      - ./storage:/app/terminusdb/storage
-  semantic_indexer:
-    build: .
+      - "TERMINUSDB_ADMIN_PASS=${TERMINUSDB_ADMIN_PASS:-root}"
+      - TERMINUSDB_INDEXER_BACKEND=http_tdb_search
+      - TERMINUSDB_TDB_SEARCH_ENDPOINT=http://tdb-search:8080
     ports:
-      - "8080:8080"
-    environment:
-      - TERMINUSDB_CONTENT_ENDPOINT=http://terminusdb:6363
-      - TERMINUSDB_USER_FORWARD_HEADER=X-User-Forward
-      - OPENAI_KEY=${OPENAI_KEY}
+      # Host 6363/6364 commonly taken by a dev TerminusDB; use 6365.
+      - "127.0.0.1:6365:6363"
     volumes:
-      - ./vector_storage:/app/storage
-    command: ["./terminusdb-semantic-indexer", "serve", "--directory", "/app/storage", "--size", "${BUFFER_AMOUNT}"]
+      - terminusdb-storage:/app/terminusdb/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/6363 && echo -e \"GET /api/info HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3 && timeout 2 grep -q api:success <&3'"]
+      interval: 60s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # Ollama embedding sidecar — serves nomic-embed-text-v2-moe via /v1/embeddings.
+  # CPU-only (no GPU required). The model is created on first start via the init service.
+  embeddings:
+    image: ollama/ollama:latest
+    pull_policy: missing
+    environment:
+      # Keep the model resident indefinitely (never unload on idle). Eliminates
+      # the cold-load penalty on every push/bench after an idle gap. Trade-off:
+      # the model stays in RAM (~0.7-1.5 GiB for nomic-embed-v2 Q8_0) at all times.
+      - OLLAMA_KEEP_ALIVE=60m
+    #ports:
+    #  - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  # One-shot init: pull the nomic model if not already present.
+  embeddings-init:
+    image: ollama/ollama:latest
+    pull_policy: missing
+    depends_on:
+      embeddings:
+        condition: service_healthy
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      - OLLAMA_HOST=http://embeddings:11434
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        ollama pull hf.co/nomic-ai/nomic-embed-text-v2-moe-GGUF:Q8_0 || true
+        ollama cp hf.co/nomic-ai/nomic-embed-text-v2-moe-GGUF:Q8_0 nomic-embed-v2 2>/dev/null || true
+        echo "Model ready."
+    restart: "no"
+
+  # tdb-search indexer — the search engine itself.
+  tdb-search:
+    build: .
+    environment:
+      - TDB_SEARCH_ADMIN_USER=admin
+      - "TDB_SEARCH_ADMIN_SECRET=${TDB_SEARCH_ADMIN_SECRET:-root}"
+      - TDB_SEARCH_EMBED_PROVIDER=openai_compatible
+      - TDB_SEARCH_EMBED_URL=http://embeddings:11434
+      - TDB_SEARCH_MODEL=nomic-embed-v2
+      - TDB_SEARCH_DIM=768
+      - TDB_SEARCH_DATA_DIR=/data
+      - TDB_SEARCH_EMBED_CACHE_SIZE=3000000
+      - TDB_SEARCH_TOKENIZER_PATH=/opt/tdb-search/tokenizer.json.bz2
+      - TDB_SEARCH_PROMETHEUS_PORT=9090
+    ports:
+      - "127.0.0.1:8081:8080"
+      - "127.0.0.1:9091:9090"
+    volumes:
+      - tdb-search-data:/data
+    depends_on:
+      terminusdb:
+        condition: service_healthy
+      embeddings:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8080 && echo -e \"GET /health/live HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3 && timeout 2 grep -q 200 <&3'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  terminusdb-storage:
+  ollama-models:
+  tdb-search-data:
