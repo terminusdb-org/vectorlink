@@ -4,14 +4,14 @@
 # Self-contained so `make pr` can gate on integration tests with no manual setup.
 set -euo pipefail
 
-CARGO_VOLUME="${CARGO_VOLUME:-tdb-search-cargo}"
-BUILD_IMAGE="${BUILD_IMAGE:-tdb-search-build:local}"
-CONTAINER="tdb-search-itest-$$"
-NETWORK="tdb-search-itest-net-$$"
+CARGO_VOLUME="${CARGO_VOLUME:-vectorlink-cargo}"
+BUILD_IMAGE="${BUILD_IMAGE:-vectorlink-build:local}"
+CONTAINER="vectorlink-itest-$$"
+NETWORK="vectorlink-itest-net-$$"
 HOST_PORT="${HOST_PORT:-8089}"
-EMBED_CONTAINER="tdb-search-itest-embed-$$"
-EMBED_MODEL="${TDB_SEARCH_MODEL:-nomic-embed-text-v2-moe}"
-EMBED_DIM="${TDB_SEARCH_DIM:-768}"
+EMBED_CONTAINER="vectorlink-itest-embed-$$"
+EMBED_MODEL="${VECTORLINK_MODEL:-nomic-embed-text-v2-moe}"
+EMBED_DIM="${VECTORLINK_DIM:-768}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
@@ -33,15 +33,15 @@ docker network create "$NETWORK" >/dev/null 2>&1 || true
 BUILD_PROFILE="${BUILD_PROFILE:-debug}"
 if [ "$BUILD_PROFILE" = "release" ]; then
   CARGO_BUILD_FLAGS="--release"
-  BINARY_PATH="/work/target/release/tdb-search"
+  BINARY_PATH="/work/target/release/vectorlink"
   echo "→ building RELEASE binary in $BUILD_IMAGE"
 else
   CARGO_BUILD_FLAGS=""
-  BINARY_PATH="/work/target/debug/tdb-search"
+  BINARY_PATH="/work/target/debug/vectorlink"
   echo "→ building DEBUG binary in $BUILD_IMAGE (incremental, fast iteration)"
 fi
 
-TARGET_VOLUME="${TARGET_VOLUME:-tdb-search-target}"
+TARGET_VOLUME="${TARGET_VOLUME:-vectorlink-target}"
 docker run --rm \
   --user "$HOST_UID:$HOST_GID" \
   -e HOME=/tmp/build-home \
@@ -54,13 +54,13 @@ docker run --rm \
 
 echo "→ starting Ollama embeddings sidecar"
 # Check if there's already an Ollama with the model available on the compose stack.
-# If tdb-search-embeddings-1 is running, connect the engine to its network directly.
+# If vectorlink-embeddings-1 is running, connect the engine to its network directly.
 OLLAMA_URL=""
 EXTRA_DOCKER_ARGS=""
-EMBED_NET=$(docker inspect tdb-search-embeddings-1 --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null || true)
+EMBED_NET=$(docker inspect vectorlink-embeddings-1 --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null || true)
 if [ -n "$EMBED_NET" ] && curl -fsS "http://localhost:11434/api/tags" >/dev/null 2>&1; then
   echo "  (reusing compose Ollama on network $EMBED_NET)"
-  OLLAMA_URL="http://tdb-search-embeddings-1:11434"
+  OLLAMA_URL="http://vectorlink-embeddings-1:11434"
 elif curl -fsS "http://localhost:11434/api/tags" >/dev/null 2>&1; then
   echo "  (reusing host Ollama at localhost:11434)"
   OLLAMA_URL="http://host.docker.internal:11434"
@@ -70,7 +70,7 @@ else
   echo "  (no Ollama found; starting a fresh one)"
   docker run -d --name "$EMBED_CONTAINER" \
     --network "$NETWORK" \
-    -v tdb-search-ollama-itest:/root/.ollama \
+    -v vectorlink-ollama-itest:/root/.ollama \
     ollama/ollama:latest >/dev/null
 
   # Wait for Ollama to come up.
@@ -101,14 +101,14 @@ docker run -d --name "$CONTAINER" \
   -v "$TARGET_VOLUME":/work/target \
   -w /work \
   -p "$HOST_PORT":8080 \
-  -e TDB_SEARCH_ADMIN_USER=admin \
-  -e TDB_SEARCH_ADMIN_SECRET=root \
-  -e TDB_SEARCH_EMBED_PROVIDER=openai_compatible \
-  -e "TDB_SEARCH_EMBED_URL=$OLLAMA_URL" \
-  -e "TDB_SEARCH_MODEL=$EMBED_MODEL" \
-  -e "TDB_SEARCH_DIM=$EMBED_DIM" \
-  -e TDB_SEARCH_DATA_DIR=/tmp/tdb-search-itest-data \
-  -e TDB_SEARCH_TOKENIZER_PATH=/work/spikes/tokenizer/tokenizer.json \
+  -e VECTORLINK_ADMIN_USER=admin \
+  -e VECTORLINK_ADMIN_SECRET=root \
+  -e VECTORLINK_EMBED_PROVIDER=openai_compatible \
+  -e "VECTORLINK_EMBED_URL=$OLLAMA_URL" \
+  -e "VECTORLINK_MODEL=$EMBED_MODEL" \
+  -e "VECTORLINK_DIM=$EMBED_DIM" \
+  -e VECTORLINK_DATA_DIR=/tmp/vectorlink-itest-data \
+  -e VECTORLINK_TOKENIZER_PATH=/work/spikes/tokenizer/tokenizer.json \
   "$BUILD_IMAGE" "$BINARY_PATH" >/dev/null
 
 # If using a fresh Ollama on the test network, also connect the engine there.
@@ -132,13 +132,13 @@ fi
 echo "  engine live at http://localhost:$HOST_PORT"
 
 echo "→ running mocha integration suite against http://localhost:$HOST_PORT"
-# TDB_SEARCH_ITEST_CONTAINER lets the restart-invariant test (P3-LAG-4) genuinely
+# VECTORLINK_ITEST_CONTAINER lets the restart-invariant test (P3-LAG-4) genuinely
 # `docker restart` this engine to prove durable index state survives a restart.
 # `docker restart` preserves the container's writable layer (where
-# TDB_SEARCH_DATA_DIR=/tmp/tdb-search-itest-data lives), so the Lance tags persist
+# VECTORLINK_DATA_DIR=/tmp/vectorlink-itest-data lives), so the Lance tags persist
 # across the restart while the in-memory state is reset — the exact restart effect.
-TDB_SEARCH_URL="http://localhost:$HOST_PORT" \
-  TDB_SEARCH_ADMIN_USER=admin \
-  TDB_SEARCH_ADMIN_SECRET=root \
-  TDB_SEARCH_ITEST_CONTAINER="$CONTAINER" \
+VECTORLINK_URL="http://localhost:$HOST_PORT" \
+  VECTORLINK_ADMIN_USER=admin \
+  VECTORLINK_ADMIN_SECRET=root \
+  VECTORLINK_ITEST_CONTAINER="$CONTAINER" \
   npx mocha --timeout 60000

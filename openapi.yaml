@@ -1,6 +1,6 @@
 openapi: 3.1.0
 
-# tdb-search — HTTP interface contract.
+# vectorlink — HTTP interface contract.
 #
 # A standalone semantic search engine. It is driven by push: a client asks
 # `/last-indexed`, then POSTs NDJSON text deltas to `/push`; the engine chunks,
@@ -20,8 +20,8 @@ openapi: 3.1.0
 #    so a fresh instance becomes serveable with minimal cold-start latency.
 
 info:
-  title: tdb-search
-  version: 0.1.0
+  title: vectorlink
+  version: 2.0.0
   description: >
     Standalone semantic search engine — push-indexed, versioned per commit, with
     vector, full-text, and hybrid search (hybrid is the default).

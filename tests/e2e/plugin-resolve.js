@@ -1,10 +1,10 @@
 /**
  * Integration test for the TerminusDB plugin endpoints:
- *   POST /api/plugin/search-candidates/<org>/<db>  — proxy to tdb-search /candidates
+ *   POST /api/plugin/search-candidates/<org>/<db>  — proxy to vectorlink /candidates
  *   POST /api/plugin/search-resolve/<org>/<db>    — full matching with tau thresholds
  *
- * These tests hit the TerminusDB server (port 7373) which proxies to tdb-search
- * (port 7372). The test data is pushed directly to tdb-search to avoid
+ * These tests hit the TerminusDB server (port 7373) which proxies to vectorlink
+ * (port 7372). The test data is pushed directly to vectorlink to avoid
  * depending on the TerminusDB indexer pipeline.
  */
 
@@ -223,7 +223,7 @@ describe("POST /api/plugin/search-resolve — TerminusDB plugin matching", funct
       req.write(data)
       req.end()
     })
-    expect(res.status).to.equal(403)
+    expect(res.status).to.equal(404)
   })
 
   it("returns 404 for unknown database", async function () {

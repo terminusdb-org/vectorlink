@@ -1,4 +1,4 @@
-# Native ARM64 Docker image build for tdb-search.
+# Native ARM64 Docker image build for vectorlink.
 #
 # Builds the production Dockerfile on ubuntu-22.04-arm (native ARM64), saves
 # the image as a gzipped tarball artifact for the publish workflow to consume.
@@ -26,11 +26,11 @@ jobs:
             .
 
       - name: Save and compress image
-        run: docker save ghcr.io/terminusdb-org/vectorlink:local | gzip > tdb-search-arm64.tar.gz
+        run: docker save ghcr.io/terminusdb-org/vectorlink:local | gzip > vectorlink-arm64.tar.gz
 
       - name: Upload Docker image artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tdb-search-arm64
-          path: tdb-search-arm64.tar.gz
+          name: vectorlink-arm64
+          path: vectorlink-arm64.tar.gz
           retention-days: 1

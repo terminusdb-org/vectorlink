@@ -1,8 +1,8 @@
-# tdb-search
+# vectorlink
 
 A semantic search engine built primarily for [TerminusDB](https://terminusdb.com), built in Rust on [LanceDB](https://lancedb.com). It is designed to work standalone.
 
-`tdb-search` is an independent reimplementation of TerminusDB's VectorLink semantic indexer. It preserves VectorLink's **search-family** HTTP shapes and its TerminusDB integration, but replaces the bespoke HNSW index and hand-rolled vector store with **LanceDB** — gaining full-text search, hybrid (vector + keyword) search, and a maintained, versioned, branchable columnar vector store. Embeddings come from a **configurable provider**, defaulting to a local CPU model (served by an Ollama sidecar) so the whole stack runs offline.
+`vectorlink` is an independent reimplementation of TerminusDB's VectorLink semantic indexer. It preserves VectorLink's **search-family** HTTP shapes and its TerminusDB integration, but replaces the bespoke HNSW index and hand-rolled vector store with **LanceDB** — gaining full-text search, hybrid (vector + keyword) search, and a maintained, versioned, branchable columnar vector store. Embeddings come from a **configurable provider**, defaulting to a local CPU model (served by an Ollama sidecar) so the whole stack runs offline.
 
 ---
 
@@ -10,7 +10,7 @@ A semantic search engine built primarily for [TerminusDB](https://terminusdb.com
 
 The original [`terminusdb-semantic-indexer`](https://github.com/terminusdb-labs/terminusdb-semantic-indexer) (the source of the `terminusdb/vectorlink` image) hardcodes OpenAI embeddings and uses a custom HNSW engine that requires maintenance by the original team. Additionally, it was never completed and proven in production for actual workloads.
 
-`tdb-search`:
+`vectorlink`:
 
 - **Preserves the search interface** — the same `/search`, `/similar`, `/duplicates`, `/check`, `/statistics` shapes, so existing search callers keep working (search-family parity; additive search modes layered on).
 - **Inverts indexing to a push model** — instead of the indexer pulling content, **TerminusDB pushes** rendered text deltas to it (`GET /last-indexed` → `POST /push`). The indexer never calls back into TerminusDB; it owns the embedding model and is a complete, standalone HTTP search service.
@@ -20,9 +20,9 @@ The original [`terminusdb-semantic-indexer`](https://github.com/terminusdb-labs/
 
 ## How history maps to LanceDB
 
-TerminusDB history is linear per branch. `tdb-search` mirrors this:
+TerminusDB history is linear per branch. `vectorlink` mirrors this:
 
-| TerminusDB | tdb-search (LanceDB / Lance) |
+| TerminusDB | vectorlink (LanceDB / Lance) |
 |------------|------------------------------|
 | domain `org/db` | a Lance dataset |
 | commit | a dataset version, bound by a Lance **tag** (`commit:<id>`) |
@@ -50,7 +50,7 @@ The embedding provider is configurable:
 - **Direct OpenAI** — `api.openai.com` for parity with the original.
 - **Generic / OpenAI-compatible HTTP** — any embeddings endpoint, configurable base URL, model, and dimension (e.g. TEI or vLLM if you prefer a different sidecar).
 
-> The default model requires task prefixes (`search_document:` for indexed text, `search_query:` for queries); `tdb-search` injects these automatically from a hard-coded, model-keyed table, so they cannot be misconfigured per deployment.
+> The default model requires task prefixes (`search_document:` for indexed text, `search_query:` for queries); `vectorlink` injects these automatically from a hard-coded, model-keyed table, so they cannot be misconfigured per deployment.
 
 > An in-process (no-sidecar) embedding mode via `fastembed` is a deferred future option — it does not yet build on aarch64, so the Ollama sidecar is the canonical local runtime.
 
@@ -66,7 +66,7 @@ docker compose up
 
 Brings up three services on CPU, no external calls (after the one-time model pull):
 
-- `tdb-search` — this server (HTTP API on `:8080`)
+- `vectorlink` — this server (HTTP API on `:8080`)
 - `embeddings` — Ollama serving `nomic-embed-text-v2-moe` (GGUF, Q8_0)
 - `terminusdb` — a TerminusDB server for an end-to-end example
 
@@ -108,7 +108,7 @@ The engine targets **fast cold-start for KEDA-style scale-from-zero**: a fresh p
 
 ## License
 
-Most of `tdb-search` is licensed under the Apache License, Version 2.0 (see
+Most of `vectorlink` is licensed under the Apache License, Version 2.0 (see
 `LICENSE`). Enterprise Edition modules are licensed under the Business Source
 License 1.1 (see `LICENSE-EE`) and convert to Apache-2.0 on the Change Date.
 

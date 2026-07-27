@@ -1,7 +1,7 @@
 /**
  * Vectorlink parity tests — scenarios ported from the vectorlink integration
  * test suite (tests/test/integration.test.js) that were not already covered
- * by existing tdb-search contract tests.
+ * by existing vectorlink contract tests.
  *
  * Ported gaps:
  *   1. Search results are sorted by distance ascending (closest first).

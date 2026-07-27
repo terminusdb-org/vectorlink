@@ -1,4 +1,4 @@
-# Build harness image for tdb-search development and CI.
+# Build harness image for vectorlink development and CI.
 #
 # Pre-bakes all system dependencies (protobuf, ssl, etc.) so containers can
 # run as a non-root user without needing apt at runtime. Removes the
@@ -10,7 +10,7 @@
 # case (501:1000) works without any chown.
 #
 # Usage (built by `make build-image`):
-#   docker build -f Dockerfile.build -t tdb-search-build:local .
+#   docker build -f Dockerfile.build -t vectorlink-build:local .
 #
 # The image is then used by DOCKER_RUN in the Makefile for all cargo
 # operations (clippy, build, test).

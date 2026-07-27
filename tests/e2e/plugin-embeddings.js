@@ -2,12 +2,12 @@
  * Integration test for the TerminusDB plugin endpoint:
  *   GET /api/plugin/search-embeddings/<org>/<db>/local/branch/<branch>
  *
- * These tests hit the TerminusDB server (port 7373) which proxies to tdb-search
- * (port 7372). Test data is pushed directly to tdb-search to avoid depending
+ * These tests hit the TerminusDB server (port 7373) which proxies to vectorlink
+ * (port 7372). Test data is pushed directly to vectorlink to avoid depending
  * on the TerminusDB indexer pipeline.
  *
  * Verifies:
- *  - The proxy forwards the commit parameter to tdb-search.
+ *  - The proxy forwards the commit parameter to vectorlink.
  *  - doc_embeddings are returned with correct structure.
  *  - store_clustering flag is present in the response.
  *  - served_commit is returned and non-empty.
@@ -139,7 +139,7 @@ describe("GET /api/plugin/search-embeddings — TerminusDB plugin proxy", functi
 
   it("returns embeddings via the TerminusDB proxy with a valid commit", async function () {
     // The proxy path includes the branch — TerminusDB resolves the head commit
-    // and forwards it to tdb-search as the commit parameter.
+    // and forwards it to vectorlink as the commit parameter.
     const res = await tdbRequest(
       "GET",
       "/api/plugin/search-embeddings/admin/plugin_embeddings_test/local/branch/main",
@@ -158,7 +158,7 @@ describe("GET /api/plugin/search-embeddings — TerminusDB plugin proxy", functi
     }
   })
 
-  it("returns embeddings when hitting tdb-search directly with commit parameter", async function () {
+  it("returns embeddings when hitting vectorlink directly with commit parameter", async function () {
     const res = await agent()
       .get("/embeddings")
       .query({ domain: DOMAIN, commit: COMMIT })
@@ -233,7 +233,7 @@ describe("GET /api/plugin/search-embeddings — TerminusDB plugin proxy", functi
       }
     })
 
-    it("returns NDJSON lines when hitting tdb-search directly with commit parameter", async function () {
+    it("returns NDJSON lines when hitting vectorlink directly with commit parameter", async function () {
       const res = await tdbStreamingRequest(
         "/api/plugin/search-embeddings/admin/plugin_embeddings_test/local/branch/main",
       )

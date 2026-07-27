@@ -1,5 +1,5 @@
 #!/bin/sh
-# Entrypoint for the tdb-search build container.
+# Entrypoint for the vectorlink build container.
 # Ensures HOME exists (required by cargo/rustup even when running as an
 # arbitrary --user uid:gid), then exec's the user's command.
 # The image pre-creates /tmp/build-home with mode 777, so this is a no-op

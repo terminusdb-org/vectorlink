@@ -231,14 +231,14 @@ test:
 
 # Integration tests (mocha) against a LIVE vectorlink server. The server and
 # Ollama must already be running — this target only runs the test suite.
-# Set TDB_SEARCH_URL to point at a non-default endpoint (default: localhost:7372).
+# Set VECTORLINK_URL to point at a non-default endpoint (default: localhost:7372).
 # Part of the `pr` gate.
 .PHONY: test-integration
 test-integration:
 	@if [ -f $(CARGO_MANIFEST) ]; then \
-		TDB_SEARCH_URL="${TDB_SEARCH_URL:-http://localhost:7372}" \
-		TDB_SEARCH_ADMIN_USER="${TDB_SEARCH_ADMIN_USER:-admin}" \
-		TDB_SEARCH_ADMIN_SECRET="${TDB_SEARCH_ADMIN_SECRET:-root}" \
+		VECTORLINK_URL="${VECTORLINK_URL:-http://localhost:7372}" \
+		VECTORLINK_ADMIN_USER="${VECTORLINK_ADMIN_USER:-admin}" \
+		VECTORLINK_ADMIN_SECRET="${VECTORLINK_ADMIN_SECRET:-root}" \
 		npx mocha --timeout 60000 ; \
 	else \
 		echo "• integration tests skipped — no $(CARGO_MANIFEST) yet" ; \
@@ -250,9 +250,9 @@ test-integration:
 # Use `make server-start` to start both servers.
 .PHONY: test-e2e
 test-e2e:
-	@TDB_SEARCH_URL="${TDB_SEARCH_URL:-http://localhost:7372}" \
-		TDB_SEARCH_ADMIN_USER="${TDB_SEARCH_ADMIN_USER:-admin}" \
-		TDB_SEARCH_ADMIN_SECRET="${TDB_SEARCH_ADMIN_SECRET:-root}" \
+	@VECTORLINK_URL="${VECTORLINK_URL:-http://localhost:7372}" \
+		VECTORLINK_ADMIN_USER="${VECTORLINK_ADMIN_USER:-admin}" \
+		VECTORLINK_ADMIN_SECRET="${VECTORLINK_ADMIN_SECRET:-root}" \
 		npx mocha --config .mocharc.e2e.js
 
 # Lint the JS test sources (eslint, TerminusDB-style). Part of `lint`.

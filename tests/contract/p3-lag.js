@@ -31,7 +31,7 @@
  * 200 after a push) is unchanged — only the internal cache is gone.
  *
  * P3-LAG-4 (restart durability — the headline regression) is exercised here when
- * the runner passes the engine container name via TDB_SEARCH_ITEST_CONTAINER:
+ * the runner passes the engine container name via VECTORLINK_ITEST_CONTAINER:
  * index → restart the container → the same commit is STILL searchable / its
  * last-indexed STILL reported / duplicates STILL work — never a post-restart 404.
  * It is also covered exhaustively at the store level (a fresh LanceStore over the
@@ -43,15 +43,15 @@ const { execFileSync, execSync } = require("child_process")
 const { agent, authHeader, BASE_URL } = require("../lib/agent")
 
 // The engine restart mechanism, injected by the integration runner.
-// TDB_SEARCH_ITEST_RESTART_CMD: a shell command that restarts the engine
+// VECTORLINK_ITEST_RESTART_CMD: a shell command that restarts the engine
 //   (e.g. "kill <pid> && <binary>" for local, "docker restart <container>" for Docker).
-// TDB_SEARCH_ITEST_CONTAINER: (legacy) Docker container name — when present without
+// VECTORLINK_ITEST_CONTAINER: (legacy) Docker container name — when present without
 //   RESTART_CMD, uses `docker restart <container>`.
 // When neither is set, the restart test is skipped — the same invariant is
 // covered exhaustively at the store level (fresh LanceStore over the same
 // on-disk dir, in src/store/lance.rs).
-const ITEST_CONTAINER = process.env.TDB_SEARCH_ITEST_CONTAINER
-const ITEST_RESTART_CMD = process.env.TDB_SEARCH_ITEST_RESTART_CMD
+const ITEST_CONTAINER = process.env.VECTORLINK_ITEST_CONTAINER
+const ITEST_RESTART_CMD = process.env.VECTORLINK_ITEST_RESTART_CMD
 const restartAvailable = ITEST_RESTART_CMD || ITEST_CONTAINER
 
 async function waitForLive (timeoutMs = 30000) {
