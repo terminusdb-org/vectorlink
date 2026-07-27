@@ -11,7 +11,7 @@
  *   - no stale rebuild branches
  *   - at most 1 rebuild branch
  *
- * Prerequisite: TDB_SEARCH_DISABLE_AUTO_COMPACTION=1 in the engine env
+ * Prerequisite: VECTORLINK_DISABLE_AUTO_COMPACTION=1 in the engine env
  * (eliminates non-determinism from the 5% probabilistic trigger).
  */
 

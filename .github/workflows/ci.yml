@@ -1,4 +1,4 @@
-# CI Gate — lint + test for tdb-search.
+# CI Gate — lint + test for vectorlink.
 #
 # Runs on every PR and push to main. Fast checks only (no Docker build,
 # no Ollama integration suite). This is a required status check for PRs.

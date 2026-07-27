@@ -1,4 +1,4 @@
-// Mocha config — integration tests only (tdb-search direct).
+// Mocha config — integration tests only (vectorlink direct).
 // E2e tests (tests/e2e/) require TerminusDB running and are run separately
 // via `make test-e2e` or .mocharc.e2e.js.
 module.exports = {

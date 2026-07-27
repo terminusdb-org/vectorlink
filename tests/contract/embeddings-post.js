@@ -3,14 +3,14 @@
  * bidirectional NDJSON modes.
  *
  * Also covers GET /embeddings with Accept: application/x-ndjson directly
- * against tdb-search (not through the TerminusDB proxy).
+ * against vectorlink (not through the TerminusDB proxy).
  */
 
 const { expect } = require("chai")
 const http = require("http")
 const { agent, authHeader } = require("../lib/agent")
 
-const BASE_URL = process.env.TDB_SEARCH_URL || "http://localhost:7372"
+const BASE_URL = process.env.VECTORLINK_URL || "http://localhost:7372"
 
 function rawNdjsonRequest (path, method, body, headers) {
   return new Promise((resolve, reject) => {

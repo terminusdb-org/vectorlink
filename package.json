@@ -1,8 +1,8 @@
 {
-  "name": "tdb-search-tests",
-  "version": "0.1.0",
+  "name": "vectorlink-tests",
+  "version": "2.0.0",
   "private": true,
-  "description": "HTTP contract tests for tdb-search (adopts TerminusDB test infra)",
+  "description": "HTTP contract tests for vectorlink (adopts TerminusDB test infra)",
   "scripts": {
     "test": "mocha",
     "test:contract": "mocha tests/contract/**/*.js",

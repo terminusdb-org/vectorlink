@@ -2,7 +2,7 @@
  * Contract tests for streaming push with progress feedback (stream=true).
  *
  * These tests define the full streaming push contract with 100% clarity,
- * testable locally against tdb-search alone (no TerminusDB required).
+ * testable locally against vectorlink alone (no TerminusDB required).
  * The contract matches exactly what TerminusDB will consume:
  *
  *   POST /push?stream=true&domain=...&target_commit=...
@@ -24,8 +24,8 @@ const { expect } = require("chai")
 const http = require("http")
 const { agent, authHeader, BASE_URL } = require("../lib/agent")
 
-const ADMIN_USER = process.env.TDB_SEARCH_ADMIN_USER || "admin"
-const ADMIN_SECRET = process.env.TDB_SEARCH_ADMIN_SECRET || "root"
+const ADMIN_USER = process.env.VECTORLINK_ADMIN_USER || "admin"
+const ADMIN_SECRET = process.env.VECTORLINK_ADMIN_SECRET || "root"
 
 /**
  * Parse the BASE_URL into host and port for raw HTTP requests.

@@ -1,7 +1,7 @@
-# Lightweight dev/E2E runtime image for tdb-search.
+# Lightweight dev/E2E runtime image for vectorlink.
 #
 # Assembles in SECONDS: no in-container cargo build. Expects a STRIPPED debug
-# binary at target/debug/tdb-search-stripped (produced by `make dev-image`).
+# binary at target/debug/vectorlink-stripped (produced by `make dev-image`).
 # Stripping reduces size from ~1.2GB to ~30MB, making the image tiny and fast.
 #
 # Contract: identical runtime environment to the production Dockerfile —
@@ -24,22 +24,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy the STRIPPED debug binary from the host build context.
 # Stripped: ~30MB vs 1.2GB full debug — fast context transfer + tiny image.
-COPY target/debug/tdb-search-stripped /usr/local/bin/tdb-search
+COPY target/debug/vectorlink-stripped /usr/local/bin/vectorlink
 
 # Tokenizer asset (same location as production image).
-COPY assets/tokenizer.json.bz2 /opt/tdb-search/tokenizer.json.bz2
+COPY assets/tokenizer.json.bz2 /opt/vectorlink/tokenizer.json.bz2
 
 # Non-root user for security (same as production Dockerfile).
-RUN useradd -r -s /bin/false tdb-search
+RUN useradd -r -s /bin/false vectorlink
 
-# Data directory for LanceDB datasets (owned by tdb-search user).
-RUN mkdir -p /data && chown tdb-search:tdb-search /data
+# Data directory for LanceDB datasets (owned by vectorlink user).
+RUN mkdir -p /data && chown vectorlink:vectorlink /data
 
-USER tdb-search
+USER vectorlink
 
-ENV TDB_SEARCH_TOKENIZER_PATH=/opt/tdb-search/tokenizer.json.bz2
-ENV TDB_SEARCH_DATA_DIR=/data
+ENV VECTORLINK_TOKENIZER_PATH=/opt/vectorlink/tokenizer.json.bz2
+ENV VECTORLINK_DATA_DIR=/data
 
 EXPOSE 8080
 
-ENTRYPOINT ["tdb-search"]
+ENTRYPOINT ["vectorlink"]

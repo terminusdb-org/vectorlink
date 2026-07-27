@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Multi-stage Dockerfile for tdb-search.
+# Multi-stage Dockerfile for vectorlink.
 #
 # Build stage: rust:1-trixie with protobuf + future deps pre-installed.
 # Runtime stage: debian:trixie-slim for minimal image size.
@@ -36,7 +36,7 @@ COPY assets/tokenizer.json.bz2 /build/tokenizer.json.bz2
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release && \
-    cp /build/target/release/tdb-search /build/tdb-search
+    cp /build/target/release/vectorlink /build/vectorlink
 
 # ──────────────────────────── Runtime stage ────────────────────────────────
 FROM debian:trixie-slim AS runtime
@@ -46,20 +46,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
   && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/tdb-search /usr/local/bin/tdb-search
-COPY --from=builder /build/tokenizer.json.bz2 /opt/tdb-search/tokenizer.json.bz2
+COPY --from=builder /build/vectorlink /usr/local/bin/vectorlink
+COPY --from=builder /build/tokenizer.json.bz2 /opt/vectorlink/tokenizer.json.bz2
 
 # Non-root user for security.
-RUN useradd -r -s /bin/false tdb-search
+RUN useradd -r -s /bin/false vectorlink
 
-# Data directory for LanceDB datasets (owned by tdb-search user).
-RUN mkdir -p /data && chown tdb-search:tdb-search /data
+# Data directory for LanceDB datasets (owned by vectorlink user).
+RUN mkdir -p /data && chown vectorlink:vectorlink /data
 
-USER tdb-search
+USER vectorlink
 
-ENV TDB_SEARCH_TOKENIZER_PATH=/opt/tdb-search/tokenizer.json.bz2
-ENV TDB_SEARCH_DATA_DIR=/data
+ENV VECTORLINK_TOKENIZER_PATH=/opt/vectorlink/tokenizer.json.bz2
+ENV VECTORLINK_DATA_DIR=/data
 
 EXPOSE 8080
 
-ENTRYPOINT ["tdb-search"]
+ENTRYPOINT ["vectorlink"]

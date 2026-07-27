@@ -1,4 +1,4 @@
-# Redocly config — strict OpenAPI linting + docs build for tdb-search.
+# Redocly config — strict OpenAPI linting + docs build for vectorlink.
 #
 # The OpenAPI lint is a hard gate: `make lint` must pass before any commit. We
 # start from Redocly's `recommended` ruleset promoted so that everything is an
@@ -6,7 +6,7 @@
 # legitimately do not apply to this contract, each with justification.
 
 apis:
-  tdb-search:
+  vectorlink:
     root: ./openapi.yaml
 
 extends:

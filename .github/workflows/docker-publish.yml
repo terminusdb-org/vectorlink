@@ -52,7 +52,7 @@ jobs:
       - name: Download AMD64 image artifact
         uses: actions/download-artifact@v4
         with:
-          name: tdb-search-amd64
+          name: vectorlink-amd64
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -63,7 +63,7 @@ jobs:
 
       - name: Load and push AMD64 image
         run: |
-          docker load < tdb-search-amd64.tar.gz
+          docker load < vectorlink-amd64.tar.gz
           docker tag ghcr.io/terminusdb-org/vectorlink:local ghcr.io/terminusdb-org/vectorlink:dev-amd64-${{ github.sha }}
           docker push ghcr.io/terminusdb-org/vectorlink:dev-amd64-${{ github.sha }}
 
@@ -79,7 +79,7 @@ jobs:
       - name: Download ARM64 image artifact
         uses: actions/download-artifact@v4
         with:
-          name: tdb-search-arm64
+          name: vectorlink-arm64
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -90,7 +90,7 @@ jobs:
 
       - name: Load and push ARM64 image
         run: |
-          docker load < tdb-search-arm64.tar.gz
+          docker load < vectorlink-arm64.tar.gz
           docker tag ghcr.io/terminusdb-org/vectorlink:local ghcr.io/terminusdb-org/vectorlink:dev-arm64-${{ github.sha }}
           docker push ghcr.io/terminusdb-org/vectorlink:dev-arm64-${{ github.sha }}
 

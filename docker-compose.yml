@@ -1,6 +1,6 @@
-# tdb-search self-contained stack (3-service, CPU-only).
+# vectorlink self-contained stack (3-service, CPU-only).
 #
-# Canonical deployment: terminusdb + tdb-search + embeddings (Ollama).
+# Canonical deployment: terminusdb + vectorlink + embeddings (Ollama).
 # No external network dependency after the one-time model pull.
 # The embedding sidecar is Ollama serving nomic-embed-text-v2-moe (Q8_0 GGUF).
 #
@@ -29,8 +29,8 @@ services:
     environment:
       - TERMINUSDB_SERVER_PORT=6363
       - "TERMINUSDB_ADMIN_PASS=${TERMINUSDB_ADMIN_PASS:-root}"
-      - TERMINUSDB_INDEXER_BACKEND=http_tdb_search
-      - TERMINUSDB_TDB_SEARCH_ENDPOINT=http://tdb-search:8080
+      - TERMINUSDB_INDEXER_BACKEND=http_vectorlink
+      - TERMINUSDB_VECTORLINK_ENDPOINT=http://vectorlink:8080
     ports:
       # Host 6363/6364 commonly taken by a dev TerminusDB; use 6365.
       - "127.0.0.1:6365:6363"
@@ -85,25 +85,25 @@ services:
         echo "Model ready."
     restart: "no"
 
-  # tdb-search indexer — the search engine itself.
-  tdb-search:
+  # vectorlink indexer — the search engine itself.
+  vectorlink:
     build: .
     environment:
-      - TDB_SEARCH_ADMIN_USER=admin
-      - "TDB_SEARCH_ADMIN_SECRET=${TDB_SEARCH_ADMIN_SECRET:-root}"
-      - TDB_SEARCH_EMBED_PROVIDER=openai_compatible
-      - TDB_SEARCH_EMBED_URL=http://embeddings:11434
-      - TDB_SEARCH_MODEL=nomic-embed-v2
-      - TDB_SEARCH_DIM=768
-      - TDB_SEARCH_DATA_DIR=/data
-      - TDB_SEARCH_EMBED_CACHE_SIZE=3000000
-      - TDB_SEARCH_TOKENIZER_PATH=/opt/tdb-search/tokenizer.json.bz2
-      - TDB_SEARCH_PROMETHEUS_PORT=9090
+      - VECTORLINK_ADMIN_USER=admin
+      - "VECTORLINK_ADMIN_SECRET=${VECTORLINK_ADMIN_SECRET:-root}"
+      - VECTORLINK_EMBED_PROVIDER=openai_compatible
+      - VECTORLINK_EMBED_URL=http://embeddings:11434
+      - VECTORLINK_MODEL=nomic-embed-v2
+      - VECTORLINK_DIM=768
+      - VECTORLINK_DATA_DIR=/data
+      - VECTORLINK_EMBED_CACHE_SIZE=3000000
+      - VECTORLINK_TOKENIZER_PATH=/opt/vectorlink/tokenizer.json.bz2
+      - VECTORLINK_PROMETHEUS_PORT=9090
     ports:
       - "127.0.0.1:8081:8080"
       - "127.0.0.1:9091:9090"
     volumes:
-      - tdb-search-data:/data
+      - vectorlink-data:/data
     depends_on:
       terminusdb:
         condition: service_healthy
@@ -120,4 +120,4 @@ services:
 volumes:
   terminusdb-storage:
   ollama-models:
-  tdb-search-data:
+  vectorlink-data:
