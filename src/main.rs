@@ -129,6 +129,14 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
+
+            // Give axum a short grace period to finish sending HTTP
+            // responses on in-flight connections, then force exit.
+            // Without this, axum waits indefinitely for long-running
+            // /push streams from TerminusDB to close, blocking shutdown.
+            eprintln!("[shutdown] allowing 5s for in-flight HTTP responses, then exiting");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            std::process::exit(0);
         })
         .await?;
     Ok(())
