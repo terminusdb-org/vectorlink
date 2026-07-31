@@ -17,3 +17,4 @@
 
 # ── Needed by Dockerfile.dev (fast dev image) ──
 !target/debug/tdb-search-stripped
+!target/debug/vectorlink-stripped

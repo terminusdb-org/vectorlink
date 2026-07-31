@@ -30,8 +30,8 @@ info:
     identifier: Apache-2.0
 
 servers:
-  - url: http://localhost:8080
-    description: Default local bind ([::]:8080).
+  - url: http://localhost:7372
+    description: Default local bind ([::]:7372).
 
 tags:
   - name: indexing

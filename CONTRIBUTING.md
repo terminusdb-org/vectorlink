@@ -169,7 +169,7 @@ All config is environment variables, read in `src/config/mod.rs`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `VECTORLINK_PORT` | `8080` | Listen port |
+| `VECTORLINK_PORT` | `7372` | Listen port |
 | `VECTORLINK_DATA_DIR` | `/data` | Lance dataset storage path |
 | `VECTORLINK_EMBED_URL` | `http://127.0.0.1:11434` | Embedding provider URL (Ollama) |
 | `VECTORLINK_MODEL` | `nomic-embed-text-v2-moe` | Embedding model name |

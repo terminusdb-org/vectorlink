@@ -35,7 +35,7 @@ tokio-stream = "0.1"
 tokio-util = "0.7"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
 uuid = { version = "1", features = ["v4"] }
 ruzstd = "0.8"
 

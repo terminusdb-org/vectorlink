@@ -25,24 +25,24 @@ This complements — does not replace — the unit and store-level tests in `spe
 ## 2. The system under test (docker-compose.yml)
 
 ```
-┌────────────────────────────────────────────────────────────┐
+┌─────────────────────────────────────────────────────────────┐
 │ docker-compose.yml  (CPU-only, no external network)         │
-│                                                              │
+│                                                             │
 │  ┌────────────┐   push (NDJSON)   ┌──────────────────────┐  │
 │  │ terminusdb │──────────────────▶│      tdb-search      │  │
-│  │  :6363     │   operation ops   │        :8080         │  │
+│  │  :6363     │   operation ops   │        :7372         │  │
 │  └────────────┘                   │  LanceDB store (vol) │  │
 │                                   └─────────┬────────────┘  │
-│                                             │ /v1/embeddings │
+│                                             │ /v1/embeddings│
 │                                   ┌─────────▼────────────┐  │
 │                                   │ embeddings (Ollama)  │  │
 │                                   │  nomic-embed-text-   │  │
 │                                   │  v2-moe (GGUF, Q8_0) │  │
 │                                   │  @ pinned digests,CPU│  │
 │                                   └──────────────────────┘  │
-│                                                              │
+│                                                             │
 │  test-runner (optional 4th service or host process)         │
-└────────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────────┘
 ```
 
 | Service | Role in tests | Determinism controls |
