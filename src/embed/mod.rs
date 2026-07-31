@@ -143,6 +143,8 @@ pub enum EmbedError {
 struct EmbedRequest {
     model: String,
     input: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<usize>,
 }
 
 /// OpenAI-compatible embedding response.
@@ -240,6 +242,7 @@ pub async fn io_embed(
     let request_body = EmbedRequest {
         model: model.to_owned(),
         input: miss_prefixed,
+        dimensions: Some(dim),
     };
 
     let response = client
@@ -489,6 +492,29 @@ mod tests {
         let vecs = result.unwrap();
         assert_eq!(vecs.len(), 1);
         assert_eq!(vecs[0].len(), 768);
+    }
+
+    // --- EmbedRequest dimensions serialization ---
+    #[test]
+    fn embed_request_serializes_dimensions() {
+        let req = EmbedRequest {
+            model: "nomic-embed-text-v2-moe".to_owned(),
+            input: vec!["hello".to_owned()],
+            dimensions: Some(256),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["dimensions"], 256);
+    }
+
+    #[test]
+    fn embed_request_omits_dimensions_when_none() {
+        let req = EmbedRequest {
+            model: "nomic-embed-text-v2-moe".to_owned(),
+            input: vec!["hello".to_owned()],
+            dimensions: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("dimensions").is_none());
     }
 
     // --- NaN in embedding fails ---
