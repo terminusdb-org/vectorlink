@@ -58,15 +58,16 @@ The embedding provider is configurable:
 
 The indexer is a **trusted component** behind a single shared admin secret (HTTP Basic, default `admin:root`), checked on every request (`401` on miss) — authentication only, **no RBAC**. TerminusDB fronts search and authorises the caller against its own capability system before calling the indexer. Deploy the indexer on a private network with TerminusDB as the front door.
 
-## Quickstart (planned)
+## Quickstart
 
 ```bash
-docker compose up
+curl -fsSL https://raw.githubusercontent.com/terminusdb-org/vectorlink/main/docker-compose.quickstart.yml \
+  | docker compose -f - up -d
 ```
 
-Brings up three services on CPU, no external calls (after the one-time model pull):
+Brings up three pre-built images on CPU, no clone, no build, no external calls (after the one-time model pull):
 
-- `vectorlink` — this server (HTTP API on `:8080`)
+- `vectorlink` — this server (HTTP API on `:7372`)
 - `embeddings` — Ollama serving `nomic-embed-text-v2-moe` (GGUF, Q8_0)
 - `terminusdb` — a TerminusDB server for an end-to-end example
 
@@ -74,16 +75,16 @@ Drive indexing by push, then search (all requests carry the admin secret):
 
 ```bash
 # 1. ask where the indexer is up to (TerminusDB uses this to compute the delta)
-curl -u admin:root 'localhost:8080/last-indexed?domain=admin/star_wars&branch=main'
+curl -u admin:root 'localhost:7372/last-indexed?domain=admin/star_wars&branch=main'
 
 # 2. push the rendered NDJSON delta for a commit (one operation per line)
 curl -u admin:root -X POST \
-  'localhost:8080/push?domain=admin/star_wars&branch=main&target_commit=<C>&parent_commit=<P>' \
+  'localhost:7372/push?domain=admin/star_wars&branch=main&target_commit=<C>&parent_commit=<P>' \
   -H 'Content-Type: application/x-ndjson' \
   --data-binary @delta.ndjson
 
 # 3. semantic search (raw text body; hybrid by default)
-curl -u admin:root 'localhost:8080/search?domain=admin/star_wars&commit=<C>' -d 'Wise old man'
+curl -u admin:root 'localhost:7372/search?domain=admin/star_wars&commit=<C>' -d 'Wise old man'
 ```
 
 In normal operation TerminusDB performs steps 1–2 automatically; the `curl` calls above are how you drive the indexer standalone.

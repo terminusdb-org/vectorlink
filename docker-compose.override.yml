@@ -9,7 +9,7 @@ services:
   terminusdb:
     environment:
       - TERMINUSDB_INDEXER_BACKEND=http_vectorlink
-      - TERMINUSDB_VECTORLINK_ENDPOINT=http://vectorlink:8080
+      - TERMINUSDB_VECTORLINK_ENDPOINT=http://vectorlink:7372
       - TERMINUSDB_SEARCH_ADMIN_SECRET=root
 
   vectorlink:

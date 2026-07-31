@@ -100,7 +100,7 @@ docker run -d --name "$CONTAINER" \
   -v "$ROOT":/work \
   -v "$TARGET_VOLUME":/work/target \
   -w /work \
-  -p "$HOST_PORT":8080 \
+  -p "$HOST_PORT":7372 \
   -e VECTORLINK_ADMIN_USER=admin \
   -e VECTORLINK_ADMIN_SECRET=root \
   -e VECTORLINK_EMBED_PROVIDER=openai_compatible \

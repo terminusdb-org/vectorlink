@@ -4,20 +4,25 @@ Bring up the stack, index one commit, and run a search — all over HTTP.
 
 ## 1. Start the stack
 
+One command — no clone, no build. All three services use pre-built images:
+
 ```bash
-docker compose up
+curl -fsSL https://raw.githubusercontent.com/terminusdb-org/vectorlink/main/docker-compose.quickstart.yml \
+  | docker compose -f - up -d
 ```
 
 This starts three services on CPU, with no external network after the one-time model pull:
 
-- `tdb-search` — the engine (HTTP API on `:8080`)
+- `vectorlink` — the engine (HTTP API on `:7372`)
 - `embeddings` — a local embedding model server
 - `terminusdb` — a TerminusDB server (only needed for the end-to-end example; the steps below don't use it)
+
+The compose project is named `vectorlink-quickstart`. Stop it with `docker compose -p vectorlink-quickstart down`.
 
 Wait until the engine is ready:
 
 ```bash
-curl -fsS http://localhost:8080/health/ready | jq
+curl -fsS http://localhost:7372/health/ready | jq
 # { "ready": true, "index": true, "search": true }
 ```
 
@@ -37,11 +42,11 @@ EOF
 Find where the engine is up to (empty on first use), then push the delta as commit `c1`:
 
 ```bash
-curl -u admin:root 'http://localhost:8080/last-indexed?domain=admin/star_wars&branch=main'
+curl -u admin:root 'http://localhost:7372/last-indexed?domain=admin/star_wars&branch=main'
 # { "branch": "main", "commit": null, "version": 0 }
 
 curl -u admin:root -X POST \
-  'http://localhost:8080/push?domain=admin/star_wars&branch=main&target_commit=c1' \
+  'http://localhost:7372/push?domain=admin/star_wars&branch=main&target_commit=c1' \
   -H 'Content-Type: application/x-ndjson' \
   --data-binary @delta.ndjson
 # task-7f3a9c
@@ -50,7 +55,7 @@ curl -u admin:root -X POST \
 Poll the task until complete:
 
 ```bash
-curl -u admin:root 'http://localhost:8080/check?task_id=task-7f3a9c'
+curl -u admin:root 'http://localhost:7372/check?task_id=task-7f3a9c'
 # { "status": "Complete", "indexed_documents": 2, "skipped": [] }
 ```
 
@@ -58,10 +63,10 @@ curl -u admin:root 'http://localhost:8080/check?task_id=task-7f3a9c'
 
 ```bash
 # GET — simple and cacheable
-curl -u admin:root 'http://localhost:8080/search?domain=admin/star_wars&commit=c1&q=wise+old+man'
+curl -u admin:root 'http://localhost:7372/search?domain=admin/star_wars&commit=c1&q=wise+old+man'
 
 # POST — structured JSON
-curl -u admin:root -X POST 'http://localhost:8080/search' \
+curl -u admin:root -X POST 'http://localhost:7372/search' \
   -H 'Content-Type: application/json' \
   -d '{"domain":"admin/star_wars","commit":"c1","q":"who are the squid people"}'
 ```

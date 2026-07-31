@@ -30,7 +30,7 @@ rules:
   # ── justified relaxations (NOT silent — documented) ──
 
   # WHY: the engine binds locally and runs on a private network behind a front
-  # door; `http://localhost:8080` is the accurate default server, not a
+  # door; `http://localhost:7372` is the accurate default server, not a
   # placeholder. INVARIANT: real deployments override the server URL.
   # CONSEQUENCE of relaxing: none — the URL is intentionally local.
   no-server-example.com: off
