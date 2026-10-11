@@ -1979,7 +1979,7 @@ async fn handle_candidates(
 
 // ─────────────────────────── Router construction ──────────────────────────
 
-pub fn build_router(state: AppState) -> Router {
+pub fn build_router(state: AppState, require_auth: bool) -> Router {
     // Mirror TerminusDB's CORS policy: reflect the requester's Origin header
     // back as Access-Control-Allow-Origin (no wildcard). This allows
     // credentials (Basic Auth) to work cross-origin while restricting
@@ -2018,8 +2018,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/integrity", get(handle_integrity))
         .route("/embeddings", get(handle_embeddings).post(handle_embeddings_post))
         .route("/domain", delete(handle_delete_domain))
-        .route("/branch-index", delete(handle_delete_branch_index))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route("/branch-index", delete(handle_delete_branch_index));
+    let authed_routes = if require_auth {
+        authed_routes.layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+    } else {
+        authed_routes
+    };
 
     // Unauthenticated routes (health probes).
     let public_routes = Router::new()
