@@ -30,7 +30,7 @@ services:
       - TERMINUSDB_SERVER_PORT=6363
       - "TERMINUSDB_ADMIN_PASS=${TERMINUSDB_ADMIN_PASS:-root}"
       - TERMINUSDB_INDEXER_BACKEND=http_vectorlink
-      - TERMINUSDB_VECTORLINK_ENDPOINT=http://vectorlink:8080
+      - TERMINUSDB_VECTORLINK_ENDPOINT=http://vectorlink:7372
     ports:
       # Host 6363/6364 commonly taken by a dev TerminusDB; use 6365.
       - "127.0.0.1:6365:6363"
@@ -100,7 +100,7 @@ services:
       - VECTORLINK_TOKENIZER_PATH=/opt/vectorlink/tokenizer.json.bz2
       - VECTORLINK_PROMETHEUS_PORT=9090
     ports:
-      - "127.0.0.1:8081:8080"
+      - "127.0.0.1:7372:7372"
       - "127.0.0.1:9091:9090"
     volumes:
       - vectorlink-data:/data
@@ -110,7 +110,7 @@ services:
       embeddings:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8080 && echo -e \"GET /health/live HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3 && timeout 2 grep -q 200 <&3'"]
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/7372 && echo -e \"GET /health/live HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3 && timeout 2 grep -q 200 <&3'"]
       interval: 10s
       timeout: 5s
       retries: 10

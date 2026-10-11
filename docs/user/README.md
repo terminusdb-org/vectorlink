@@ -20,6 +20,6 @@ You **push** the text that changed between two commits; tdb-search embeds it and
 
 ## Conventions in these docs
 
-- Base URL is `http://localhost:8080` (the default).
+- Base URL is `http://localhost:7372` (the default).
 - Every request carries the admin secret as HTTP Basic auth: `-u admin:root` (change it for any exposed deployment).
 - The full machine-readable contract is [`../../openapi.yaml`](../../openapi.yaml); render it with `make docs`.

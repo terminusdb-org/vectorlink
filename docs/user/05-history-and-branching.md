@@ -13,7 +13,7 @@ cat > delta-c2.ndjson <<'EOF'
 EOF
 
 curl -u admin:root -X POST \
-  'http://localhost:8080/push?domain=admin/star_wars&branch=main&target_commit=c2&parent_commit=c1' \
+  'http://localhost:7372/push?domain=admin/star_wars&branch=main&target_commit=c2&parent_commit=c1' \
   -H 'Content-Type: application/x-ndjson' --data-binary @delta-c2.ndjson
 # poll /check until Complete
 ```
@@ -21,8 +21,8 @@ curl -u admin:root -X POST \
 Now search the **same query at each commit**:
 
 ```bash
-curl -u admin:root 'http://localhost:8080/search?domain=admin/star_wars&commit=c1&q=trained+Luke+on+Dagobah'
-curl -u admin:root 'http://localhost:8080/search?domain=admin/star_wars&commit=c2&q=trained+Luke+on+Dagobah'
+curl -u admin:root 'http://localhost:7372/search?domain=admin/star_wars&commit=c1&q=trained+Luke+on+Dagobah'
+curl -u admin:root 'http://localhost:7372/search?domain=admin/star_wars&commit=c2&q=trained+Luke+on+Dagobah'
 ```
 
 - At `c2`, Yoda ranks for "trained Luke on Dagobah" (the new text).
@@ -41,7 +41,7 @@ EOF
 
 # branch "experiment" forks from c1; first push on it names c1 as parent
 curl -u admin:root -X POST \
-  'http://localhost:8080/push?domain=admin/star_wars&branch=experiment&target_commit=b1&parent_commit=c1' \
+  'http://localhost:7372/push?domain=admin/star_wars&branch=experiment&target_commit=b1&parent_commit=c1' \
   -H 'Content-Type: application/x-ndjson' --data-binary @delta-b1.ndjson
 ```
 
@@ -49,15 +49,15 @@ Now observe the two properties:
 
 ```bash
 # the branch sees c1's documents (Yoda, Mon Calamari) WITHOUT re-indexing them — block reuse
-curl -u admin:root 'http://localhost:8080/search?domain=admin/star_wars&commit=b1&q=wise+old+man'
+curl -u admin:root 'http://localhost:7372/search?domain=admin/star_wars&commit=b1&q=wise+old+man'
 #   → returns People/20, inherited from c1's shared vectors
 
 # the new document exists only on the branch
-curl -u admin:root 'http://localhost:8080/search?domain=admin/star_wars&commit=b1&q=bounty+hunter'
+curl -u admin:root 'http://localhost:7372/search?domain=admin/star_wars&commit=b1&q=bounty+hunter'
 #   → returns People/21
 
 # main is untouched by the branch
-curl -u admin:root 'http://localhost:8080/search?domain=admin/star_wars&commit=c2&q=bounty+hunter'
+curl -u admin:root 'http://localhost:7372/search?domain=admin/star_wars&commit=c2&q=bounty+hunter'
 #   → does NOT return People/21
 ```
 
@@ -73,7 +73,7 @@ If a commit changes nothing indexable, point it at an existing snapshot:
 
 ```bash
 curl -u admin:root -X POST \
-  'http://localhost:8080/assign?domain=admin/star_wars&source_commit=c2&target_commit=c3'
+  'http://localhost:7372/assign?domain=admin/star_wars&source_commit=c2&target_commit=c3'
 # 204 — searching c3 now equals searching c2, with no embedding work
 ```
 
@@ -82,7 +82,7 @@ curl -u admin:root -X POST \
 Indexing is asynchronous, so search can lag the write head. If you search a commit that isn't indexed yet, the engine **serves the nearest indexed ancestor immediately** (never blocks) and tells you what it actually served via the **`TerminusDB-Data-Version`** response header:
 
 ```bash
-curl -u admin:root -D - 'http://localhost:8080/search?domain=admin/star_wars&commit=c9&q=wise+old+man'
+curl -u admin:root -D - 'http://localhost:7372/search?domain=admin/star_wars&commit=c9&q=wise+old+man'
 # HTTP/1.1 200 OK
 # TerminusDB-Data-Version: commit:c2          ← served from c2, not c9
 # [ ... results from c2 ... ]

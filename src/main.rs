@@ -5,7 +5,7 @@
 
 //! vectorlink server — standalone semantic search engine.
 //!
-//! Binds [::]:8080, answers liveness immediately, defers all heavy work.
+//! Binds [::]:7372, answers liveness immediately, defers all heavy work.
 //!
 //! Subcommands:
 //!   (no args)            — start the HTTP server
