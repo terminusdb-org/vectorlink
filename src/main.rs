@@ -10,6 +10,9 @@
 //! Subcommands:
 //!   (no args)            — start the HTTP server
 //!   prime-embed-cache    — read LanceDB embeddings and prime the sled cache
+//!   drop-store --yes     — delete the entire vectorlink store (data_dir) so it
+//!                          is recreated with the current VECTORLINK_EMBED_*
+//!                          parameters on next start
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -36,11 +39,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return prime_embed_cache(&args[2..]).await;
     }
 
+    if args.len() > 1 && args[1] == "drop-store" {
+        return drop_store(&args[2..]);
+    }
+
     run_server().await
+}
+
+/// Delete the entire vectorlink store (all domains, embeddings and caches) so
+/// it is recreated with the current embedding parameters on next start.
+/// Requires `--yes`; run only while the server is stopped.
+fn drop_store(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.iter().any(|a| a == "--yes") {
+        return Err(
+            "refusing to drop the store: pass --yes to delete all indexed vectors".into(),
+        );
+    }
+    let config = Config::from_env();
+    let data_dir = Path::new(&config.data_dir);
+    let params_path = data_dir.join(vectorlink::config::EMBEDDING_PARAMS_FILE);
+    if let Ok(contents) = std::fs::read_to_string(&params_path) {
+        eprintln!(
+            "[drop-store] store at {} was locked to: {}",
+            data_dir.display(),
+            contents.trim()
+        );
+    }
+    if data_dir.exists() {
+        std::fs::remove_dir_all(data_dir)?;
+    }
+    std::fs::create_dir_all(data_dir)?;
+    eprintln!(
+        "[drop-store] dropped {}; the store is recreated with the current VECTORLINK_EMBED_* parameters on next start",
+        data_dir.display()
+    );
+    Ok(())
 }
 
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env();
+
+    // Embedding parameters are locked into the store at creation; refuse to
+    // start with a configuration that does not match the locked parameters.
+    vectorlink::config::verify_or_lock_embedding_params(
+        Path::new(&config.data_dir),
+        &config.embed_provider,
+    )?;
 
     // Load the tokenizer (required for chunking).
     let tokenizer_path = Path::new(&config.tokenizer_path);
