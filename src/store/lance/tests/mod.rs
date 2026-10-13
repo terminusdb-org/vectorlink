@@ -1775,9 +1775,6 @@ fn rrf_merge_preserves_original_vector_distances() {
     );
 }
 
-// RRF distances should scale smoothly from 0.0, not create a bimodal
-// 0.0 / 0.5 cliff caused by normalising against the theoretical max.
-
 // VectorIndexConfig dimension validation.
 
 #[test]
