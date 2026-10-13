@@ -168,6 +168,7 @@ impl LanceStore {
                     find_match_and_next_words(content, &query_lower);
                 SuggestHit {
                     id: id.clone(),
+
                     snippet: Some(content.clone()),
                     match_start,
                     match_end,

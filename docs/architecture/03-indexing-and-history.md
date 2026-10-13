@@ -16,7 +16,7 @@ After this document you will be able to:
 
 The defining property of the system: indexing commit `C` with parent `P` is **not** a full rebuild. It is "take `P`'s index, add only what changed, save as `C`." The expensive artifacts — the vectors — are **shared** between `P` and `C`. Only changed documents are embedded and stored anew.
 
-This is what makes per-commit indexing affordable and is the behaviour tdb-search must preserve.
+This is what makes per-commit indexing affordable and is the behaviour vectorlink must preserve.
 
 ---
 
@@ -75,9 +75,9 @@ The indexer never pulls from TerminusDB; the parent commit comes from the `/last
 
 ## 4. 🆕 Mapping history onto LanceDB
 
-tdb-search keeps the *behaviour* of §2–§3 but replaces the storage with LanceDB. The product decision is **linear-per-branch** history (no merge semantics; merges land on the target branch as ordinary linear appends). Only **branch-out** must be supported.
+vectorlink keeps the *behaviour* of §2–§3 but replaces the storage with LanceDB. The product decision is **linear-per-branch** history (no merge semantics; merges land on the target branch as ordinary linear appends). Only **branch-out** must be supported.
 
-| Reference concept | tdb-search (LanceDB / Lance) |
+| Reference concept | vectorlink (LanceDB / Lance) |
 |-------------------|------------------------------|
 | `{domain}.vecs` (shared vectors) | A Lance dataset for the domain; rows carry the embedding |
 | `vec_id` (stable, shared) | A Lance row in a fragment; fragments shared across versions/branches. One row **per chunk** of a document (doc 05 §7), keyed `(doc_id, chunk_index)` |
@@ -128,4 +128,4 @@ Keying **globally by commit id (not per branch)** makes this a *comprehensive pa
 1. When indexing `C1` from `C0`, which documents get embedded? *(Only those changed between C0 and C1.)*
 2. What does `/assign` avoid doing? *(Recomputing/re-embedding — it just points a new commit at an existing index/version.)*
 3. Why does a search at `commit=C0` not see changes made in `C1`? *(Each commit is an isolated snapshot — a Lance version via MVCC, an HNSW file in the reference.)*
-4. Where does branching support come from in tdb-search, and what is the risk? *(The `lance` core crate's `create_branch`; it isn't in the high-level lancedb API and is not stability-labelled.)*
+4. Where does branching support come from in vectorlink, and what is the risk? *(The `lance` core crate's `create_branch`; it isn't in the high-level lancedb API and is not stability-labelled.)*

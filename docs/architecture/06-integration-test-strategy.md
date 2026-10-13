@@ -29,7 +29,7 @@ This complements — does not replace — the unit and store-level tests in `spe
 │ docker-compose.yml  (CPU-only, no external network)         │
 │                                                              │
 │  ┌────────────┐   push (NDJSON)   ┌──────────────────────┐  │
-│  │ terminusdb │──────────────────▶│      tdb-search      │  │
+│  │ terminusdb │──────────────────▶│      vectorlink      │  │
 │  │  :6363     │   operation ops   │        :8080         │  │
 │  └────────────┘                   │  LanceDB store (vol) │  │
 │                                   └─────────┬────────────┘  │
@@ -47,7 +47,7 @@ This complements — does not replace — the unit and store-level tests in `spe
 
 | Service | Role in tests | Determinism controls |
 |---------|---------------|----------------------|
-| `tdb-search` | System under test | Pinned image/build; fixed config; LanceDB volume reset per run |
+| `vectorlink` | System under test | Pinned image/build; fixed config; LanceDB volume reset per run |
 | `embeddings` (Ollama) | Real embeddings | **Pinned image + GGUF digests, Q8_0**, CPU, one-input-per-request for tests |
 | `terminusdb` | Real push source | Seeded from a fixed dataset bundle (Star Wars) at a known commit |
 | `test-runner` | Drives HTTP, asserts | Talks only to public endpoints |
@@ -154,7 +154,7 @@ When the model revision is intentionally bumped, golden vectors are regenerated 
 ```
 1. docker compose up --wait        (services report healthy)
 2. health gates:
-     GET tdb-search /statistics → 200
+     GET vectorlink /statistics → 200
      GET embeddings  (Ollama readiness) → 200
      terminusdb info           → 200
 3. seed: load Star Wars bundle (Level D) OR mount fixture ops (Levels A–C)

@@ -10,7 +10,7 @@ docker compose up
 
 This starts three services on CPU, with no external network after the one-time model pull:
 
-- `tdb-search` — the engine (HTTP API on `:8080`)
+- `vectorlink` — the engine (HTTP API on `:8080`)
 - `embeddings` — a local embedding model server
 - `terminusdb` — a TerminusDB server (only needed for the end-to-end example; the steps below don't use it)
 

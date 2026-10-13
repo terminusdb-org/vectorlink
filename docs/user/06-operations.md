@@ -67,8 +67,8 @@ Resolution order per setting: **command-line flag > environment variable > built
 | embedding dimension | `--dim` | `..._DIM` | `768` (fixed per index once created) |
 | provider key (if the provider needs one) | `--embed-key` | `..._EMBED_KEY` / `OPENAI_API_KEY` | — |
 | negative-cache TTL (seconds) | `--neg-cache-ttl` | `..._NEG_CACHE_TTL` | `3600` |
-| admin user | `--admin-user` | `TDB_SEARCH_ADMIN_USER` | `admin` |
-| admin secret | `--admin-secret` | `TDB_SEARCH_ADMIN_SECRET` | `root` |
+| admin user | `--admin-user` | `VECTORLINK_ADMIN_USER` | `admin` |
+| admin secret | `--admin-secret` | `VECTORLINK_ADMIN_SECRET` | `root` |
 
 The embedding dimension is fixed when an index is first created and is immutable; a query whose embedding dimension doesn't match the index fails loudly (`409`) — it is never silently padded.
 
