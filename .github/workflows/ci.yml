@@ -246,8 +246,8 @@ jobs:
 
           # Pull the embedding model (engine default: multilingual-e5-base)
           echo "Pulling multilingual-e5-base model..."
-          docker exec ollama ollama pull hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0
-          docker exec ollama ollama cp hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0 multilingual-e5-base
+          docker exec ollama ollama pull hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0
+          docker exec ollama ollama cp hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0 multilingual-e5-base
 
       - name: Start vectorlink engine
         run: |
@@ -357,8 +357,8 @@ jobs:
 
           # Pull the embedding model (engine default: multilingual-e5-base)
           echo "Pulling multilingual-e5-base model..."
-          docker exec ollama ollama pull hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0
-          docker exec ollama ollama cp hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0 multilingual-e5-base
+          docker exec ollama ollama pull hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0
+          docker exec ollama ollama cp hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0 multilingual-e5-base
 
       - name: Start vectorlink engine
         run: |

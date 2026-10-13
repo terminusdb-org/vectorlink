@@ -80,8 +80,8 @@ services:
     entrypoint: ["bash", "-c"]
     command:
       - |
-        ollama pull hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0 || true
-        ollama cp hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0 multilingual-e5-base 2>/dev/null || true
+        ollama pull hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0 || true
+        ollama cp hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0 multilingual-e5-base 2>/dev/null || true
         echo "Model ready."
     restart: "no"
 

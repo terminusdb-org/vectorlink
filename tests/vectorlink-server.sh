@@ -73,9 +73,9 @@ function start_server() {
     # Activate the default model in a local Ollama if it is not present: pull
     # the Q8_0 GGUF and tag it under the plain name the engine asks for.
     if command -v ollama >/dev/null 2>&1 && ! ollama show "$MODEL" >/dev/null 2>&1; then
-        echo "Model $MODEL not present in Ollama — pulling hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0..."
-        if ollama pull hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0; then
-            ollama cp hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0 "$MODEL" 2>/dev/null || true
+        echo "Model $MODEL not present in Ollama — pulling hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0..."
+        if ollama pull hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0; then
+            ollama cp hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0 "$MODEL" 2>/dev/null || true
         else
             echo "WARNING: model pull failed — embed calls will fail until $MODEL exists in Ollama"
         fi
