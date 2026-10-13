@@ -143,6 +143,10 @@ make lint             # OpenAPI (Redocly) + clippy (-D warnings) + eslint
 
 `#![forbid(unsafe_code)]` is in every crate. Introducing `unsafe` requires a reviewed, signed commit that removes the forbid attribute.
 
+## Engineering rules
+
+**No fallbacks without an approved standing rule.** Silent fallbacks — guessing a parent, substituting a default, retrying against different parameters — are never introduced as part of a feature or a merge resolution. If a code path cannot proceed correctly, it fails loud: a typed error naming what is missing, why it matters, and what the caller should do next. A fallback may only exist when it has been explicitly approved as a permanent, documented standing rule for that specific case; until then, errors surface, they do not get papered over. When reviewing incoming code that contains a fallback, do not resolve the conflict in its favor — flag it, and either remove it or get it approved before merge.
+
 ## Source layout
 
 ```
