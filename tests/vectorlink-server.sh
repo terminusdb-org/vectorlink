@@ -139,7 +139,7 @@ function stop_server() {
         echo "Stopping vectorlink (PID: $pid)..."
         kill "$pid"
 
-        local max_wait=130
+        local max_wait=140
         local waited=0
         while ps -p "$pid" > /dev/null 2>&1 && [ $waited -lt $max_wait ]; do
             sleep 1

@@ -11,10 +11,10 @@ Every parameter may be given as a query parameter **or** in the JSON body. **The
 
 ```bash
 # GET
-curl -u admin:root 'http://localhost:8080/search?domain=admin/star_wars&commit=c1&q=wise+old+man&mode=hybrid'
+curl -u admin:root 'http://localhost:7372/search?domain=admin/star_wars&commit=c1&q=wise+old+man&mode=hybrid'
 
 # POST
-curl -u admin:root -X POST http://localhost:8080/search \
+curl -u admin:root -X POST http://localhost:7372/search \
   -H 'Content-Type: application/json' \
   -d '{"domain":"admin/star_wars","commit":"c1","q":"wise old man","mode":"hybrid","count":5}'
 ```
@@ -43,7 +43,7 @@ curl -u admin:root -X POST http://localhost:8080/search \
 - In JSON, use arrays: `"doc_type": ["People", "Species"]`.
 
 ```bash
-curl -u admin:root -X POST http://localhost:8080/search \
+curl -u admin:root -X POST http://localhost:7372/search \
   -H 'Content-Type: application/json' \
   -d '{"domain":"admin/star_wars","commit":"c1","q":"engineer","doc_type":["Species"]}'
 ```
@@ -59,7 +59,7 @@ curl -u admin:root -X POST http://localhost:8080/search \
 - **fts**: exact keywords, identifiers, rare tokens that embeddings blur.
 
 ```bash
-curl -u admin:root 'http://localhost:8080/search?domain=admin/star_wars&commit=c1&q=Mon+Calamari&mode=fts'
+curl -u admin:root 'http://localhost:7372/search?domain=admin/star_wars&commit=c1&q=Mon+Calamari&mode=fts'
 ```
 
 ## Reading the response
@@ -87,7 +87,7 @@ curl -u admin:root 'http://localhost:8080/search?domain=admin/star_wars&commit=c
 Add `snippet=true` to include the matched chunk's text as `chunk.snippet` (omitted by default to keep responses small):
 
 ```bash
-curl -u admin:root 'http://localhost:8080/search?domain=admin/star_wars&commit=c1&q=wise+old+man&snippet=true'
+curl -u admin:root 'http://localhost:7372/search?domain=admin/star_wars&commit=c1&q=wise+old+man&snippet=true'
 ```
 ```json
 [ { "id": "terminusdb:///star-wars/People/20", "distance": 0.0939,
@@ -99,13 +99,13 @@ curl -u admin:root 'http://localhost:8080/search?domain=admin/star_wars&commit=c
 
 ```bash
 # more like a known document
-curl -u admin:root 'http://localhost:8080/similar?domain=admin/star_wars&commit=c1&id=terminusdb:///star-wars/People/20'
+curl -u admin:root 'http://localhost:7372/similar?domain=admin/star_wars&commit=c1&id=terminusdb:///star-wars/People/20'
 
 # near-duplicate groups within a population (bounded by threshold + pagination)
-curl -u admin:root 'http://localhost:8080/duplicates?domain=admin/star_wars&commit=c1&threshold=0.05'
+curl -u admin:root 'http://localhost:7372/duplicates?domain=admin/star_wars&commit=c1&threshold=0.05'
 
 # cross-catalogue entity resolution: pairs that straddle Abt (set) and Buy (target)
-curl -u admin:root 'http://localhost:8080/duplicates?domain=admin/er&commit=c1&threshold=0.1&doc_type=Abt&target_doc_type=Buy&snippet=true'
+curl -u admin:root 'http://localhost:7372/duplicates?domain=admin/er&commit=c1&threshold=0.1&doc_type=Abt&target_doc_type=Buy&snippet=true'
 ```
 
 Each result is a `{ "group": [ {"id"[, "snippet"]}, … ], "distance": <0..1> }`, sorted nearest-first. `/duplicates` is always bounded; it never runs an unbounded all-pairs scan.

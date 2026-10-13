@@ -22,8 +22,17 @@ pub struct AppState {
     pub config: Config,
 }
 
-/// Build the axum router with all endpoints wired.
+/// Build the axum router with all endpoints wired, admin-secret enforced.
 pub fn router(service: SearchService, config: Config) -> Router {
     let state = AppState { service, config };
-    handlers::build_router(state)
+    handlers::build_router(state, true)
+}
+
+/// Build the axum router for a trusted in-process caller (no auth layer).
+///
+/// Only reachable through a library embedding where requests are already
+/// authorized by the host — never expose this on a socket.
+pub fn trusted_router(service: SearchService, config: Config) -> Router {
+    let state = AppState { service, config };
+    handlers::build_router(state, false)
 }

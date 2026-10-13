@@ -119,10 +119,10 @@ impl EmbedCache {
             return None;
         }
         let floats: Vec<f32> = decompressed
-            .chunks_exact(4)
-            .map(|chunk| {
-                f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-            })
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         Some(floats)
     }
@@ -227,8 +227,10 @@ mod tests {
         let compressed = ruzstd::encoding::compress_to_vec(&raw[..], ZSTD_LEVEL);
         let decompressed = decompress_zstd(&compressed).expect("decode");
         let floats: Vec<f32> = decompressed
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(floats, embedding, "roundtrip preserves exact values");
     }

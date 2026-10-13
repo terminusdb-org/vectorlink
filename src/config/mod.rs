@@ -293,7 +293,7 @@ impl Config {
             port: std::env::var("VECTORLINK_PORT")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(8080),
+                .unwrap_or(7372),
             embed_provider,
             embed_api_key: std::env::var("VECTORLINK_EMBED_API_KEY")
                 .ok()
@@ -350,7 +350,7 @@ impl Default for Config {
         Self {
             admin_user: "admin".to_owned(),
             admin_secret: "root".to_owned(),
-            port: 8080,
+            port: 7372,
             embed_provider: Provider::OpenAiCompatible {
                 base_url: "http://localhost:11434".to_owned(),
                 model: "nomic-embed-text-v2-moe".to_owned(),
