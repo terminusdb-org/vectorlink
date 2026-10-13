@@ -29,6 +29,12 @@ use crate::store::lance::{LanceStore, MAIN_BRANCH};
 /// resolvable to a version in the domain dataset, this is an error — we never
 /// silently create an empty branch or guess a parent.
 ///
+/// FALLBACK: if the parent commit's tag does not exist (e.g. the branch was
+/// created in TerminusDB but its initial commit was never pushed to the engine),
+/// the branch is forked from the main branch's latest version instead. This is
+/// correct because TerminusDB branches inherit the parent branch's state, and
+/// main's latest indexed version is the closest indexed ancestor.
+///
 /// `branch == "main"` always exists (the Lance native default branch); a
 /// branch-out request for main is a no-op `AlreadyExists`.
 pub async fn io_ensure_branch_forked(
@@ -61,6 +67,24 @@ pub async fn io_ensure_branch_forked(
     match store.io_create_branch_from_tag(domain, branch, parent_commit).await {
         Ok(parent_version) => Ok(BranchOutcome::Created { parent_version }),
         Err(e) if is_already_exists(&e) => Ok(BranchOutcome::AlreadyExists),
+        Err(e) if is_ref_not_found(&e) => {
+            // The parent commit's tag doesn't exist in the engine — this
+            // happens when a TerminusDB branch is created but its initial
+            // commit was never pushed (e.g. schema-only commit that didn't
+            // trigger indexing). Fall back to forking from main's latest
+            // version, which is the closest indexed ancestor.
+            //
+            // Guard: only fall back if the domain dataset already exists
+            // (main has been indexed). If the domain doesn't exist at all,
+            // propagate the original error — branching an unindexed domain
+            // must fail loud.
+            if !store.dataset_path(domain).exists() {
+                return Err(e);
+            }
+            let main_version = store.io_branch_head_version(domain, MAIN_BRANCH).await?;
+            store.io_create_branch(domain, branch, main_version).await?;
+            Ok(BranchOutcome::Created { parent_version: main_version })
+        }
         Err(e) => Err(e),
     }
 }
@@ -70,6 +94,13 @@ pub async fn io_ensure_branch_forked(
 fn is_already_exists(e: &StoreError) -> bool {
     let msg = e.to_string().to_lowercase();
     msg.contains("already exists")
+}
+
+/// Whether a store error reports that a tag/ref was not found — triggers the
+/// main-branch fallback for branch creation.
+fn is_ref_not_found(e: &StoreError) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("ref not found") || msg.contains("does not exist")
 }
 
 /// Result of a branch-out attempt.
@@ -140,6 +171,52 @@ mod tests {
         let result =
             io_ensure_branch_forked(&store, "admin/empty", "feature", "no_such_commit").await;
         assert!(result.is_err(), "branching an unindexed parent must fail loud");
+    }
+
+    // --- branch-out falls back to main's latest when parent tag is missing ---
+    //
+    // When a TerminusDB branch is created but its initial commit was never
+    // pushed to the engine (e.g. schema-only commit), the parent commit's tag
+    // won't exist. The fallback forks from main's latest indexed version
+    // instead — the closest indexed ancestor.
+    #[tokio::test]
+    async fn branch_out_falls_back_to_main_when_parent_tag_missing() {
+        let (store, _tmp) = make_test_store(8);
+        let domain = "admin/fallback";
+
+        // Seed main with docs and tag c0.
+        let v_main = seed_main_commit(&store, domain, "c0", &["A", "B"]).await;
+
+        // Try to branch from a non-existent commit tag — should fall back to
+        // main's latest version, not fail.
+        let outcome =
+            io_ensure_branch_forked(&store, domain, "feature", "nonexistent_commit_tag").await;
+        assert!(
+            outcome.is_ok(),
+            "branch-out with missing parent tag should fall back to main, not fail: {:?}",
+            outcome
+        );
+        assert_eq!(
+            outcome.unwrap(),
+            BranchOutcome::Created {
+                parent_version: v_main
+            },
+            "fallback should fork from main's latest indexed version"
+        );
+
+        // The branch should see main's docs (inherited via block reuse).
+        let branch_files = store
+            .io_branch_data_file_paths(domain, "feature")
+            .await
+            .expect("branch files");
+        let main_files = store
+            .io_branch_data_file_paths(domain, "main")
+            .await
+            .expect("main files");
+        assert!(
+            branch_files.is_superset(&main_files),
+            "fallback branch must share main's fragment files"
+        );
     }
 
     // --- branch-out on main is a no-op AlreadyExists ---

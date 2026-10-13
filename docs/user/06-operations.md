@@ -7,7 +7,7 @@ Auth, health, statistics, and configuration for running the engine.
 Every functional endpoint requires a shared **admin secret** over HTTP Basic:
 
 ```bash
-curl -u admin:root 'http://localhost:8080/statistics'
+curl -u admin:root 'http://localhost:7372/statistics'
 ```
 
 - Default `admin:root` — **change it for any exposed deployment** (see configuration below).
@@ -20,8 +20,8 @@ There is **no embedding-key request header** — the engine owns its model and c
 ## Health & readiness
 
 ```bash
-curl -fsS http://localhost:8080/health/live    # process up — answers immediately
-curl -fsS http://localhost:8080/health/ready    # can it actually serve?
+curl -fsS http://localhost:7372/health/live    # process up — answers immediately
+curl -fsS http://localhost:7372/health/ready    # can it actually serve?
 ```
 
 Readiness is **per-capability** so an orchestrator can route/scale on the right signal:
@@ -38,7 +38,7 @@ An instance can be ready-to-index before ready-to-search. While the embedding ba
 ## Statistics
 
 ```bash
-curl -u admin:root http://localhost:8080/statistics
+curl -u admin:root http://localhost:7372/statistics
 ```
 
 ```json
@@ -60,7 +60,7 @@ Resolution order per setting: **command-line flag > environment variable > built
 | Setting | Flag | Env | Default |
 |---------|------|-----|---------|
 | storage directory | `--directory` | — | (required) |
-| listen port | `--port` | — | `8080` |
+| listen port | `--port` | — | `7372` |
 | embedding provider | `--provider` | `..._PROVIDER` | local sidecar (OpenAI-compatible) |
 | provider URL | `--embed-url` | `..._EMBED_URL` | the bundled embeddings service |
 | embedding model | `--model` | `..._MODEL` | `nomic-ai/nomic-embed-text-v2-moe` |

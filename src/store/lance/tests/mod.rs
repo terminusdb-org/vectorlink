@@ -11197,8 +11197,7 @@ async fn fts_search_works_at_all_commit_versions() {
 
         let is_boundary = crate::store::lance::should_index_commit(commit_position);
 
-        let tagged_version;
-        if is_boundary {
+        let tagged_version = if is_boundary {
             // Boundary: full index optimization + cascade.
             let ds_arc = store
                 .io_open_dataset_uncached(domain, "main")
@@ -11215,15 +11214,14 @@ async fn fts_search_works_at_all_commit_versions() {
             let delta_count = store.io_get_delta_count(domain, "main").await;
             let _ = io_incremental_cascade(&mut ds, delta_count).await;
 
-            tagged_version = ds.version().version;
+            ds.version().version
         } else {
             // Non-boundary: ensure FTS index exists and covers new fragments.
-            let fts_v = store
+            store
                 .io_ensure_fts_index(domain, "main")
                 .await
-                .expect("FTS ensure");
-            tagged_version = fts_v;
-        }
+                .expect("FTS ensure")
+        };
 
         store
             .io_tag_commit(domain, "main", &format!("c{}", i), tagged_version)

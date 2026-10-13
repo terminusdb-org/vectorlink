@@ -7,13 +7,15 @@
 //! No business logic; thin translation only.
 
 use axum::extract::{Query, RawQuery, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use axum::body::Body;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use super::auth::auth_middleware;
 use super::AppState;
@@ -1977,7 +1979,29 @@ async fn handle_candidates(
 
 // ─────────────────────────── Router construction ──────────────────────────
 
-pub fn build_router(state: AppState) -> Router {
+pub fn build_router(state: AppState, require_auth: bool) -> Router {
+    // Mirror TerminusDB's CORS policy: reflect the requester's Origin header
+    // back as Access-Control-Allow-Origin (no wildcard). This allows
+    // credentials (Basic Auth) to work cross-origin while restricting
+    // access to origins the browser actually came from.
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_credentials(true)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("accept"),
+            HeaderName::from_static("origin"),
+        ])
+        .max_age(Duration::from_secs(1728000));
+
     // Authenticated routes (admin-secret required).
     let authed_routes = Router::new()
         .route("/last-indexed", get(handle_last_indexed))
@@ -1994,8 +2018,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/integrity", get(handle_integrity))
         .route("/embeddings", get(handle_embeddings).post(handle_embeddings_post))
         .route("/domain", delete(handle_delete_domain))
-        .route("/branch-index", delete(handle_delete_branch_index))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route("/branch-index", delete(handle_delete_branch_index));
+    let authed_routes = if require_auth {
+        authed_routes.layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+    } else {
+        authed_routes
+    };
 
     // Unauthenticated routes (health probes).
     let public_routes = Router::new()
@@ -2005,6 +2036,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .merge(authed_routes)
         .merge(public_routes)
+        .layer(cors)
         .with_state(state)
 }
 
