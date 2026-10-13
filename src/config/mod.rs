@@ -126,7 +126,9 @@ impl LockedEmbeddingParams {
     pub fn from_provider(provider: &Provider) -> Self {
         Self {
             provider: provider.kind().to_owned(),
-            base_url: provider.base_url().to_owned(),
+            // Normalized like io_embed does, so a trailing slash in
+            // VECTORLINK_EMBED_URL cannot false-positive the lock check.
+            base_url: provider.base_url().trim_end_matches('/').to_owned(),
             model: provider.model_name().to_owned(),
             dim: provider.expected_dim(),
         }
@@ -164,7 +166,8 @@ pub fn verify_or_lock_embedding_params(
                  but the current configuration resolves to\n{}\n\
                  All stored embeddings are only valid for the locked parameters. Restore the \
                  original parameters, or drop and recreate the entire store with \
-                 `vectorlink drop-store --yes` (deletes all indexed vectors).",
+                 `vectorlink drop-store --yes` — embedded in TerminusDB, delete the vectorlink \
+                 directory under the storage path instead (deletes all indexed vectors).",
                 data_dir.display(),
                 serde_json::to_string_pretty(&locked).unwrap_or_default(),
                 serde_json::to_string_pretty(&current).unwrap_or_default()
