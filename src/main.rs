@@ -79,6 +79,16 @@ fn drop_store(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env();
 
+    // The admin secret has no default — refuse to start without one. In
+    // container deployments it comes from .env via compose interpolation
+    // (see .env.example); embedded mode never reaches this code path.
+    if config.admin_secret.is_empty() {
+        return Err("VECTORLINK_ADMIN_SECRET is not set — the server requires an admin \
+             secret and there is no default. Set it in the environment or in .env \
+             (see .env.example)"
+            .into());
+    }
+
     // Embedding parameters are locked into the store at creation; refuse to
     // start with a configuration that does not match the locked parameters.
     vectorlink::config::verify_or_lock_embedding_params(

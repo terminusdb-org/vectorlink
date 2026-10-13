@@ -6,7 +6,7 @@ Every command uses two short environment variables so you can paste the whole th
 
 ```bash
 export URL=http://localhost:8081      # the engine (docker compose maps it to :8081)
-export CRED=admin:root                # admin secret (HTTP Basic) — the compose default
+export CRED=admin:root                # admin secret (HTTP Basic) — value from .env
 ```
 
 > `curl -u "$CRED"` sends the admin secret on every call. Health probes don't need it.

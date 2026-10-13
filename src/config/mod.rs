@@ -249,7 +249,7 @@ impl Config {
         let embed_url = std::env::var("VECTORLINK_EMBED_URL")
             .unwrap_or_else(|_| "http://localhost:11434".to_owned());
         let model = std::env::var("VECTORLINK_MODEL")
-            .unwrap_or_else(|_| "nomic-embed-text-v2-moe".to_owned());
+            .unwrap_or_else(|_| "multilingual-e5-base".to_owned());
         let dim: usize = std::env::var("VECTORLINK_DIM")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -288,8 +288,10 @@ impl Config {
         Self {
             admin_user: std::env::var("VECTORLINK_ADMIN_USER")
                 .unwrap_or_else(|_| "admin".to_owned()),
-            admin_secret: std::env::var("VECTORLINK_ADMIN_SECRET")
-                .unwrap_or_else(|_| "root".to_owned()),
+            // No default: an empty secret means unset. The server binary
+            // refuses to start without it; the embedded (trusted_router)
+            // path does no auth and never reads it.
+            admin_secret: std::env::var("VECTORLINK_ADMIN_SECRET").unwrap_or_default(),
             port: std::env::var("VECTORLINK_PORT")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -330,7 +332,7 @@ impl Config {
             port,
             embed_provider: Provider::OpenAiCompatible {
                 base_url: "http://localhost:11434".to_owned(),
-                model: "nomic-embed-text-v2-moe".to_owned(),
+                model: "multilingual-e5-base".to_owned(),
                 dim: 768,
             },
             embed_api_key: None,
@@ -353,7 +355,7 @@ impl Default for Config {
             port: 7372,
             embed_provider: Provider::OpenAiCompatible {
                 base_url: "http://localhost:11434".to_owned(),
-                model: "nomic-embed-text-v2-moe".to_owned(),
+                model: "multilingual-e5-base".to_owned(),
                 dim: 768,
             },
             embed_api_key: None,

@@ -75,7 +75,7 @@ POST /push?domain={domain}&branch={branch}&target_commit={C}&parent_commit={P}
 - `{domain}` — e.g. `admin/star_wars`.
 - `{branch}` — e.g. `main`.
 - `{parent_commit}` — comes from the `/last-indexed` handshake; TerminusDB computes the diff from there to `{target_commit}`.
-- **Auth** — every indexer request is gated by a shared admin secret over **HTTP Basic** (`admin:root` by default). This is authentication only — there is no RBAC at the indexer. TerminusDB fronts search and authorises the caller against its own capability system before calling the indexer.
+- **Auth** — every indexer request is gated by a shared admin secret over **HTTP Basic** (`VECTORLINK_ADMIN_SECRET`, required — no default). This is authentication only — there is no RBAC at the indexer. TerminusDB fronts search and authorises the caller against its own capability system before calling the indexer.
 - **Body** — an NDJSON stream, parsed line-by-line and processed incrementally in chunks (never buffered whole).
 - **Failure** → the push fails loudly with the status code and body (no silent fallback).
 

@@ -31,8 +31,8 @@ The glossary in [README](./README.md). No prior VectorLink knowledge assumed.
 │  │  LanceDB  │   │  embed client │──────────▶ ┌──────────────────────┐
 │  │  store    │   └───────────────┘   /v1/     │  Embedding provider   │
 │  │ (vectors, │                        embed   │  default: local Ollama │
-│  │  FTS,     │                                │  sidecar (nomic-embed- │
-│  │  versions)│                                │  text-v2-moe)          │
+│  │  FTS,     │                                │  sidecar (e5-base,    │
+│  │  versions)│                                │  GGUF Q8_0)            │
 │  └───────────┘                                └───────────────────────┘
 └────────────────────────────────────────────────────────────────────────┘
 ```
@@ -41,7 +41,7 @@ The glossary in [README](./README.md). No prior VectorLink knowledge assumed.
 |-----------|----------------|--------|
 | **TerminusDB** | Stores documents and their full commit history; knows the diff between any two commits; renders documents to embedding strings via GraphQL + Handlebars; **renders text and PUSHES deltas** to the indexer; **fronts search** (authorises the caller, then calls the indexer). | Unchanged |
 | **vectorlink** | The semantic indexer: HTTP API that **receives pushes, embeds them, stores them versioned, and answers search**. | Reimplemented (this project) |
-| **Embedding provider** | Turns text into vectors. | 🆕 configurable; default is a local Ollama sidecar serving a CPU model (nomic-embed-text-v2-moe) |
+| **Embedding provider** | Turns text into vectors. | 🆕 configurable; default is a local Ollama sidecar serving a CPU model (multilingual-e5-base) |
 | **LanceDB store** | Versioned columnar storage of vectors + full-text index. | 🆕 replaces bespoke HNSW + paged vector store |
 | **Caller / app** | Configures embedding templates, edits documents, runs searches via TerminusDB. | Unchanged |
 

@@ -819,10 +819,12 @@ paths:
           application/x-ndjson:
             schema: { $ref: '#/components/schemas/EmbeddingsNdjsonLine' }
             examples:
-              bidirectional:
-                value: |
-                  {"domain":"admin/star_wars","commit":"abc123","doc_types":["People"]}
-                  {"domain":"admin/star_wars","commit":"abc123","doc_id":"terminusdb:///star-wars/People/1"}
+              contextLine:
+                summary: First line — sets domain/commit/doc_types context
+                value: { domain: "admin/star_wars", commit: "abc123", doc_types: ["People"] }
+              documentLine:
+                summary: Subsequent lines — one doc_id each, context inherited
+                value: { domain: "admin/star_wars", commit: "abc123", doc_id: "terminusdb:///star-wars/People/1" }
       responses:
         '200':
           description: Embedding records (JSON array or NDJSON stream).
@@ -1042,6 +1044,8 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Liveness' }
               examples: { up: { value: { status: "ok" } } }
+        '405':
+          description: Method not allowed — probes are GET-only.
 
   /health/ready:
     get:
@@ -1065,6 +1069,8 @@ paths:
               examples:
                 bothReady: { value: { ready: true, index: true, search: true } }
                 indexOnly: { value: { ready: true, index: true, search: false } }
+        '405':
+          description: Method not allowed — probes are GET-only.
         '503':
           description: Not yet ready to serve (e.g. store not open).
           content:

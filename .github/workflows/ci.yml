@@ -244,9 +244,10 @@ jobs:
             sleep 1
           done
 
-          # Pull the embedding model
-          echo "Pulling nomic-embed-text-v2-moe model..."
-          docker exec ollama ollama pull nomic-embed-text-v2-moe
+          # Pull the embedding model (engine default: multilingual-e5-base)
+          echo "Pulling multilingual-e5-base model..."
+          docker exec ollama ollama pull hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0
+          docker exec ollama ollama cp hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0 multilingual-e5-base
 
       - name: Start vectorlink engine
         run: |
@@ -255,8 +256,6 @@ jobs:
           VECTORLINK_ADMIN_SECRET=root \
           VECTORLINK_EMBED_PROVIDER=openai_compatible \
           VECTORLINK_EMBED_URL=http://127.0.0.1:11434 \
-          VECTORLINK_MODEL=nomic-embed-text-v2-moe \
-          VECTORLINK_DIM=768 \
           VECTORLINK_DATA_DIR=/tmp/vectorlink-ci-data \
           VECTORLINK_TOKENIZER_PATH=$GITHUB_WORKSPACE/assets/tokenizer.json.bz2 \
           RUST_LOG=info \
@@ -265,7 +264,7 @@ jobs:
 
           # Wait for engine readiness
           for i in $(seq 1 100); do
-            if curl -fsS http://127.0.0.1:8080/health/live >/dev/null 2>&1; then
+            if curl -fsS http://127.0.0.1:7372/health/live >/dev/null 2>&1; then
               echo "vectorlink engine is live"
               break
             fi
@@ -356,9 +355,10 @@ jobs:
             sleep 1
           done
 
-          # Pull the embedding model
-          echo "Pulling nomic-embed-text-v2-moe model..."
-          docker exec ollama ollama pull nomic-embed-text-v2-moe
+          # Pull the embedding model (engine default: multilingual-e5-base)
+          echo "Pulling multilingual-e5-base model..."
+          docker exec ollama ollama pull hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0
+          docker exec ollama ollama cp hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0 multilingual-e5-base
 
       - name: Start vectorlink engine
         run: |
@@ -368,8 +368,6 @@ jobs:
           VECTORLINK_ADMIN_SECRET=root \
           VECTORLINK_EMBED_PROVIDER=openai_compatible \
           VECTORLINK_EMBED_URL=http://127.0.0.1:11434 \
-          VECTORLINK_MODEL=nomic-embed-text-v2-moe \
-          VECTORLINK_DIM=768 \
           VECTORLINK_DATA_DIR=/tmp/vectorlink-e2e-data \
           VECTORLINK_TOKENIZER_PATH=$GITHUB_WORKSPACE/assets/tokenizer.json.bz2 \
           RUST_LOG=info \

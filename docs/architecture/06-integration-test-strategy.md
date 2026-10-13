@@ -36,8 +36,8 @@ This complements — does not replace — the unit and store-level tests in `spe
 │                                             │ /v1/embeddings│
 │                                   ┌─────────▼────────────┐  │
 │                                   │ embeddings (Ollama)  │  │
-│                                   │  nomic-embed-text-   │  │
-│                                   │  v2-moe (GGUF, Q8_0) │  │
+│                                   │  multilingual-e5-    │  │
+│                                   │  base (GGUF, Q8_0)   │  │
 │                                   │  @ pinned digests,CPU│  │
 │                                   └──────────────────────┘  │
 │                                                             │
@@ -124,7 +124,7 @@ The fidelity smoke test, reproducing the VectorLink blog:
 - Seed TerminusDB with the Star Wars bundle; configure the `People`/`Species` embedding templates; create commit `C0`.
 - Let TerminusDB push `C0` to the indexer; wait until the indexer's `/last-indexed` reports `C0`.
 - Assert: `"Wise old man"` → top hit `People/20` (Yoda); `"Who are the squid people"` → top hit `Species/8` (Mon Calamari).
-- **Prefix-table test:** the default model receives nomic prefixes; an unknown model name receives none; embedding the same text as document vs query yields different vectors.
+- **Prefix-table test:** the default model receives its asymmetric e5 prefixes (`passage:`/`query:`); an unknown model name receives none; embedding the same text as document vs query yields different vectors.
 - **Distance-scale test:** self-distance ≈ `0.0`; reported distance ∈ `[0,1]`; equals `lance_cosine_distance / 2` within tolerance.
 - **CPU/no-network assertion:** the stack completes with no GPU and no egress.
 
@@ -182,4 +182,4 @@ Health gates must use **DOM/endpoint readiness polling, not fixed sleeps** (a pr
 2. What is the single configuration choice that most directly removes the batching nondeterminism in tests? *(One input per embedding request — no padding partners.)*
 3. How do you prove incremental indexing reused parent blocks rather than recomputing? *(Show only the changed doc was embedded — call count/provenance — and that the old commit's search result is unchanged.)*
 4. Why reset the LanceDB volume between runs? *(So versions/commits/tags start clean and results are reproducible.)*
-5. Which test guards the nomic prefix requirement? *(Embedding the same text as document vs query and asserting the vectors differ.)*
+5. Which test guards the e5 prefix requirement? *(Embedding the same text as document vs query and asserting the vectors differ.)*

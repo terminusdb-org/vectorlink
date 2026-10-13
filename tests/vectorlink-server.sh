@@ -26,7 +26,7 @@ ADMIN_SECRET="${VECTORLINK_ADMIN_SECRET:-root}"
 DATA_DIR="${VECTORLINK_DATA_DIR:-/tmp/vectorlink-data}"
 TOKENIZER_PATH="${VECTORLINK_TOKENIZER_PATH:-$PROJECT_ROOT/assets/tokenizer.json.bz2}"
 EMBED_URL="${VECTORLINK_EMBED_URL:-http://127.0.0.1:11434}"
-MODEL="${VECTORLINK_MODEL:-nomic-embed-text-v2-moe}"
+MODEL="${VECTORLINK_MODEL:-multilingual-e5-base}"
 DIM="${VECTORLINK_DIM:-768}"
 BINARY="${VECTORLINK_BINARY:-$PROJECT_ROOT/target/release/vectorlink}"
 
@@ -69,6 +69,17 @@ function start_server() {
     export VECTORLINK_MODEL="$MODEL"
     export VECTORLINK_DIM="$DIM"
     export VECTORLINK_EMBED_CACHE_SIZE="${VECTORLINK_EMBED_CACHE_SIZE:-3000000}"
+
+    # Activate the default model in a local Ollama if it is not present: pull
+    # the Q8_0 GGUF and tag it under the plain name the engine asks for.
+    if command -v ollama >/dev/null 2>&1 && ! ollama show "$MODEL" >/dev/null 2>&1; then
+        echo "Model $MODEL not present in Ollama — pulling hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0..."
+        if ollama pull hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0; then
+            ollama cp hf.co/tatsuyaaaaaaa/multilingual-e5-base-gguf:Q8_0 "$MODEL" 2>/dev/null || true
+        else
+            echo "WARNING: model pull failed — embed calls will fail until $MODEL exists in Ollama"
+        fi
+    fi
 
     # Start in a new session so it survives the script exiting
     python3 -c "
@@ -267,7 +278,7 @@ case "${1:-}" in
         echo "  VECTORLINK_DATA_DIR       - Data directory (default: /tmp/vectorlink-data)"
         echo "  VECTORLINK_TOKENIZER_PATH - Tokenizer path (default: assets/tokenizer.json.bz2)"
         echo "  VECTORLINK_EMBED_URL      - Ollama URL (default: http://127.0.0.1:11434)"
-        echo "  VECTORLINK_MODEL          - Embedding model (default: nomic-embed-text-v2-moe)"
+        echo "  VECTORLINK_MODEL          - Embedding model (default: multilingual-e5-base)"
         echo "  VECTORLINK_DIM            - Embedding dimension (default: 768)"
         echo "  TERMINUSDB_INDEXER_BACKEND       - Indexer backend (default: http_vectorlink)"
         echo "  TERMINUSDB_VECTORLINK_ENDPOINT   - Indexer push target (default: http://127.0.0.1:7372)"

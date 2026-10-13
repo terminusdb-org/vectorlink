@@ -30,7 +30,8 @@ pub enum EmbeddingRole {
     Classification,
 }
 
-/// Task prefix set for a model (all four nomic prefixes).
+/// Task prefix set for a model (e.g. the four nomic roles, or e5's
+/// passage:/query: asymmetric pair).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskPrefix {
     pub document: &'static str,
