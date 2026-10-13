@@ -83,7 +83,16 @@ impl EmbedCache {
                     .flush_every_ms(Some(SLED_FLUSH_MS))
                     .cache_capacity(SLED_CACHE_CAPACITY_BYTES)
                     .open()
-                    .expect("failed to open sled embed cache");
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "failed to open sled embed cache at {}: {} — \
+                             if this is a lock acquisition error, another vectorlink process is \
+                             using the same data directory (check for a running instance or a \
+                             stale process holding the sled lock)",
+                            path.display(),
+                            e
+                        )
+                    });
                 Self {
                     db: Some(db),
                     enabled: true,
