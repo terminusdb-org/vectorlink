@@ -190,12 +190,27 @@ impl SearchService {
             .unwrap_or(true);
         let ready_search = Arc::new(std::sync::atomic::AtomicBool::new(search_ready));
 
+        let mut http_client_builder = reqwest::Client::builder();
+        if let Some(key) = &config.embed_api_key {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", key)
+                    .parse()
+                    .expect("VECTORLINK_EMBED_API_KEY contains invalid header characters"),
+            );
+            http_client_builder = http_client_builder.default_headers(headers);
+        }
+        let http_client = http_client_builder
+            .build()
+            .expect("failed to build http client");
+
         Self {
             store,
             config,
             tokenizer: Arc::new(tokenizer),
             chunk_params,
-            http_client: reqwest::Client::new(),
+            http_client,
             embed_cache,
             ready_index,
             ready_search,
@@ -3587,6 +3602,7 @@ mod tests_exact_duplicate_override {
                 model: "test-model".to_owned(),
                 dim,
             },
+            embed_api_key: None,
             data_dir: "/tmp/test".to_owned(),
             tokenizer_path: "assets/tokenizer.json.bz2".to_owned(),
             embed_batch_size: 32,

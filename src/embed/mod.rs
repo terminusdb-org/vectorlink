@@ -100,6 +100,15 @@ pub enum Provider {
 }
 
 impl Provider {
+    /// Stable identifier for the provider kind, matching `VECTORLINK_EMBED_PROVIDER`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Provider::OpenAiCompatible { .. } => "openai_compatible",
+            Provider::OpenAi { .. } => "openai",
+            Provider::GenericHttp { .. } => "generic_http",
+        }
+    }
+
     pub fn model_name(&self) -> &str {
         match self {
             Provider::OpenAiCompatible { model, .. } => model,
