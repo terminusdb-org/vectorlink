@@ -21,5 +21,5 @@ You **push** the text that changed between two commits; vectorlink embeds it and
 ## Conventions in these docs
 
 - Base URL is `http://localhost:7372` (the default).
-- Every request carries the admin secret as HTTP Basic auth: `-u admin:root` (change it for any exposed deployment).
+- Every request carries the admin secret as HTTP Basic auth: `-u admin:root` — `root` is the secret set by `.env.example` in the quickstart; there is no built-in default.
 - The full machine-readable contract is [`../../openapi.yaml`](../../openapi.yaml); render it with `make docs`.
