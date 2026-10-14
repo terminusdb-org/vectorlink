@@ -496,6 +496,7 @@ impl SearchService {
     /// When `progress_tx` is `Some`, the pipeline sends `ProgressUpdate` messages
     /// through it as NDJSON progress lines. The caller holds the `progress_rx`
     /// and streams its items as the HTTP response body.
+    #[allow(clippy::too_many_arguments)]
     pub async fn push_stream(
         &self,
         domain_raw: &str,
@@ -504,6 +505,7 @@ impl SearchService {
         parent_commit: Option<&str>,
         operation_rx: mpsc::Receiver<Operation>,
         progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
+        expected_docs: Option<u64>,
     ) -> Result<String, ServiceError> {
         let rp =
             parse_domain(domain_raw).map_err(|e| ServiceError::Validation(e.to_string()))?;
@@ -631,6 +633,7 @@ impl SearchService {
             // new push, releasing memory from the old pipeline.
             let result = io_run_index_pipeline_stream(
                 &ctx, &commit, operation_rx, progress_tx, &cancel_token_for_task,
+                expected_docs,
             ).await;
 
             // Unregister cancel token — pipeline completed (not cancelled).
@@ -842,13 +845,13 @@ impl SearchService {
             snippet,
         };
 
-        let chunk_hits = self
+        // Document-level results: Vector/Fts best-chunk dedup; Hybrid fuses the
+        // legs at document level via RRF (each doc = one rank per leg).
+        let results = self
             .store
-            .io_search(&domain_str, &branch, &served_commit, &search_query)
+            .io_search_documents(&domain_str, &branch, &served_commit, &search_query)
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
-
-        let results = dedup_chunks_to_documents(chunk_hits, snippet);
 
         // Apply pagination.
         let paginated: Vec<SearchHit> = results
@@ -2427,6 +2430,7 @@ async fn io_run_index_pipeline_stream(
     mut operation_rx: mpsc::Receiver<Operation>,
     progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
     cancel_token: &tokio_util::sync::CancellationToken,
+    expected_docs: Option<u64>,
 ) -> Result<(u64, Vec<SkippedDoc>), String> {
     struct DocToEmbed {
         id: String,
@@ -2756,6 +2760,25 @@ async fn io_run_index_pipeline_stream(
                 &mut total_docs_seen, &mut indexed_count,
                 cancel_token,
             ).await?;
+        }
+    }
+
+    // Channel closed — the producer signalled end-of-input. If the producer
+    // declared a document count and the stream delivered fewer document ops,
+    // the body was truncated (e.g. broken pipe mid-push). Reject the commit:
+    // tagging it would mark partial data as indexed and let last_indexed
+    // advance past documents that never arrived — a permanent skip.
+    if let Some(expected) = expected_docs {
+        let received = total_docs_seen + all_delete_ids.len() as u64;
+        if received < expected {
+            let msg = format!(
+                "truncated push: expected {} document ops, received {}",
+                expected, received
+            );
+            if let Some(tx) = &progress_tx {
+                let _ = tx.send(ProgressUpdate::Error { error: msg.clone() }).await;
+            }
+            return Err(msg);
         }
     }
 
@@ -3378,7 +3401,7 @@ mod tests_streaming {
         drop(_tx); // Close immediately — no operations.
 
         let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
-        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_empty", rx, None, &tokio_util::sync::CancellationToken::new())
+        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_empty", rx, None, &tokio_util::sync::CancellationToken::new(), None)
             .await
             .expect("streaming pipeline must succeed for empty channel");
 
@@ -3438,7 +3461,7 @@ mod tests_streaming {
         drop(tx);
 
         let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
-        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_errors", rx, None, &tokio_util::sync::CancellationToken::new())
+        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_errors", rx, None, &tokio_util::sync::CancellationToken::new(), None)
             .await
             .expect("streaming pipeline must succeed for all-error channel");
 
@@ -3496,7 +3519,7 @@ mod tests_streaming {
         drop(tx);
 
         let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
-        let result = io_run_index_pipeline_stream(&ctx, "c1_abort", rx, None, &tokio_util::sync::CancellationToken::new()).await;
+        let result = io_run_index_pipeline_stream(&ctx, "c1_abort", rx, None, &tokio_util::sync::CancellationToken::new(), None).await;
 
         assert!(result.is_err(), "Abort must return error in streaming pipeline");
         assert!(result.unwrap_err().contains("aborted"));
@@ -3553,7 +3576,7 @@ mod tests_streaming {
         drop(tx);
 
         let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
-        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_delete", rx, None, &tokio_util::sync::CancellationToken::new())
+        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_delete", rx, None, &tokio_util::sync::CancellationToken::new(), None)
             .await
             .expect("streaming pipeline must succeed for delete-only channel");
 
@@ -4631,7 +4654,7 @@ mod tests_concurrent_search {
                 embed_batch_size: 32,
             };
             let _ = io_run_index_pipeline_stream(
-                &ctx, "c1", rx, None, &cancel_for_pipeline,
+                &ctx, "c1", rx, None, &cancel_for_pipeline, None,
             ).await;
         });
 

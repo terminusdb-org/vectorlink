@@ -35,7 +35,7 @@ pub use self::schema::{
     COMPACT_REBUILD_PREFIX, compact_rebuild_branch_name, is_compact_rebuild_branch,
     is_reserved_branch_name,
 };
-pub use self::dedup::{dedup_chunks_to_documents, pairs_from_neighbours};
+pub use self::dedup::{dedup_chunks_to_documents, pairs_from_neighbours, rrf_fuse_documents};
 pub use self::index::{io_compact_data, io_ensure_fts_index_on_dataset, io_merge_indices};
 pub use self::rollup::{io_exponential_rollup, io_incremental_cascade, merges_needed, rollup_partitions, should_index_commit};
 pub use self::commit::VersionDelta;

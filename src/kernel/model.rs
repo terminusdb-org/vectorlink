@@ -217,12 +217,30 @@ pub struct SkippedDoc {
     pub message: String,
 }
 
-/// Search result hit (frozen wire shape).
+/// Search result hit (frozen wire shape; hybrid leg fields are additive and
+/// only serialised when present).
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
     pub id: String,
     pub distance: f32,
     pub chunk: ChunkInfo,
+    /// Fused document-level RRF score — hybrid search only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rrf_score: Option<f32>,
+    /// Vector leg evidence — present when the doc ranked in the vector leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector: Option<LegScore>,
+    /// FTS leg evidence — present when the doc ranked in the FTS leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fts: Option<LegScore>,
+}
+
+/// One leg's evidence for a hybrid hit: the document's rank within that leg's
+/// document list (0 = best) and the leg-distance of its winning chunk.
+#[derive(Debug, Clone, Serialize)]
+pub struct LegScore {
+    pub rank: u32,
+    pub distance: f32,
 }
 
 /// Chunk location metadata within a search hit.
