@@ -1376,6 +1376,8 @@ async fn handle_embeddings_stream(
             let served_commit = stream_result.served_commit;
             let store_clustering = stream_result.store_clustering;
             let total_count = stream_result.total_count;
+            let embedding_model = stream_result.embedding_model;
+            let clustering_model = stream_result.clustering_model;
             let receiver = stream_result.receiver;
 
             // Convert the mpsc receiver into an async stream of NDJSON lines.
@@ -1402,6 +1404,8 @@ async fn handle_embeddings_stream(
                 "x-total-count",
                 total_count.to_string().parse().unwrap(),
             );
+            headers.insert("x-embedding-model", embedding_model.parse().unwrap());
+            headers.insert("x-clustering-model", clustering_model.parse().unwrap());
 
             (StatusCode::OK, headers, body).into_response()
         }
@@ -1589,6 +1593,8 @@ async fn embeddings_stream_response(
             let served_commit = stream_result.served_commit;
             let store_clustering = stream_result.store_clustering;
             let total_count = stream_result.total_count;
+            let embedding_model = stream_result.embedding_model;
+            let clustering_model = stream_result.clustering_model;
             let receiver = stream_result.receiver;
 
             let mapped = futures::StreamExt::map(
@@ -1614,6 +1620,8 @@ async fn embeddings_stream_response(
                 "x-total-count",
                 total_count.to_string().parse().unwrap(),
             );
+            headers.insert("x-embedding-model", embedding_model.parse().unwrap());
+            headers.insert("x-clustering-model", clustering_model.parse().unwrap());
 
             (StatusCode::OK, headers, body).into_response()
         }

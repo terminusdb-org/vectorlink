@@ -120,6 +120,11 @@ pub struct LanceStore {
     pub dim: usize,
     /// Vector index configuration (nprobes, refine_factor for search).
     pub(super) vector_index_config: VectorIndexConfig,
+    /// ANN config for the `clustering_embedding` (slot-2) column. `None`
+    /// disables the clustering index — /candidates then gathers via flat scan.
+    /// Independent of `vector_index_config` so the two columns can carry
+    /// different precision profiles.
+    pub(super) clustering_index_config: Option<VectorIndexConfig>,
     /// Open dataset handles, keyed by DOMAIN (layout A). The cached handle is
     /// the domain dataset opened at its default (main) branch head; branch
     /// writes check out a branch-bound handle without mutating this one.
@@ -217,6 +222,7 @@ impl LanceStore {
             base_dir: base_dir.to_owned(),
             dim,
             vector_index_config,
+            clustering_index_config: Some(VectorIndexConfig::default_for_dim(dim)),
             datasets: RwLock::new(HashMap::new()),
             branch_indexes: RwLock::new(HashMap::new()),
             tasks: RwLock::new(HashMap::new()),
@@ -350,6 +356,15 @@ impl LanceStore {
     #[cfg(test)]
     pub fn set_vector_index_config(&mut self, config: VectorIndexConfig) {
         self.vector_index_config = config;
+    }
+
+    /// ANN config for the `clustering_embedding` column (`None` = flat scan).
+    pub fn clustering_index_config(&self) -> Option<&VectorIndexConfig> {
+        self.clustering_index_config.as_ref()
+    }
+
+    pub fn set_clustering_index_config(&mut self, config: Option<VectorIndexConfig>) {
+        self.clustering_index_config = config;
     }
 
     /// Get the Arrow schema for chunk rows (embedding dimension from config).

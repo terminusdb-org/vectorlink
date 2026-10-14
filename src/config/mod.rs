@@ -117,6 +117,12 @@ pub struct LockedEmbeddingParams {
     pub base_url: String,
     pub model: String,
     pub dim: usize,
+    /// Slot-2 (clustering) provider parameters, recorded when
+    /// `VECTORLINK_MODEL2` is configured. `None` means the slot-1 provider
+    /// serves the clustering role too — the vectors in `clustering_embedding`
+    /// belong to the slot-1 space either way, so this is part of the lock.
+    #[serde(default)]
+    pub clustering: Option<Box<LockedEmbeddingParams>>,
 }
 
 /// Name of the embedding-parameters lock file at the store root.
@@ -131,6 +137,7 @@ impl LockedEmbeddingParams {
             base_url: provider.base_url().trim_end_matches('/').to_owned(),
             model: provider.model_name().to_owned(),
             dim: provider.expected_dim(),
+            clustering: None,
         }
     }
 }
@@ -145,9 +152,11 @@ impl LockedEmbeddingParams {
 pub fn verify_or_lock_embedding_params(
     data_dir: &std::path::Path,
     provider: &Provider,
+    provider2: Option<&Provider>,
 ) -> Result<(), String> {
     let path = data_dir.join(EMBEDDING_PARAMS_FILE);
-    let current = LockedEmbeddingParams::from_provider(provider);
+    let mut current = LockedEmbeddingParams::from_provider(provider);
+    current.clustering = provider2.map(|p| Box::new(LockedEmbeddingParams::from_provider(p)));
 
     if path.exists() {
         let contents = std::fs::read_to_string(&path)
@@ -200,6 +209,67 @@ pub fn verify_or_lock_embedding_params(
     Ok(())
 }
 
+/// Build a provider from its kind string + endpoint parts.
+fn resolve_provider(kind: &str, base_url: String, model: String, dim: usize) -> Provider {
+    match kind {
+        "openai" => Provider::OpenAi {
+            base_url,
+            model,
+            dim,
+        },
+        "generic_http" => Provider::GenericHttp {
+            base_url,
+            model,
+            dim,
+        },
+        _ => Provider::OpenAiCompatible {
+            base_url,
+            model,
+            dim,
+        },
+    }
+}
+
+/// Resolve the optional slot-2 (clustering) embedding provider.
+///
+/// `None` when `VECTORLINK_MODEL2` is unset — the slot-1 provider then serves
+/// all embedding roles (single-model operation, the default).
+///
+/// When set, the `VECTORLINK_MODEL2_*` variables override endpoint, provider
+/// kind and dimension; anything unset falls back to the slot-1 configuration,
+/// so `VECTORLINK_MODEL2=nomic-embed-v2` alone is enough to pin the second
+/// model on the same endpoint.
+pub fn resolve_provider2<F>(slot1: &Provider, get: F) -> Option<Provider>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let model = get("VECTORLINK_MODEL2")?;
+    let kind = get("VECTORLINK_MODEL2_PROVIDER").unwrap_or_else(|| slot1.kind().to_owned());
+    let base_url = get("VECTORLINK_MODEL2_URL").unwrap_or_else(|| slot1.base_url().to_owned());
+    let dim = get("VECTORLINK_MODEL2_DIM")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| slot1.expected_dim());
+    Some(resolve_provider(&kind, base_url, model, dim))
+}
+
+/// Slot-2 embed endpoint bearer token: `VECTORLINK_MODEL2_API_KEY`, falling
+/// back to `VECTORLINK_EMBED_API_KEY` only when the slot-2 endpoint is the
+/// same as slot 1's — credentials must never leak to a different host.
+pub fn resolve_api_key2<F>(get: F, same_endpoint: bool) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get("VECTORLINK_MODEL2_API_KEY")
+        .or_else(|| {
+            if same_endpoint {
+                get("VECTORLINK_EMBED_API_KEY")
+            } else {
+                None
+            }
+        })
+        .filter(|s| !s.is_empty())
+}
+
 /// Default batch size for cross-document embedding (PO decision, 2026-06-15).
 /// Past the knee of the latency curve (88.8 ms/embed at bs=32 vs 228.8 at bs=1).
 const DEFAULT_EMBED_BATCH_SIZE: usize = 32;
@@ -211,10 +281,22 @@ pub struct Config {
     pub admin_secret: String,
     pub port: u16,
     pub embed_provider: Provider,
+    /// Optional second (slot-2) embedding provider used for the clustering
+    /// role — e.g. `VECTORLINK_MODEL2=nomic-embed-v2`. When `None`, the
+    /// slot-1 provider serves all roles.
+    pub provider2: Option<Provider>,
     /// Optional bearer token for the embedding endpoint (e.g. OpenAI API key).
     /// `None` sends no Authorization header. `VECTORLINK_EMBED_API_KEY`;
     /// default None. Never persisted to disk.
     pub embed_api_key: Option<String>,
+    /// Bearer token for the slot-2 endpoint (`VECTORLINK_MODEL2_API_KEY`,
+    /// falling back to `VECTORLINK_EMBED_API_KEY`).
+    pub api_key2: Option<String>,
+    /// ANN index for the `clustering_embedding` column. `Some(config)`
+    /// enables it (default) with independently tunable parameters;
+    /// `None` (`VECTORLINK_MODEL2_INDEX=false`) leaves the column
+    /// unindexed — /candidates gathers via flat scan.
+    pub clustering_index: Option<crate::store::lance::VectorIndexConfig>,
     pub data_dir: String,
     pub tokenizer_path: String,
     /// Number of texts to batch per embedding HTTP call (cross-document batching).
@@ -255,23 +337,27 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(768);
 
-        let embed_provider = match provider_str.as_str() {
-            "openai" => Provider::OpenAi {
-                base_url: embed_url,
-                model,
+        let embed_provider = resolve_provider(&provider_str, embed_url, model, dim);
+
+        let env = |k: &str| std::env::var(k).ok();
+        let provider2 = resolve_provider2(&embed_provider, env);
+        let api_key2 = provider2.as_ref().and_then(|p2| {
+            let same_endpoint = p2.base_url().trim_end_matches('/')
+                == embed_provider.base_url().trim_end_matches('/');
+            resolve_api_key2(env, same_endpoint)
+        });
+        if let Some(p2) = &provider2 {
+            // The `clustering_embedding` column is FixedSizeList(dim) — a
+            // different slot-2 width cannot be stored. Fail loud at boot.
+            assert_eq!(
+                p2.expected_dim(),
                 dim,
-            },
-            "generic_http" => Provider::GenericHttp {
-                base_url: embed_url,
-                model,
-                dim,
-            },
-            _ => Provider::OpenAiCompatible {
-                base_url: embed_url,
-                model,
-                dim,
-            },
-        };
+                "VECTORLINK_MODEL2_DIM ({}) must equal VECTORLINK_DIM ({}) — \
+                 clustering_embedding shares the store's vector width",
+                p2.expected_dim(),
+                dim
+            );
+        }
 
         let embed_batch_size: usize = std::env::var("VECTORLINK_EMBED_BATCH_SIZE")
             .ok()
@@ -285,6 +371,37 @@ impl Config {
             "VECTORLINK_EMBED_BATCH_SIZE must be >= 1, got 0 (check environment)"
         );
 
+        // Slot-2 (clustering) ANN index: on by default, independently
+        // parameterised so the second column can carry a different precision
+        // profile than the slot-1 `embedding` index.
+        let clustering_index = match std::env::var("VECTORLINK_MODEL2_INDEX") {
+            Ok(s) if s.eq_ignore_ascii_case("false") || s == "0" => None,
+            _ => {
+                let mut cfg = crate::store::lance::VectorIndexConfig::default_for_dim(dim);
+                let p = |name: &str| std::env::var(name).ok();
+                if let Some(v) = p("VECTORLINK_MODEL2_INDEX_NUM_PARTITIONS") {
+                    cfg.num_partitions = v.parse().unwrap_or(cfg.num_partitions);
+                }
+                if let Some(v) = p("VECTORLINK_MODEL2_INDEX_M") {
+                    cfg.m = v.parse().unwrap_or(cfg.m);
+                }
+                if let Some(v) = p("VECTORLINK_MODEL2_INDEX_EF_CONSTRUCTION") {
+                    cfg.ef_construction = v.parse().unwrap_or(cfg.ef_construction);
+                }
+                if let Some(v) = p("VECTORLINK_MODEL2_INDEX_NPROBES") {
+                    cfg.nprobes = v.parse().unwrap_or(cfg.nprobes);
+                }
+                if let Some(v) = p("VECTORLINK_MODEL2_INDEX_REFINE_FACTOR") {
+                    cfg.refine_factor = if v.eq_ignore_ascii_case("none") {
+                        None
+                    } else {
+                        v.parse().ok().or(cfg.refine_factor)
+                    };
+                }
+                Some(cfg)
+            }
+        };
+
         Self {
             admin_user: std::env::var("VECTORLINK_ADMIN_USER")
                 .unwrap_or_else(|_| "admin".to_owned()),
@@ -297,11 +414,13 @@ impl Config {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(7372),
             embed_provider,
+            provider2,
             embed_api_key: std::env::var("VECTORLINK_EMBED_API_KEY")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            data_dir: std::env::var("VECTORLINK_DATA_DIR")
-                .unwrap_or_else(|_| "/data".to_owned()),
+            api_key2,
+            clustering_index,
+            data_dir: std::env::var("VECTORLINK_DATA_DIR").unwrap_or_else(|_| "/data".to_owned()),
             tokenizer_path: std::env::var("VECTORLINK_TOKENIZER_PATH")
                 .unwrap_or_else(|_| "/data/tokenizer.json.bz2".to_owned()),
             embed_batch_size,
@@ -335,7 +454,10 @@ impl Config {
                 model: "multilingual-e5-base".to_owned(),
                 dim: 768,
             },
+            provider2: None,
             embed_api_key: None,
+            api_key2: None,
+            clustering_index: Some(crate::store::lance::VectorIndexConfig::default_for_dim(768)),
             data_dir: "/tmp/vectorlink-test".to_owned(),
             tokenizer_path: "assets/tokenizer.json.bz2".to_owned(),
             embed_batch_size: DEFAULT_EMBED_BATCH_SIZE,
@@ -358,7 +480,10 @@ impl Default for Config {
                 model: "multilingual-e5-base".to_owned(),
                 dim: 768,
             },
+            provider2: None,
             embed_api_key: None,
+            api_key2: None,
+            clustering_index: Some(crate::store::lance::VectorIndexConfig::default_for_dim(768)),
             data_dir: "/tmp/vectorlink-test".to_owned(),
             tokenizer_path: "assets/tokenizer.json.bz2".to_owned(),
             embed_batch_size: DEFAULT_EMBED_BATCH_SIZE,
@@ -385,7 +510,8 @@ mod tests {
     #[test]
     fn params_lock_written_on_first_init() {
         let dir = tempfile::tempdir().unwrap();
-        verify_or_lock_embedding_params(dir.path(), &provider("nomic-embed-v2", 768)).unwrap();
+        verify_or_lock_embedding_params(dir.path(), &provider("nomic-embed-v2", 768), None)
+            .unwrap();
         let locked: LockedEmbeddingParams = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join(EMBEDDING_PARAMS_FILE)).unwrap(),
         )
@@ -399,18 +525,27 @@ mod tests {
     #[test]
     fn params_lock_accepts_matching_provider() {
         let dir = tempfile::tempdir().unwrap();
-        verify_or_lock_embedding_params(dir.path(), &provider("nomic-embed-v2", 768)).unwrap();
-        verify_or_lock_embedding_params(dir.path(), &provider("nomic-embed-v2", 768)).unwrap();
+        verify_or_lock_embedding_params(dir.path(), &provider("nomic-embed-v2", 768), None)
+            .unwrap();
+        verify_or_lock_embedding_params(dir.path(), &provider("nomic-embed-v2", 768), None)
+            .unwrap();
     }
 
     #[test]
     fn params_lock_rejects_changed_model_with_recovery_hint() {
         let dir = tempfile::tempdir().unwrap();
-        verify_or_lock_embedding_params(dir.path(), &provider("nomic-embed-v2", 768)).unwrap();
-        let err =
-            verify_or_lock_embedding_params(dir.path(), &provider("text-embedding-3-small", 1536))
-                .expect_err("mismatched params must fail");
-        assert!(err.contains("nomic-embed-v2"), "stored params missing: {err}");
+        verify_or_lock_embedding_params(dir.path(), &provider("nomic-embed-v2", 768), None)
+            .unwrap();
+        let err = verify_or_lock_embedding_params(
+            dir.path(),
+            &provider("text-embedding-3-small", 1536),
+            None,
+        )
+        .expect_err("mismatched params must fail");
+        assert!(
+            err.contains("nomic-embed-v2"),
+            "stored params missing: {err}"
+        );
         assert!(
             err.contains("text-embedding-3-small"),
             "current params missing: {err}"
@@ -422,8 +557,140 @@ mod tests {
     fn params_lock_rejects_corrupt_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(EMBEDDING_PARAMS_FILE), "not json").unwrap();
-        let err = verify_or_lock_embedding_params(dir.path(), &provider("nomic-embed-v2", 768))
-            .expect_err("corrupt lock file must fail");
+        let err =
+            verify_or_lock_embedding_params(dir.path(), &provider("nomic-embed-v2", 768), None)
+                .expect_err("corrupt lock file must fail");
         assert!(err.contains(EMBEDDING_PARAMS_FILE), "path missing: {err}");
+    }
+
+    // --- slot-2 (clustering) provider resolution ---
+
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            vars.iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn provider2_absent_without_model2() {
+        let slot1 = provider("multilingual-e5-base", 768);
+        assert!(resolve_provider2(&slot1, env(&[])).is_none());
+    }
+
+    #[test]
+    fn provider2_inherits_slot1_kind_url_and_dim() {
+        let slot1 = Provider::GenericHttp {
+            base_url: "http://custom:9000".to_owned(),
+            model: "multilingual-e5-base".to_owned(),
+            dim: 768,
+        };
+        let p2 = resolve_provider2(&slot1, env(&[("VECTORLINK_MODEL2", "nomic-embed-v2")]))
+            .expect("MODEL2 set → provider2 must resolve");
+        assert_eq!(p2.kind(), "generic_http", "kind must inherit slot 1");
+        assert_eq!(
+            p2.base_url(),
+            "http://custom:9000",
+            "url must inherit slot 1"
+        );
+        assert_eq!(p2.model_name(), "nomic-embed-v2");
+        assert_eq!(p2.expected_dim(), 768, "dim must inherit slot 1");
+    }
+
+    #[test]
+    fn provider2_custom_endpoint_overrides() {
+        let slot1 = provider("multilingual-e5-base", 768);
+        let p2 = resolve_provider2(
+            &slot1,
+            env(&[
+                ("VECTORLINK_MODEL2", "nomic-embed-v2"),
+                ("VECTORLINK_MODEL2_PROVIDER", "openai"),
+                ("VECTORLINK_MODEL2_URL", "http://other:11434"),
+                ("VECTORLINK_MODEL2_DIM", "768"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(p2.kind(), "openai");
+        assert_eq!(p2.base_url(), "http://other:11434");
+        assert_eq!(p2.model_name(), "nomic-embed-v2");
+        assert_eq!(p2.expected_dim(), 768);
+    }
+
+    #[test]
+    fn api_key2_falls_back_to_slot1_key() {
+        let vars = env(&[("VECTORLINK_EMBED_API_KEY", "sk-main")]);
+        // Same endpoint → the slot-1 key serves both providers.
+        assert_eq!(resolve_api_key2(&vars, true), Some("sk-main".to_owned()));
+        let vars = env(&[
+            ("VECTORLINK_EMBED_API_KEY", "sk-main"),
+            ("VECTORLINK_MODEL2_API_KEY", "sk-second"),
+        ]);
+        assert_eq!(resolve_api_key2(&vars, false), Some("sk-second".to_owned()));
+        assert_eq!(resolve_api_key2(env(&[]), true), None);
+    }
+
+    #[test]
+    fn api_key2_never_leaks_slot1_key_to_a_different_endpoint() {
+        // Different endpoint + no EMBED2 key → None (unauthenticated), never
+        // the slot-1 credential.
+        let vars = env(&[("VECTORLINK_EMBED_API_KEY", "sk-main")]);
+        assert_eq!(resolve_api_key2(&vars, false), None);
+    }
+
+    // --- params lock covers slot 2 ---
+
+    #[test]
+    fn params_lock_covers_clustering_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        verify_or_lock_embedding_params(
+            dir.path(),
+            &provider("multilingual-e5-base", 768),
+            Some(&provider("nomic-embed-v2", 768)),
+        )
+        .unwrap();
+        let locked: LockedEmbeddingParams = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(EMBEDDING_PARAMS_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            locked.clustering.as_deref().map(|c| c.model.as_str()),
+            Some("nomic-embed-v2"),
+            "clustering model must be recorded in the lock"
+        );
+    }
+
+    #[test]
+    fn params_lock_rejects_changed_clustering_model() {
+        let dir = tempfile::tempdir().unwrap();
+        verify_or_lock_embedding_params(
+            dir.path(),
+            &provider("multilingual-e5-base", 768),
+            Some(&provider("nomic-embed-v2", 768)),
+        )
+        .unwrap();
+        let err = verify_or_lock_embedding_params(
+            dir.path(),
+            &provider("multilingual-e5-base", 768),
+            Some(&provider("text-embedding-3-small", 768)),
+        )
+        .expect_err("changed clustering model must fail");
+        assert!(err.contains("text-embedding-3-small"), "{err}");
+    }
+
+    #[test]
+    fn params_lock_rejects_adding_provider2_to_existing_store() {
+        // A store created without slot 2 holds clustering embeddings from the
+        // slot-1 model. Adding a second model silently would mix spaces.
+        let dir = tempfile::tempdir().unwrap();
+        verify_or_lock_embedding_params(dir.path(), &provider("multilingual-e5-base", 768), None)
+            .unwrap();
+        let err = verify_or_lock_embedding_params(
+            dir.path(),
+            &provider("multilingual-e5-base", 768),
+            Some(&provider("nomic-embed-v2", 768)),
+        )
+        .expect_err("enabling slot 2 on a locked store must fail");
+        assert!(err.contains("drop-store"), "recovery hint missing: {err}");
     }
 }

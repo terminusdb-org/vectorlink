@@ -62,11 +62,11 @@ async function waitForTask (taskId, timeoutMs = 90000) {
   throw new Error(`task ${taskId} did not complete within ${timeoutMs}ms`)
 }
 
-async function pushAndWait (domain, branch, commit, ops) {
+async function pushAndWait (domain, branch, commit, ops, extraQuery) {
   const body = ops.map((l) => JSON.stringify(l)).join("\n")
   const pushRes = await agent()
     .post("/push")
-    .query({ domain, branch, target_commit: commit })
+    .query(Object.assign({ domain, branch, target_commit: commit }, extraQuery))
     .set("Authorization", authHeader())
     .set("Content-Type", "application/x-ndjson")
     .send(body)
@@ -117,6 +117,12 @@ describe("POST /embeddings — batch and streaming modes", function () {
     expect(res.body).to.have.property("clustering_embeddings").that.is.an("object")
     expect(res.body).to.have.property("store_clustering").that.is.a("boolean")
     expect(res.body).to.have.property("served_commit").that.is.a("string")
+    expect(res.body).to.have.property("embedding_model").that.is.a("string")
+    expect(res.body).to.have.property("clustering_model").that.is.a("string")
+    // Slot-2 wiring: when VECTORLINK_MODEL2 is configured, the clustering
+    // column must carry that model's embeddings; otherwise it is slot 1's.
+    const expectedClustering = process.env.VECTORLINK_MODEL2 || res.body.embedding_model
+    expect(res.body.clustering_model).to.equal(expectedClustering)
     expect(Object.keys(res.body.doc_embeddings).length).to.be.greaterThan(0)
   })
 
@@ -159,6 +165,9 @@ describe("POST /embeddings — batch and streaming modes", function () {
     expect(res.headers["x-served-commit"]).to.be.a("string")
     expect(res.headers).to.have.property("x-store-clustering")
     expect(res.headers).to.have.property("x-total-count")
+    expect(res.headers["x-embedding-model"]).to.be.a("string")
+    const expectedClustering = process.env.VECTORLINK_MODEL2 || res.headers["x-embedding-model"]
+    expect(res.headers["x-clustering-model"]).to.equal(expectedClustering)
     expect(res.lines.length).to.be.greaterThan(0)
     for (const line of res.lines) {
       expect(line).to.have.property("doc_id")
@@ -273,5 +282,54 @@ describe("GET /embeddings with Accept: application/x-ndjson (direct)", function 
       .expect(200)
 
     expect(res.body).to.have.property("doc_embeddings").that.is.an("object")
+  })
+})
+
+describe("Clustering embeddings (store_clustering + slot-2 model)", function () {
+  this.timeout(120000)
+
+  const DOMAIN = "admin/embeddings_clustering_test"
+  const BRANCH = "main"
+  const COMMIT = "ec_c0"
+
+  before(async function () {
+    await agent().delete("/domain").query({ domain: DOMAIN }).set("Authorization", authHeader())
+    await pushAndWait(DOMAIN, BRANCH, COMMIT, [
+      {
+        op: "Inserted",
+        id: "terminusdb:///ec/Doc/1",
+        string: "Lightsaber combat forms and the Jedi order",
+      },
+      {
+        op: "Inserted",
+        id: "terminusdb:///ec/Doc/2",
+        string: "Recipes for seasonal vegetable cooking",
+      },
+    ], { store_clustering: true })
+  })
+
+  after(async function () {
+    await agent().delete("/domain").query({ domain: DOMAIN }).set("Authorization", authHeader())
+  })
+
+  it("stores clustering embeddings keyed per doc, labelled with the clustering model", async function () {
+    const res = await agent()
+      .post("/embeddings")
+      .set("Authorization", authHeader())
+      .send({ domain: DOMAIN, commit: COMMIT })
+      .expect(200)
+
+    expect(res.body.store_clustering).to.equal(true)
+    const expectedClustering = process.env.VECTORLINK_MODEL2 || res.body.embedding_model
+    expect(res.body.clustering_model).to.equal(expectedClustering)
+
+    const clustering = res.body.clustering_embeddings
+    expect(Object.keys(clustering).length).to.equal(2)
+    const doc = res.body.doc_embeddings["terminusdb:///ec/Doc/1"]
+    const clus = clustering["terminusdb:///ec/Doc/1"]
+    expect(clus).to.be.an("array").with.lengthOf(doc.length)
+    // Same input text, different role — vectors must differ (different
+    // prefix, and a different model entirely when slot 2 is configured).
+    expect(clus).to.not.deep.equal(doc)
   })
 })
