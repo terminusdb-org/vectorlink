@@ -34,6 +34,10 @@ Embedding **dimension is configuration**, fixed per index at creation and record
 
 Default: **`multilingual-e5-base`** — 768-d, multilingual (~100 languages), XLM-RoBERTa-base backbone, served on **CPU** by a local **Ollama** sidecar (Q8_0 GGUF, ~300 MB) exposing an OpenAI-compatible `/v1/embeddings`.
 
+Why this model: it is the recommended default because it is small enough for CPU inference (278M params, ~300 MB quantized), genuinely multilingual, MIT-licensed, and its asymmetric `passage:`/`query:` convention is a well-understood retrieval pattern.
+
+**Where the GGUF comes from.** No reputable quantizer publishes this model, so we build it ourselves: `hf.co/vectorlink/multilingual-e5-base-GGUF` contains a Q8_0 converted *from first-party* `intfloat/multilingual-e5-base` safetensors. The pipeline is `scripts/make-multilingual-e5-base-gguf.sh` — it pins the upstream commit and safetensors SHA-256, converts with a pinned llama.cpp release, asserts `pooling=mean` and `dim=768` in the GGUF metadata, then quantizes. Run it to rebuild or audit the artifact.
+
 **⚠️ Task prefixes are mandatory for this model.** It was trained with instruction prefixes and produces *different, worse* results without them — silently (no error). But prefixes are **model-specific**: applying e5's prefixes to, say, an OpenAI model would corrupt the input. So prefixes are **a property of the model, not the deployment**.
 
 vectorlink keeps a **hard-coded table of prefixes keyed by model name**. On every embed it looks up the configured model:
@@ -105,9 +109,10 @@ vectorlink therefore **chunks** long inputs using the de-facto RAG standard (ful
 
 - **Token-based chunking with overlap.** Split the string into chunks that fit the model window, with ~15% overlap so context isn't lost at boundaries.
 - **One vector per chunk.** Each chunk is its own LanceDB row, keyed by `(doc_id, chunk_index)`. A short document is simply one chunk.
-- **The prefix counts against the budget.** `search_document: ` consumes tokens, so chunk size = window − prefix tokens; the prefix is applied to each chunk.
+- **The prefix counts against the budget.** `passage: ` (or the model's document prefix) consumes tokens, so chunk size = window − prefix tokens; the prefix is applied to each chunk.
 - **The model's own tokenizer** sets boundaries (xlm-roberta SentencePiece — shared by the e5 and nomic families) — counting with the wrong tokenizer would reintroduce truncation.
 - **Search dedups chunks back to documents.** Vector/FTS/hybrid search runs over chunk rows, then groups by `doc_id` keeping the best chunk, so `/search` still returns documents (`[{id,distance}]`) — chunk ids never leak.
+- **Hybrid fuses at document level.** Each leg first collapses to a document ranking via best chunk (MaxP), then RRF (k=60) combines the document lists; each hit surfaces `rrf_score` plus per-leg `vector`/`fts` `{rank, distance}`. A document present in both legs outranks a single-leg hit, and multi-chunk fan-out cannot buy rank.
 - **`Changed` replaces the whole chunk set; `Deleted` removes all chunks** for a `doc_id`.
 
 This guarantees arbitrarily large documents are fully embedded and a query matching a passage deep in a document still finds it. Chunking is deterministic (a pure function of text + tokenizer + size + overlap), so it preserves the reproducibility guarantees of §3–§4.
@@ -128,7 +133,7 @@ Because the model is local, pinned, and run in inference mode with one-input-per
 ---
 
 ## Check your understanding
-1. Why must `search_document:` / `search_query:` prefixes be injected, and why is forgetting them dangerous? *(The model needs them for correct embeddings; omission degrades results silently — no error.)*
+1. Why must `passage:` / `query:` (or the model's asymmetric) prefixes be injected, and why is forgetting them dangerous? *(The model needs them for correct embeddings; omission degrades results silently — no error.)*
 2. List the factors that must be pinned for deterministic embeddings. *(GGUF digest, quantization (Q8_0), inference mode, device/compute path, pooling, batch composition, input bytes.)*
 3. What is the single biggest threat to determinism in a batching embedding server, and how is it removed for tests? *(Dynamic batching with padding; removed via one-input-per-request + pinned image/GGUF, or golden-vector snapshots.)*
 4. Embedding has no temperature/seed to set — why not? *(There is no sampling step; the forward pass is deterministic given fixed inputs and weights.)*

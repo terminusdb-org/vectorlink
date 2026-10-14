@@ -43,6 +43,11 @@ pub struct PushParams {
     /// Updates the domain's setting (for both new and existing domains).
     /// Defaults to `false` (no param sent).
     pub store_clustering: Option<bool>,
+    /// Expected document count for this commit (from the producer's
+    /// X-Document-Count). When set, a body that ends before delivering this
+    /// many document ops is rejected as truncated instead of being tagged
+    /// as an indexed commit.
+    pub expected_docs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -475,6 +480,7 @@ async fn handle_push(
             params.parent_commit.as_deref(),
             op_rx,
             progress_tx_opt,
+            params.expected_docs,
         )
         .await;
 

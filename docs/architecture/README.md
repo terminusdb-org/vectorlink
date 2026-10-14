@@ -33,6 +33,7 @@ This mirrors Gagné's events of instruction (gain attention → state objective 
 | 04 | [Search](./04-search.md) | `/search`, `/similar`, `/duplicates`, and 🆕 full-text & hybrid search. |
 | 05 | [Embeddings & determinism](./05-embeddings-and-determinism.md) | The configurable embedding provider, the default local model, and exactly what makes embedding output reproducible. |
 | 06 | [Integration test strategy](./06-integration-test-strategy.md) | How to integration-test the full stack from `docker-compose.yml` with deterministic, repeatable assertions. |
+| 07 | [Hybrid search](./07-hybrid-search.md) | How vector and FTS legs are fused at document level (MaxP + RRF) and how hybrid `distance` should be read. |
 
 Start at 01 and read in order; later docs assume the earlier ones.
 

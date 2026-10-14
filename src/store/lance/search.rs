@@ -14,9 +14,9 @@ use lance_index::scalar::FullTextSearchQuery;
 use lance_linalg::distance::DistanceType;
 
 use crate::kernel::error::StoreError;
-use crate::kernel::model::SearchMode;
+use crate::kernel::model::{SearchHit, SearchMode};
 
-use super::{ChunkHit, DistanceKind, EmbeddingRecord, LanceStore, SearchQuery, SuggestQuery, SuggestResult, SuggestHit, MAIN_BRANCH};
+use super::{dedup_chunks_to_documents, rrf_fuse_documents, ChunkHit, DistanceKind, EmbeddingRecord, LanceStore, SearchQuery, SuggestQuery, SuggestResult, SuggestHit, MAIN_BRANCH};
 
 impl LanceStore {
     /// Vector/FTS/hybrid search over chunk rows.
@@ -47,6 +47,36 @@ impl LanceStore {
         };
 
         Ok(hits)
+    }
+
+    /// Document-level search for `/search`: Vector/Fts delegate to `io_search`
+    /// and best-chunk dedup; Hybrid fuses the two legs at document level via
+    /// RRF (`rrf_fuse_documents`), where each document contributes exactly one
+    /// rank per leg — multi-chunk fan-out cannot dilute the fused ranking.
+    /// Returns hits in fused order (Vector/Fts: distance order); callers
+    /// paginate afterwards.
+    pub async fn io_search_documents(
+        &self,
+        domain: &str,
+        branch: &str,
+        commit: &str,
+        query: &SearchQuery,
+    ) -> Result<Vec<SearchHit>, StoreError> {
+        match query.mode {
+            SearchMode::Hybrid => {
+                // Same cached-head snapshot contract as io_search.
+                let snapshot = self.io_snapshot_from_cache(domain, branch, commit).await?;
+                let (vector_hits, fts_hits) = tokio::join!(
+                    self.vector_search(&snapshot, query),
+                    self.fts_search(&snapshot, query),
+                );
+                Ok(rrf_fuse_documents(vector_hits?, fts_hits?, query.snippet))
+            }
+            _ => Ok(dedup_chunks_to_documents(
+                self.io_search(domain, branch, commit, query).await?,
+                query.snippet,
+            )),
+        }
     }
 
     /// Suggest (typeahead): FTS-only search for partial-query UI assistance.
@@ -1379,9 +1409,15 @@ pub(super) fn rrf_merge(vector_hits: Vec<ChunkHit>, fts_hits: Vec<ChunkHit>) -> 
         }
     }
 
-    // Sort by RRF score descending (highest relevance first).
+    // Sort by RRF score descending (highest relevance first); doc_id then
+    // chunk_index break ties deterministically (HashMap order is unstable).
     let mut ranked: Vec<(f32, ChunkHit)> = scores.into_values().collect();
-    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.doc_id.cmp(&b.1.doc_id))
+            .then_with(|| a.1.chunk_index.cmp(&b.1.chunk_index))
+    });
 
     // Return hits in RRF order, preserving each hit's original distance.
     ranked
