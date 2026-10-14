@@ -272,7 +272,7 @@ jobs:
           done
 
           # Verify engine is actually up
-          if ! curl -fsS http://127.0.0.1:8080/health/live >/dev/null 2>&1; then
+          if ! curl -fsS http://127.0.0.1:7372/health/live >/dev/null 2>&1; then
             echo "ERROR: vectorlink did not become live"
             cat /tmp/vectorlink-test.log 2>/dev/null || true
             exit 1
@@ -280,7 +280,7 @@ jobs:
 
       - name: Run mocha integration suite
         env:
-          VECTORLINK_URL: http://127.0.0.1:8080
+          VECTORLINK_URL: http://127.0.0.1:7372
           VECTORLINK_ADMIN_USER: admin
           VECTORLINK_ADMIN_SECRET: root
         run: npx mocha --timeout 60000
