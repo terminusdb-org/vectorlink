@@ -64,7 +64,7 @@ Every assertion that compares vectors, distances, or rankings relies on these be
 2. **Q8_0 quantization, CPU** — one numerical path (goldens are baseline-specific to this quantization).
 3. **Inference mode** — Ollama/llama.cpp serves inference-mode models (no dropout); embeddings have no sampling step.
 4. **One-input-per-request in tests** — no padding partners, so each input's vector is independent of its neighbours.
-5. **Prefixes injected deterministically** — `search_document:` for content, `search_query:` for queries.
+5. **Prefixes injected deterministically** — `passage:` for content, `query:` for queries.
 6. **Store reset per run** — fresh LanceDB volume so versions/commits start clean.
 
 If all six hold, the suite is intended to be **bit-for-bit reproducible**: identical vectors → identical distances → identical rankings. ⚠️ **Cross-restart bit-identity is a Phase-0 carried caveat** (only same-process repeatability is proven, `spikes/evidence/embeddings-stack.md`); the determinism gate (Level E) is the place it is confirmed before golden-vector assertions are enforced strictly.
