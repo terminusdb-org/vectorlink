@@ -168,8 +168,11 @@ pub fn chunk_location(token_start: u32, doc_token_len: u32) -> f32 {
     }
 }
 
-/// Compute the default ChunkParams for the nomic model (512 window, prefix-budgeted).
-pub fn params_for_nomic(tokenizer: &Tokenizer, prefix: &str) -> Result<ChunkParams, ChunkError> {
+/// Compute the default ChunkParams for a 512-token model window, minus the
+/// role prefix's token cost (e.g. "passage: " for e5, "search_document: " for
+/// nomic). The caller supplies the prefix for the configured model so the
+/// budget always matches what the embedder actually prepends.
+pub fn params_for_window(tokenizer: &Tokenizer, prefix: &str) -> Result<ChunkParams, ChunkError> {
     const WINDOW: usize = 512;
 
     let prefix_encoding = tokenizer
@@ -230,7 +233,7 @@ mod tests {
     #[test]
     fn large_doc_splits_into_multiple_chunks_with_full_coverage() {
         let tok = test_tokenizer();
-        let params = params_for_nomic(&tok, "search_document: ")
+        let params = params_for_window(&tok, "search_document: ")
             .expect("params must compute");
 
         // Build a document well over 512 tokens.

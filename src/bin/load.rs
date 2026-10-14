@@ -154,7 +154,7 @@ async fn main() -> ExitCode {
         Some(p) => embed::prefix_for_role(&p, EmbeddingRole::Document).to_owned(),
         None => String::new(),
     };
-    let chunk_params = match chunk::params_for_nomic(&tokenizer, &prefix) {
+    let chunk_params = match chunk::params_for_window(&tokenizer, &prefix) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: chunk params: {}", e);

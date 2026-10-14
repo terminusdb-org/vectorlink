@@ -181,7 +181,7 @@ impl SearchService {
             Some(p) => embed::prefix_for_role(&p, EmbeddingRole::Document).to_owned(),
             None => String::new(),
         };
-        let chunk_params = chunk::params_for_nomic(&tokenizer, &prefix)
+        let chunk_params = chunk::params_for_window(&tokenizer, &prefix)
             .unwrap_or(ChunkParams { max_tokens: 480, overlap: 64 });
 
         let ready_index = Arc::new(std::sync::atomic::AtomicBool::new(true));

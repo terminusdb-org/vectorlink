@@ -18,20 +18,20 @@
  *      leaves no stale orphan chunks findable.
  *
  * ── Fixture token-sizing rationale (why the chunk counts are deterministic) ──
- * The engine sizes chunks with `params_for_nomic(tokenizer, "search_document: ")`
+ * The engine sizes chunks with `params_for_window(tokenizer, "passage: ")`
  * (src/chunk/mod.rs): WINDOW=512, minus the document prefix's token cost. With
- * the shipped nomic tokenizer (spikes/tokenizer/tokenizer.json) the prefix costs
- * 4 tokens, so:
- *     max_tokens = 508,  overlap = 508/7 = 72,  step = max_tokens - overlap = 436
+ * the shipped e5/XLM-R tokenizer (assets/tokenizer.json.bz2) the prefix costs
+ * 2 tokens, so:
+ *     max_tokens = 510,  overlap = 510/7 = 72,  step = max_tokens - overlap = 438
  * The filler unit "alpha " encodes to EXACTLY 2 tokens (uniform — no multi-digit
- * subword splits, unlike "word{N} "). Chunk boundaries are [start, start+508),
+ * subword splits, unlike "word{N} "). Chunk boundaries are [start, start+510),
  * advancing by `step` until the doc end is reached.
  *
  * These exact token totals + chunk counts were measured against the real
  * tokenizer (a temporary probe in src/chunk/mod.rs, since removed) and are
  * reproduced by the engine's own chunker — they are NOT guessed:
- *   - ("alpha "×251) + "endmarker undermk omega" = 508 tokens → 1 chunk (at budget)
- *   - ("alpha "×252) + "endmarker overmk omega"  = 510 tokens → 2 chunks (over budget)
+ *   - ("alpha "×252) + "endmarker undermk omega" = 510 tokens → 1 chunk (at budget)
+ *   - ("alpha "×253) + "endmarker overmk omega"  = 512 tokens → 2 chunks (over budget)
  *   - head + ("alpha "×550) + middle + ("alpha "×550) + tail = 2243 tokens
  *       → EXACTLY 5 chunks; head lands in chunk 0, middle in chunk 2 (a true
  *         interior chunk, not an overlap-shared edge), tail in chunk 4 (last).
@@ -53,10 +53,10 @@ const TAIL_PHRASE = "The final passphrase is xyzzy spoken by Mon Mothma."
 const FIVE_CHUNK_FILLER_REPS = 550
 const FIVE_CHUNK_EXPECTED = 5
 
-// ("alpha "×251) + "endmarker undermk omega" = 508 tokens → 1 chunk.
-// ("alpha "×252) + "endmarker overmk omega"  = 510 tokens → 2 chunks.
-const BOUNDARY_ONE_CHUNK_REPS = 251
-const BOUNDARY_TWO_CHUNK_REPS = 252
+// ("alpha "×252) + "endmarker undermk omega" = 510 tokens → 1 chunk.
+// ("alpha "×253) + "endmarker overmk omega"  = 512 tokens → 2 chunks.
+const BOUNDARY_ONE_CHUNK_REPS = 252
+const BOUNDARY_TWO_CHUNK_REPS = 253
 
 function buildFiveChunkDoc () {
   const filler = FILLER_UNIT.repeat(FIVE_CHUNK_FILLER_REPS)
@@ -213,7 +213,7 @@ describe("Chunking deep-test (real embeddings + real chunker)", function () {
   describe("4. 512-token boundary crossing (no silent truncation — RISK-06)", function () {
     before(async function () {
       // Two sibling docs on a fresh commit: one just AT the single-chunk budget
-      // (508 tokens → 1 chunk) and one just OVER it (510 tokens → 2 chunks). Each
+      // (510 tokens → 1 chunk) and one just OVER it (512 tokens → 2 chunks). Each
       // has a UNIQUE retrievable phrase at the very end so we prove the tail of
       // the over-budget doc is not silently dropped.
       const justUnder =
@@ -231,22 +231,22 @@ describe("Chunking deep-test (real embeddings + real chunker)", function () {
     // Each doc carries a UNIQUE literal tail marker (undermk / overmk). We use
     // FTS so the lookup keys on the EXACT marker text — a robust, doc-specific
     // probe rather than a vector nearest-neighbour that could surface the sibling.
-    it("the at-budget doc (508 tokens) is a single chunk", async function () {
+    it("the at-budget doc (510 tokens) is a single chunk", async function () {
       const hits = await searchMode(DOMAIN, "c_boundary", "undermk", "fts", { count: 50 })
       const docHit = hits.find(h => h.id === `${BOUNDARY_ID}/under`)
       expect(docHit, "at-budget doc must be retrievable by its marker").to.not.equal(undefined)
-      expect(docHit.chunk.count).to.equal(1, "508-token doc must be a single chunk")
+      expect(docHit.chunk.count).to.equal(1, "510-token doc must be a single chunk")
     })
 
-    it("the over-budget doc (510 tokens) splits 1→2 chunks", async function () {
+    it("the over-budget doc (512 tokens) splits 1→2 chunks", async function () {
       const hits = await searchMode(DOMAIN, "c_boundary", "overmk", "fts", { count: 50 })
       const docHit = hits.find(h => h.id === `${BOUNDARY_ID}/over`)
       expect(docHit, "over-budget doc must be retrievable by its marker").to.not.equal(undefined)
-      expect(docHit.chunk.count).to.equal(2, "510-token doc must split into exactly 2 chunks")
+      expect(docHit.chunk.count).to.equal(2, "512-token doc must split into exactly 2 chunks")
     })
 
     it("the over-budget doc's TAIL content survives (no silent truncation)", async function () {
-      // "overmk" sits in the final part of the over-budget doc, past the 508
+      // "overmk" sits in the final part of the over-budget doc, past the 510
       // single-chunk budget. FTS matches literal text: if the chunker truncated
       // instead of splitting, this marker would be unindexed and unreachable.
       const hits = await searchMode(DOMAIN, "c_boundary", "overmk", "fts", { count: 50 })
