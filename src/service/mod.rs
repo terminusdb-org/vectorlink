@@ -40,6 +40,10 @@ pub struct EmbeddingsResult {
     pub store_clustering: bool,
     /// The commit that was searched.
     pub served_commit: String,
+    /// Slot-1 model that produced `doc_embeddings`.
+    pub embedding_model: String,
+    /// Model that produced `clustering_embeddings` (slot-2 model when configured).
+    pub clustering_model: String,
 }
 
 /// Streaming response for GET /embeddings (NDJSON mode).
@@ -51,6 +55,10 @@ pub struct EmbeddingsStreamResult {
     pub store_clustering: bool,
     /// Total number of unique doc_ids that will be streamed.
     pub total_count: u64,
+    /// Slot-1 model that produced the `embedding` records.
+    pub embedding_model: String,
+    /// Model that produced the `clustering_embedding` records.
+    pub clustering_model: String,
     /// Channel receiver yielding `EmbeddingRecord` values.
     pub receiver: tokio::sync::mpsc::Receiver<EmbeddingRecord>,
 }
@@ -104,6 +112,10 @@ pub struct SearchService {
     tokenizer: Arc<Tokenizer>,
     chunk_params: ChunkParams,
     http_client: reqwest::Client,
+    /// Client for the slot-2 (clustering) provider — carries
+    /// `api_key2` as its Authorization default. Used only when
+    /// `provider2` is configured; otherwise the slot-1 client serves.
+    http_client2: reqwest::Client,
     embed_cache: crate::embed::cache::EmbedCache,
     /// Per-capability readiness: index readiness is independent of search
     /// readiness (search additionally requires a warm embedding backend).
@@ -205,12 +217,30 @@ impl SearchService {
             .build()
             .expect("failed to build http client");
 
+        // Slot-2 client — a separate Authorization default so the slot-1 key
+        // is never sent to a different endpoint.
+        let mut http_client2_builder = reqwest::Client::builder();
+        if let Some(key) = &config.api_key2 {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", key)
+                    .parse()
+                    .expect("VECTORLINK_MODEL2_API_KEY contains invalid header characters"),
+            );
+            http_client2_builder = http_client2_builder.default_headers(headers);
+        }
+        let http_client2 = http_client2_builder
+            .build()
+            .expect("failed to build http client");
+
         Self {
             store,
             config,
             tokenizer: Arc::new(tokenizer),
             chunk_params,
             http_client,
+            http_client2,
             embed_cache,
             ready_index,
             ready_search,
@@ -401,6 +431,16 @@ impl SearchService {
         let tokenizer = Arc::clone(&self.tokenizer);
         let chunk_params = self.chunk_params.clone();
         let provider = self.config.embed_provider.clone();
+        let clustering_provider = self
+            .config
+            .provider2
+            .clone()
+            .unwrap_or_else(|| provider.clone());
+        let clustering_client = if self.config.provider2.is_some() {
+            self.http_client2.clone()
+        } else {
+            self.http_client.clone()
+        };
         let http_client = self.http_client.clone();
         let embed_batch_size = self.config.embed_batch_size;
         let embed_cache = self.embed_cache.clone();
@@ -424,6 +464,8 @@ impl SearchService {
                 tokenizer: &tokenizer,
                 chunk_params: &chunk_params,
                 provider: &provider,
+                clustering_provider: &clustering_provider,
+                clustering_client: &clustering_client,
                 http_client: &http_client,
                 embed_cache: &embed_cache,
                 domain: &domain_str,
@@ -562,6 +604,16 @@ impl SearchService {
         let tokenizer = Arc::clone(&self.tokenizer);
         let chunk_params = self.chunk_params.clone();
         let provider = self.config.embed_provider.clone();
+        let clustering_provider = self
+            .config
+            .provider2
+            .clone()
+            .unwrap_or_else(|| provider.clone());
+        let clustering_client = if self.config.provider2.is_some() {
+            self.http_client2.clone()
+        } else {
+            self.http_client.clone()
+        };
         let http_client = self.http_client.clone();
         let embed_batch_size = self.config.embed_batch_size;
         let embed_cache = self.embed_cache.clone();
@@ -618,6 +670,8 @@ impl SearchService {
                 tokenizer: &tokenizer,
                 chunk_params: &chunk_params,
                 provider: &provider,
+                clustering_provider: &clustering_provider,
+                clustering_client: &clustering_client,
                 http_client: &http_client,
                 embed_cache: &embed_cache,
                 domain: &domain_str,
@@ -864,6 +918,32 @@ impl SearchService {
             hits: paginated,
             served_commit,
         })
+    }
+
+    /// Provider + HTTP client for an embedding role. The Clustering role uses
+    /// the slot-2 provider when configured (`VECTORLINK_MODEL2`); every other
+    /// role uses the slot-1 provider.
+    fn embed_route(&self, role: EmbeddingRole) -> (&Provider, &reqwest::Client) {
+        if role == EmbeddingRole::Clustering {
+            if let Some(p2) = &self.config.provider2 {
+                return (p2, &self.http_client2);
+            }
+        }
+        (&self.config.embed_provider, &self.http_client)
+    }
+
+    /// (slot-1, clustering) model names — clustering falls back to slot 1 when
+    /// no second model is configured.
+    fn model_names(&self) -> (String, String) {
+        (
+            self.config.embed_provider.model_name().to_owned(),
+            self.config
+                .provider2
+                .as_ref()
+                .unwrap_or(&self.config.embed_provider)
+                .model_name()
+                .to_owned(),
+        )
     }
 
     /// Suggest (typeahead): FTS-only partial-query assistance.
@@ -1718,11 +1798,14 @@ impl SearchService {
             std::collections::HashMap::new()
         };
 
+        let (embedding_model, clustering_model) = self.model_names();
         Ok(EmbeddingsResult {
             doc_embeddings,
             clustering_embeddings,
             store_clustering,
             served_commit,
+            embedding_model,
+            clustering_model,
         })
     }
 
@@ -1762,10 +1845,13 @@ impl SearchService {
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
+        let (embedding_model, clustering_model) = self.model_names();
         Ok(EmbeddingsStreamResult {
             served_commit,
             store_clustering,
             total_count,
+            embedding_model,
+            clustering_model,
             receiver: rx,
         })
     }
@@ -1859,25 +1945,28 @@ impl SearchService {
             ));
         }
 
-        // Embed both texts, each with its specified role.
+        // Embed both texts, each with its specified role (the clustering role
+        // may route to the slot-2 provider).
         let source_texts = vec![source.to_owned()];
         let target_texts = vec![target.to_owned()];
+        let (source_provider, source_client) = self.embed_route(source_role);
+        let (target_provider, target_client) = self.embed_route(target_role);
 
         let source_embeddings = embed::io_embed(
-            &self.config.embed_provider,
+            source_provider,
             &source_texts,
             source_role,
-            &self.http_client,
+            source_client,
             Some(&self.embed_cache),
         )
         .await
         .map_err(|e| ServiceError::Internal(format!("embedding source failed: {}", e)))?;
 
         let target_embeddings = embed::io_embed(
-            &self.config.embed_provider,
+            target_provider,
             &target_texts,
             target_role,
-            &self.http_client,
+            target_client,
             Some(&self.embed_cache),
         )
         .await
@@ -1945,6 +2034,11 @@ struct PipelineCtx<'a> {
     tokenizer: &'a Tokenizer,
     chunk_params: &'a ChunkParams,
     provider: &'a Provider,
+    /// Slot-2 provider for the clustering role — the configured
+    /// `provider2`, or the slot-1 provider when no second model is set.
+    clustering_provider: &'a Provider,
+    /// HTTP client matching `clustering_provider` (carries the slot-2 key).
+    clustering_client: &'a reqwest::Client,
     http_client: &'a reqwest::Client,
     embed_cache: &'a crate::embed::cache::EmbedCache,
     domain: &'a str,
@@ -2117,11 +2211,11 @@ async fn io_run_index_pipeline(
 
     let embed_results_query = if store_clustering {
         embed::io_embed_batched(
-            ctx.provider,
+            ctx.clustering_provider,
             &flat_texts,
             ctx.embed_batch_size,
             EmbeddingRole::Clustering,
-            ctx.http_client,
+            ctx.clustering_client,
             Some(ctx.embed_cache),
         )
         .await
@@ -2288,9 +2382,15 @@ async fn io_run_index_pipeline(
                     .map_err(|e| format!("vector index creation failed: {}", e))?;
 
                 if store_clustering {
-                    crate::store::vector_index::io_ensure_clustering_vector_index(&mut ds_opt, &vector_config, false)
+                    if let Some(clustering_config) = ctx.store.clustering_index_config() {
+                        crate::store::vector_index::io_ensure_clustering_vector_index(
+                            &mut ds_opt,
+                            clustering_config,
+                            false,
+                        )
                         .await
                         .map_err(|e| format!("clustering vector index creation failed: {}", e))?;
+                    }
                 }
 
                 indexed_version = Some(ds_opt.version().version);
@@ -2549,11 +2649,11 @@ async fn io_run_index_pipeline_stream(
             let embed_results_query = if store_clustering {
                 tokio::select! {
                     r = embed::io_embed_batched(
-                        ctx.provider,
+                        ctx.clustering_provider,
                         &flat_texts,
                         ctx.embed_batch_size,
                         EmbeddingRole::Clustering,
-                        ctx.http_client,
+                        ctx.clustering_client,
                         Some(ctx.embed_cache),
                     ) => r,
                     _ = cancel_token.cancelled() => {
@@ -2832,9 +2932,15 @@ async fn io_run_index_pipeline_stream(
                 .map_err(|e| format!("vector index creation failed: {}", e))?;
 
             if store_clustering {
-                crate::store::vector_index::io_ensure_clustering_vector_index(&mut ds, &vector_config, false)
+                if let Some(clustering_config) = ctx.store.clustering_index_config() {
+                    crate::store::vector_index::io_ensure_clustering_vector_index(
+                        &mut ds,
+                        clustering_config,
+                        false,
+                    )
                     .await
                     .map_err(|e| format!("clustering vector index creation failed: {}", e))?;
+                }
             }
 
             indexed_version = Some(ds.version().version);
@@ -2976,6 +3082,8 @@ mod tests_risk26 {
             tokenizer,
             chunk_params,
             provider,
+            clustering_provider: provider,
+            clustering_client: http_client,
             http_client,
             embed_cache: &DISABLED_CACHE,
             domain,
@@ -3356,6 +3464,8 @@ mod tests_streaming {
             tokenizer,
             chunk_params,
             provider,
+            clustering_provider: provider,
+            clustering_client: http_client,
             http_client,
             embed_cache: &DISABLED_CACHE,
             domain,
@@ -3625,7 +3735,10 @@ mod tests_exact_duplicate_override {
                 model: "test-model".to_owned(),
                 dim,
             },
+            provider2: None,
             embed_api_key: None,
+            api_key2: None,
+            clustering_index: Some(crate::store::lance::VectorIndexConfig::default_for_dim(dim)),
             data_dir: "/tmp/test".to_owned(),
             tokenizer_path: "assets/tokenizer.json.bz2".to_owned(),
             embed_batch_size: 32,
@@ -4647,6 +4760,8 @@ mod tests_concurrent_search {
                 tokenizer: &tokenizer_clone,
                 chunk_params: &chunk_params_clone,
                 provider: &provider_clone,
+                clustering_provider: &provider_clone,
+                clustering_client: &http_client_clone,
                 http_client: &http_client_clone,
                 embed_cache: &DISABLED_CACHE,
                 domain,

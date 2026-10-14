@@ -94,6 +94,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     vectorlink::config::verify_or_lock_embedding_params(
         Path::new(&config.data_dir),
         &config.embed_provider,
+        config.provider2.as_ref(),
     )?;
 
     // Load the tokenizer (required for chunking).
@@ -108,12 +109,14 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Create the LanceStore backed by the data directory.
     let dim = config.embed_provider.expected_dim();
     let data_dir = Path::new(&config.data_dir);
-    let lance_store = Arc::new(LanceStore::new(
+    let mut lance_store = LanceStore::new(
         data_dir,
         dim,
         config.lance_index_cache_bytes,
         config.lance_metadata_cache_bytes,
-    ));
+    );
+    lance_store.set_clustering_index_config(config.clustering_index.clone());
+    let lance_store = Arc::new(lance_store);
 
     // Startup cleanup: delete any stale __compact_rebuild branches left by
     // a crashed compaction. This is a critical safety check — a lingering
@@ -235,6 +238,13 @@ async fn prime_embed_cache(args: &[String]) -> Result<(), Box<dyn std::error::Er
     let config = Config::from_env();
 
     let model = config.embed_provider.model_name();
+    // Clustering embeddings live in the slot-2 space when a second provider
+    // is configured — their cache keys must use that model's name.
+    let clustering_model = config
+        .provider2
+        .as_ref()
+        .map(|p| p.model_name())
+        .unwrap_or(model);
     let dim = config.embed_provider.expected_dim();
     let data_dir = Path::new(&config.data_dir);
 
@@ -349,10 +359,10 @@ async fn prime_embed_cache(args: &[String]) -> Result<(), Box<dyn std::error::Er
                 if clust_emb.len() == dim {
                     let prefixed = embed::apply_prefix(
                         &[content.to_owned()],
-                        model,
+                        clustering_model,
                         EmbeddingRole::Clustering,
                     );
-                    let key = EmbedCache::cache_key(model, &prefixed[0]);
+                    let key = EmbedCache::cache_key(clustering_model, &prefixed[0]);
                     cache.put(&key, &clust_emb);
                     total_cached += 1;
                 }

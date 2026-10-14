@@ -200,6 +200,37 @@ async fn main() -> ExitCode {
     };
     let http_client = reqwest::Client::new();
 
+    // Slot-2 (clustering) provider: VECTORLINK_MODEL2 + optional
+    // VECTORLINK_MODEL2_* — falls back to the slot-1 provider when unset.
+    let provider2 = vectorlink::config::resolve_provider2(&provider, |k| std::env::var(k).ok());
+    let same_endpoint = provider2
+        .as_ref()
+        .map(|p2| p2.base_url().trim_end_matches('/') == provider.base_url().trim_end_matches('/'))
+        .unwrap_or(true);
+    let api_key2 = vectorlink::config::resolve_api_key2(|k| std::env::var(k).ok(), same_endpoint);
+    let http_client2 = match api_key2 {
+        Some(key) => {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", key)
+                    .parse()
+                    .expect("VECTORLINK_MODEL2_API_KEY contains invalid header characters"),
+            );
+            reqwest::Client::builder()
+                .default_headers(headers)
+                .build()
+                .expect("failed to build http client")
+        }
+        None => reqwest::Client::new(),
+    };
+    let clustering_provider = provider2.as_ref().unwrap_or(&provider);
+    let clustering_client = if provider2.is_some() {
+        &http_client2
+    } else {
+        &http_client
+    };
+
     // Acquire the per-(domain, branch) pipeline lock for the WHOLE
     // load→tag→last-indexed sequence (#D). The push pipeline takes the same
     // lock, so a concurrent `load` + `/push` on the same branch cannot
@@ -220,6 +251,8 @@ async fn main() -> ExitCode {
                     &chunk_params,
                     &provider,
                     &http_client,
+                    clustering_provider,
+                    clustering_client,
                     &args.domain,
                     &args.branch,
                     id,
@@ -317,6 +350,8 @@ async fn io_index_one(
     chunk_params: &chunk::ChunkParams,
     provider: &embed::Provider,
     http_client: &reqwest::Client,
+    clustering_provider: &embed::Provider,
+    clustering_client: &reqwest::Client,
     domain: &str,
     branch: &str,
     doc_id: &str,
@@ -332,14 +367,24 @@ async fn io_index_one(
     let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
 
     // Phase 6A Step 5: embed with BOTH roles (document + query).
-    let mut embeddings_doc =
-        embed::io_embed(provider, &chunk_texts, EmbeddingRole::Document, http_client, None)
-            .await
-            .map_err(|e| format!("embedding (doc) failed: {}", e))?;
-    let mut embeddings_query =
-        embed::io_embed(provider, &chunk_texts, EmbeddingRole::Clustering, http_client, None)
-            .await
-            .map_err(|e| format!("embedding (query) failed: {}", e))?;
+    let mut embeddings_doc = embed::io_embed(
+        provider,
+        &chunk_texts,
+        EmbeddingRole::Document,
+        http_client,
+        None,
+    )
+    .await
+    .map_err(|e| format!("embedding (doc) failed: {}", e))?;
+    let mut embeddings_query = embed::io_embed(
+        clustering_provider,
+        &chunk_texts,
+        EmbeddingRole::Clustering,
+        clustering_client,
+        None,
+    )
+    .await
+    .map_err(|e| format!("embedding (query) failed: {}", e))?;
 
     if embeddings_doc.len() != chunks.len() {
         return Err(format!(

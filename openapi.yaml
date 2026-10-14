@@ -774,6 +774,12 @@ paths:
             X-Total-Count:
               schema: { type: integer }
               description: Total number of embedding records in the response.
+            X-Embedding-Model:
+              schema: { type: string }
+              description: Model that produced the `embedding` vectors (slot 1).
+            X-Clustering-Model:
+              schema: { type: string }
+              description: Model that produced the `clustering_embedding` vectors (slot 2 when VECTORLINK_MODEL2 is configured, otherwise slot 1).
           content:
             application/json:
               schema:
@@ -835,6 +841,12 @@ paths:
               schema: { type: string }
             X-Total-Count:
               schema: { type: integer }
+            X-Embedding-Model:
+              schema: { type: string }
+              description: Model that produced the `embedding` vectors (slot 1).
+            X-Clustering-Model:
+              schema: { type: string }
+              description: Model that produced the `clustering_embedding` vectors (slot 2 when VECTORLINK_MODEL2 is configured, otherwise slot 1).
           content:
             application/json:
               schema:

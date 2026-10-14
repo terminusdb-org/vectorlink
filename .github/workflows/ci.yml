@@ -249,6 +249,10 @@ jobs:
           docker exec ollama ollama pull hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0
           docker exec ollama ollama cp hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0 multilingual-e5-base
 
+          # Slot-2 (clustering) model — VECTORLINK_MODEL2
+          echo "Pulling nomic-embed-text-v2-moe model..."
+          docker exec ollama ollama pull nomic-embed-text-v2-moe:latest
+
       - name: Start vectorlink engine
         run: |
           mkdir -p /tmp/vectorlink-ci-data
@@ -256,6 +260,7 @@ jobs:
           VECTORLINK_ADMIN_SECRET=root \
           VECTORLINK_EMBED_PROVIDER=openai_compatible \
           VECTORLINK_EMBED_URL=http://127.0.0.1:11434 \
+          VECTORLINK_MODEL2=nomic-embed-text-v2-moe \
           VECTORLINK_DATA_DIR=/tmp/vectorlink-ci-data \
           VECTORLINK_TOKENIZER_PATH=$GITHUB_WORKSPACE/assets/tokenizer.json.bz2 \
           RUST_LOG=info \
@@ -283,6 +288,7 @@ jobs:
           VECTORLINK_URL: http://127.0.0.1:7372
           VECTORLINK_ADMIN_USER: admin
           VECTORLINK_ADMIN_SECRET: root
+          VECTORLINK_MODEL2: nomic-embed-text-v2-moe
         run: npx mocha --timeout 60000
 
       - name: Stop vectorlink engine
