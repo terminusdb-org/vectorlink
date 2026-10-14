@@ -143,6 +143,10 @@ make lint             # OpenAPI (Redocly) + clippy (-D warnings) + eslint
 
 `#![forbid(unsafe_code)]` is in every crate. Introducing `unsafe` requires a reviewed, signed commit that removes the forbid attribute.
 
+## Engineering rules
+
+**No fallbacks without an approved standing rule.** Silent fallbacks — guessing a parent, substituting a default, retrying against different parameters — are never introduced as part of a feature or a merge resolution. If a code path cannot proceed correctly, it fails loud: a typed error naming what is missing, why it matters, and what the caller should do next. A fallback may only exist when it has been explicitly approved as a permanent, documented standing rule for that specific case; until then, errors surface, they do not get papered over. When reviewing incoming code that contains a fallback, do not resolve the conflict in its favor — flag it, and either remove it or get it approved before merge.
+
 ## Source layout
 
 ```
@@ -172,13 +176,13 @@ All config is environment variables, read in `src/config/mod.rs`:
 | `VECTORLINK_PORT` | `7372` | Listen port |
 | `VECTORLINK_DATA_DIR` | `/data` | Lance dataset storage path |
 | `VECTORLINK_EMBED_URL` | `http://127.0.0.1:11434` | Embedding provider URL (Ollama) |
-| `VECTORLINK_MODEL` | `nomic-embed-text-v2-moe` | Embedding model name |
+| `VECTORLINK_MODEL` | `multilingual-e5-base` | Embedding model name |
 | `VECTORLINK_DIM` | `768` | Embedding vector dimension |
 | `VECTORLINK_EMBED_BATCH_SIZE` | `32` | Texts per embedding HTTP call |
 | `VECTORLINK_EMBED_CACHE_SIZE` | `20000` | Max embed cache entries (`none` to disable) |
 | `VECTORLINK_TOKENIZER_PATH` | `/data/tokenizer.json.bz2` | Tokenizer file (bz2 or plain JSON) |
 | `VECTORLINK_ADMIN_USER` | `admin` | HTTP Basic auth user |
-| `VECTORLINK_ADMIN_PASSWORD` | `root` | HTTP Basic auth password |
+| `VECTORLINK_ADMIN_SECRET` | _required — no default_ | HTTP Basic auth password |
 
 ## TerminusDB integration
 

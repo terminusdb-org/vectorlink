@@ -16,7 +16,7 @@ After this document you will be able to:
 
 The reference (`openai.rs`) is hardwired: `https://api.openai.com/v1/embeddings`, model `text-embedding-ada-002`, 1536 dimensions, tiktoken token arrays. It needs an OpenAI key and a network.
 
-tdb-search makes the provider **configurable** (a discriminated union, not flags):
+vectorlink makes the provider **configurable** (a discriminated union, not flags):
 
 | Provider | Endpoint | Use |
 |----------|----------|-----|
@@ -32,22 +32,23 @@ Embedding **dimension is configuration**, fixed per index at creation and record
 
 ## 2. The default model and its prefix requirement
 
-Default: **`nomic-ai/nomic-embed-text-v2-moe`** — 768-d, multilingual (~100 languages), mixture-of-experts (475M params, 305M active), served on **CPU** by a local **Ollama** sidecar (from Nomic's official GGUF, Q8_0) exposing an OpenAI-compatible `/v1/embeddings`.
+Default: **`multilingual-e5-base`** — 768-d, multilingual (~100 languages), XLM-RoBERTa-base backbone, served on **CPU** by a local **Ollama** sidecar (Q8_0 GGUF, ~300 MB) exposing an OpenAI-compatible `/v1/embeddings`.
 
-**⚠️ Task prefixes are mandatory for this model.** It was trained with instruction prefixes and produces *different, worse* results without them — silently (no error). But prefixes are **model-specific**: applying nomic's prefixes to, say, an OpenAI model would corrupt the input. So prefixes are **a property of the model, not the deployment**.
+**⚠️ Task prefixes are mandatory for this model.** It was trained with instruction prefixes and produces *different, worse* results without them — silently (no error). But prefixes are **model-specific**: applying e5's prefixes to, say, an OpenAI model would corrupt the input. So prefixes are **a property of the model, not the deployment**.
 
-tdb-search keeps a **hard-coded table of prefixes keyed by model name**. On every embed it looks up the configured model:
+vectorlink keeps a **hard-coded table of prefixes keyed by model name**. On every embed it looks up the configured model:
 
 | Model | Document prefix | Query prefix |
 |-------|-----------------|--------------|
-| `nomic-ai/nomic-embed-text-v2-moe` (default) | `search_document: ` | `search_query: ` |
+| `multilingual-e5-base` (default) | `passage: ` | `query: ` |
+| `nomic-ai/nomic-embed-text-v2-moe` | `search_document: ` | `search_query: ` |
 | `nomic-ai/nomic-embed-text-v1.5` | `search_document: ` | `search_query: ` |
 | OpenAI / any unknown model | _(none)_ | _(none)_ |
 
 - **match** → apply that model's prefix per role (Document = indexed content, Query = search text);
 - **no match** → **no prefix** (safe default).
 
-This is poka-yoke: the correct prefixes ship with the binary, so no deployment can misconfigure them. Adding a model means extending the table in code (reviewed), not changing config. A dedicated test (doc 06) asserts: the default model gets nomic prefixes, an unknown model gets none, and document-vs-query embeddings of the same text differ.
+This is poka-yoke: the correct prefixes ship with the binary, so no deployment can misconfigure them. Adding a model means extending the table in code (reviewed), not changing config. A dedicated test (doc 06) asserts: the default model gets its e5 prefixes, an unknown model gets none, and document-vs-query embeddings of the same text differ.
 
 ---
 
@@ -100,12 +101,12 @@ We neutralise this in the test configuration by making batch composition fixed:
 
 The default model has a **512-token hard limit**. A rendered embedding string longer than that would be **silently truncated** by the tokenizer — discarding most of a large document. That is a silent-degradation failure and is forbidden.
 
-tdb-search therefore **chunks** long inputs using the de-facto RAG standard (full design in `specs/08-document-chunking.md`):
+vectorlink therefore **chunks** long inputs using the de-facto RAG standard (full design in `specs/08-document-chunking.md`):
 
 - **Token-based chunking with overlap.** Split the string into chunks that fit the model window, with ~15% overlap so context isn't lost at boundaries.
 - **One vector per chunk.** Each chunk is its own LanceDB row, keyed by `(doc_id, chunk_index)`. A short document is simply one chunk.
 - **The prefix counts against the budget.** `search_document: ` consumes tokens, so chunk size = window − prefix tokens; the prefix is applied to each chunk.
-- **The model's own tokenizer** sets boundaries (nomic → xlm-roberta SentencePiece) — counting with the wrong tokenizer would reintroduce truncation.
+- **The model's own tokenizer** sets boundaries (xlm-roberta SentencePiece — shared by the e5 and nomic families) — counting with the wrong tokenizer would reintroduce truncation.
 - **Search dedups chunks back to documents.** Vector/FTS/hybrid search runs over chunk rows, then groups by `doc_id` keeping the best chunk, so `/search` still returns documents (`[{id,distance}]`) — chunk ids never leak.
 - **`Changed` replaces the whole chunk set; `Deleted` removes all chunks** for a `doc_id`.
 
@@ -118,9 +119,9 @@ This guarantees arbitrarily large documents are fully embedded and a query match
 ## 8. The default test stack (preview of doc 06)
 
 `docker-compose.yml` runs three CPU-only services with no external network:
-- `embeddings` — **Ollama** serving `nomic-embed-text-v2-moe` (official GGUF, Q8_0), pinned image + GGUF digests.
+- `embeddings` — **Ollama** serving `multilingual-e5-base` (GGUF, Q8_0), pinned image + GGUF digests.
 - `terminusdb` — a real TerminusDB for end-to-end fidelity.
-- `tdb-search` — configured with `OpenAiCompatible { base_url: http://embeddings:11434 }` and the nomic prefixes.
+- `vectorlink` — configured with `OpenAiCompatible { base_url: http://embeddings:11434 }` and the e5 prefixes.
 
 Because the model is local, pinned, and run in inference mode with one-input-per-request batching, the vectors — and therefore every search ranking and distance — are reproducible within a run, which is what makes assertion-level integration testing possible (doc 06). (Cross-restart bit-identity is confirmed in the determinism battery before goldens are enforced strictly.)
 

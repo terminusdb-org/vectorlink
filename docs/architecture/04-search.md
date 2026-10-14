@@ -68,7 +68,7 @@ With `snippet=true`, each member also carries `"snippet": "…"`. The `group` ar
 
 ## 4. Interpreting `distance`
 
-tdb-search reports a **normalized cosine distance in `[0, 1]`**, identical to the reference scale:
+vectorlink reports a **normalized cosine distance in `[0, 1]`**, identical to the reference scale:
 
 | cosine similarity | reported `distance` | meaning |
 |-------------------|---------------------|---------|
@@ -78,7 +78,7 @@ tdb-search reports a **normalized cosine distance in `[0, 1]`**, identical to th
 
 Smaller is closer. The reference computed this as `clamp01((dot − 1) / −2)` = `(1 − cos_sim) / 2` over L2-normalized vectors.
 
-LanceDB natively returns the *standard* cosine distance `1 − cos_sim` ∈ `[0, 2]`. These two scales differ by **exactly ×2**, so tdb-search converts deterministically:
+LanceDB natively returns the *standard* cosine distance `1 − cos_sim` ∈ `[0, 2]`. These two scales differ by **exactly ×2**, so vectorlink converts deterministically:
 
 ```
 distance = clamp01( lance_cosine_distance / 2 )
@@ -90,7 +90,7 @@ Vectors are L2-normalized before insertion, so Lance's cosine distance equals `1
 
 ## 5. 🆕 Full-text and hybrid search
 
-The reference has **vector search only**. tdb-search adds full-text and hybrid through a single endpoint:
+The reference has **vector search only**. vectorlink adds full-text and hybrid through a single endpoint:
 
 ```
 POST /search?domain=D&commit=C&count=N&mode=vector|fts|hybrid[&doc_type=T]
@@ -115,7 +115,7 @@ Why this matters: full-text search catches exact terms, IDs, and rare tokens tha
 
 ## 6. The search snapshot is commit-scoped
 
-Every search names a `commit`. tdb-search resolves it to the tagged Lance version and reads that snapshot (doc 03 §4). So search results are **reproducible per commit**: the same query against the same commit returns the same documents, regardless of later indexing. This property is the backbone of the deterministic integration tests (doc 06).
+Every search names a `commit`. vectorlink resolves it to the tagged Lance version and reads that snapshot (doc 03 §4). So search results are **reproducible per commit**: the same query against the same commit returns the same documents, regardless of later indexing. This property is the backbone of the deterministic integration tests (doc 06).
 
 ## 7. 🆕 Eventual consistency: search can lag the write head
 

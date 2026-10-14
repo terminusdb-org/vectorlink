@@ -30,7 +30,8 @@ pub enum EmbeddingRole {
     Classification,
 }
 
-/// Task prefix set for a model (all four nomic prefixes).
+/// Task prefix set for a model (e.g. the four nomic roles, or e5's
+/// passage:/query: asymmetric pair).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskPrefix {
     pub document: &'static str,
@@ -50,6 +51,15 @@ pub fn prefixes_for_model(model: &str) -> Option<TaskPrefix> {
             query: "search_query: ",
             clustering: "clustering: ",
             classification: "classification: ",
+        }),
+        // E5 asymmetric convention: `query: ` for queries, `passage: ` for
+        // corpus texts. Symmetric tasks (clustering, classification) use
+        // `query: ` on all inputs.
+        "intfloat/multilingual-e5-base" | "multilingual-e5-base" => Some(TaskPrefix {
+            document: "passage: ",
+            query: "query: ",
+            clustering: "query: ",
+            classification: "query: ",
         }),
         _ => None,
     }
@@ -414,6 +424,31 @@ mod tests {
         let p = prefix.unwrap();
         assert_eq!(p.document, "search_document: ");
         assert_eq!(p.query, "search_query: ");
+    }
+
+    #[test]
+    fn e5_multilingual_base_has_e5_prefixes() {
+        // E5 asymmetric convention: queries get `query: `, corpus texts get
+        // `passage: `. Symmetric tasks (clustering, classification) use
+        // `query: ` on all inputs.
+        for model in ["intfloat/multilingual-e5-base", "multilingual-e5-base"] {
+            let prefix = prefixes_for_model(model);
+            assert!(prefix.is_some(), "missing prefixes for {model}");
+            let p = prefix.unwrap();
+            assert_eq!(p.document, "passage: ");
+            assert_eq!(p.query, "query: ");
+            assert_eq!(p.clustering, "query: ");
+            assert_eq!(p.classification, "query: ");
+        }
+    }
+
+    #[test]
+    fn apply_prefix_e5_query_and_document() {
+        let texts = vec!["hello world".to_owned()];
+        let doc = apply_prefix(&texts, "multilingual-e5-base", EmbeddingRole::Document);
+        assert_eq!(doc, vec!["passage: hello world"]);
+        let query = apply_prefix(&texts, "multilingual-e5-base", EmbeddingRole::Query);
+        assert_eq!(query, vec!["query: hello world"]);
     }
 
     #[test]

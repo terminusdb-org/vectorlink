@@ -36,7 +36,7 @@ To build the delta from `parent_commit` to `target_commit`, TerminusDB does the 
    - feed the result into the type's Handlebars template (or, if no template, the JSON document),
    - emit one NDJSON line.
 
-   > Note: this rendered string can be **arbitrarily long**. tdb-search chunks it to fit the embedding model's context window (doc 05 §7) so nothing is silently truncated — TerminusDB itself imposes no length limit here.
+   > Note: this rendered string can be **arbitrarily long**. vectorlink chunks it to fit the embedding model's context window (doc 05 §7) so nothing is silently truncated — TerminusDB itself imposes no length limit here.
 4. **Push** the lines to the indexer as a chunked NDJSON stream.
 
 ### Worked example: the Star Wars `People` embedding template
@@ -55,7 +55,7 @@ The person's name is Yoda. They are described with the following synopsis: Yoda 
 ```
 That rendered string — not the raw JSON — is what gets embedded. (The blog's insight: embedding the meaningful sentence gives far better semantics than embedding raw JSON.)
 
-> **Boundary reminder:** all of §2 happens *inside TerminusDB*. tdb-search receives only the finished operation lines.
+> **Boundary reminder:** all of §2 happens *inside TerminusDB*. vectorlink receives only the finished operation lines.
 
 ---
 
@@ -75,7 +75,7 @@ POST /push?domain={domain}&branch={branch}&target_commit={C}&parent_commit={P}
 - `{domain}` — e.g. `admin/star_wars`.
 - `{branch}` — e.g. `main`.
 - `{parent_commit}` — comes from the `/last-indexed` handshake; TerminusDB computes the diff from there to `{target_commit}`.
-- **Auth** — every indexer request is gated by a shared admin secret over **HTTP Basic** (`admin:root` by default). This is authentication only — there is no RBAC at the indexer. TerminusDB fronts search and authorises the caller against its own capability system before calling the indexer.
+- **Auth** — every indexer request is gated by a shared admin secret over **HTTP Basic** (`VECTORLINK_ADMIN_SECRET`, required — no default). This is authentication only — there is no RBAC at the indexer. TerminusDB fronts search and authorises the caller against its own capability system before calling the indexer.
 - **Body** — an NDJSON stream, parsed line-by-line and processed incrementally in chunks (never buffered whole).
 - **Failure** → the push fails loudly with the status code and body (no silent fallback).
 
@@ -94,20 +94,20 @@ NDJSON; each line is one tagged operation (`#[serde(tag="op")]`). This is the **
 {"op":"Error","message":"Failed to retrieve embedding for id ..."}
 ```
 
-| op | Meaning | Reference behaviour | 🆕 tdb-search |
+| op | Meaning | Reference behaviour | 🆕 vectorlink |
 |----|---------|---------------------|---------------|
 | `Inserted` | New document | Embed `string`, insert point | Same |
 | `Changed` | Modified document | Treated as insert (duplicate) | May upsert (replace) behind a feature flag |
 | `Deleted` | Removed document | Parsed then **dropped** (no-op) | May delete the row behind a feature flag |
 | `Error` | Upstream couldn't render | Logged, skipped | Same |
 
-Default tdb-search behaviour must not regress the reference: insert-only semantics remain the default; delete/replace are opt-in.
+Default vectorlink behaviour must not regress the reference: insert-only semantics remain the default; delete/replace are opt-in.
 
 ---
 
 ## 5. Building a fake push driver (for tests)
 
-Because the contract is just "POST an NDJSON stream to `/push`," a test double is trivial: a client that POSTs a fixed file of operation lines to `/push?domain=…&branch=…&target_commit=…&parent_commit=…` with the admin secret. This lets you integration-test all of tdb-search's indexing without TerminusDB, with fully controlled input. (The full deterministic stack in doc 06 uses a *real* TerminusDB for end-to-end fidelity, but the fake driver is invaluable for focused tests.)
+Because the contract is just "POST an NDJSON stream to `/push`," a test double is trivial: a client that POSTs a fixed file of operation lines to `/push?domain=…&branch=…&target_commit=…&parent_commit=…` with the admin secret. This lets you integration-test all of vectorlink's indexing without TerminusDB, with fully controlled input. (The full deterministic stack in doc 06 uses a *real* TerminusDB for end-to-end fidelity, but the fake driver is invaluable for focused tests.)
 
 ---
 

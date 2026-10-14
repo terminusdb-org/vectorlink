@@ -4,11 +4,14 @@ Bring up the stack, index one commit, and run a search — all over HTTP.
 
 ## 1. Start the stack
 
-One command — no clone, no build. All three services use pre-built images:
+Three commands — no clone, no build. All three services use pre-built images.
+The admin secret is the only required configuration: fetch `.env.example`
+(which carries `root` for local use) as `.env`, then bring the stack up:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/terminusdb-org/vectorlink/main/docker-compose.quickstart.yml \
-  | docker compose -f - up -d
+curl -fsSLO https://raw.githubusercontent.com/terminusdb-org/vectorlink/main/docker-compose.quickstart.yml
+curl -fsSL https://raw.githubusercontent.com/terminusdb-org/vectorlink/main/.env.example -o .env
+docker compose -f docker-compose.quickstart.yml up -d
 ```
 
 This starts three services on CPU, with no external network after the one-time model pull:

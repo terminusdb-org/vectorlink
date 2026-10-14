@@ -2,7 +2,7 @@
 #
 # Canonical deployment: terminusdb + vectorlink + embeddings (Ollama).
 # No external network dependency after the one-time model pull.
-# The embedding sidecar is Ollama serving nomic-embed-text-v2-moe (Q8_0 GGUF).
+# The embedding sidecar is Ollama serving multilingual-e5-base (Q8_0 GGUF).
 #
 # TerminusDB build-from-source notes:
 #   The canonical path builds TerminusDB from the sibling submodule (../terminusdb/).
@@ -25,7 +25,7 @@ services:
       args:
         SKIP_TESTS: "true"
         SWIPL_VERSION: "10.0.1"
-    image: terminusdb/terminusdb-server:local
+    #image: terminusdb/terminusdb-server:local
     environment:
       - TERMINUSDB_SERVER_PORT=6363
       - "TERMINUSDB_ADMIN_PASS=${TERMINUSDB_ADMIN_PASS:-root}"
@@ -44,7 +44,7 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  # Ollama embedding sidecar — serves nomic-embed-text-v2-moe via /v1/embeddings.
+  # Ollama embedding sidecar — serves multilingual-e5-base via /v1/embeddings.
   # CPU-only (no GPU required). The model is created on first start via the init service.
   embeddings:
     image: ollama/ollama:latest
@@ -52,7 +52,7 @@ services:
     environment:
       # Keep the model resident indefinitely (never unload on idle). Eliminates
       # the cold-load penalty on every push/bench after an idle gap. Trade-off:
-      # the model stays in RAM (~0.7-1.5 GiB for nomic-embed-v2 Q8_0) at all times.
+      # the model stays in RAM (~0.3-0.6 GiB for multilingual-e5-base Q8_0) at all times.
       - OLLAMA_KEEP_ALIVE=60m
     #ports:
     #  - "127.0.0.1:11434:11434"
@@ -66,7 +66,7 @@ services:
       start_period: 30s
     restart: unless-stopped
 
-  # One-shot init: pull the nomic model if not already present.
+  # One-shot init: pull the e5 model if not already present.
   embeddings-init:
     image: ollama/ollama:latest
     pull_policy: missing
@@ -80,8 +80,8 @@ services:
     entrypoint: ["bash", "-c"]
     command:
       - |
-        ollama pull hf.co/nomic-ai/nomic-embed-text-v2-moe-GGUF:Q8_0 || true
-        ollama cp hf.co/nomic-ai/nomic-embed-text-v2-moe-GGUF:Q8_0 nomic-embed-v2 2>/dev/null || true
+        ollama pull hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0 || true
+        ollama cp hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0 multilingual-e5-base 2>/dev/null || true
         echo "Model ready."
     restart: "no"
 
@@ -90,11 +90,9 @@ services:
     build: .
     environment:
       - VECTORLINK_ADMIN_USER=admin
-      - "VECTORLINK_ADMIN_SECRET=${VECTORLINK_ADMIN_SECRET:-root}"
+      - "VECTORLINK_ADMIN_SECRET=${VECTORLINK_ADMIN_SECRET:?set VECTORLINK_ADMIN_SECRET in .env (see .env.example)}"
       - VECTORLINK_EMBED_PROVIDER=openai_compatible
       - VECTORLINK_EMBED_URL=http://embeddings:11434
-      - VECTORLINK_MODEL=nomic-embed-v2
-      - VECTORLINK_DIM=768
       - VECTORLINK_DATA_DIR=/data
       - VECTORLINK_EMBED_CACHE_SIZE=3000000
       - VECTORLINK_TOKENIZER_PATH=/opt/vectorlink/tokenizer.json.bz2

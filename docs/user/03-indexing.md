@@ -60,7 +60,7 @@ GET /check?task_id=<id>
 
 ## Concurrency
 
-A push already in progress for the same `(domain, branch)` is rejected with `409` — it is not started twice.
+A commit can only be indexed once. Pushing a `target_commit` that is already in-flight or already indexed is rejected with `409` — the first push always wins. A push that failed releases the reservation, so retrying a failed commit is fine. To point a commit at an existing snapshot without re-embedding, use `/assign` (below).
 
 ## Reassigning a commit (no recompute)
 

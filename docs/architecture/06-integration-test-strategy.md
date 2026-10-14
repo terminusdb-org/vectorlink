@@ -29,15 +29,15 @@ This complements — does not replace — the unit and store-level tests in `spe
 │ docker-compose.yml  (CPU-only, no external network)         │
 │                                                             │
 │  ┌────────────┐   push (NDJSON)   ┌──────────────────────┐  │
-│  │ terminusdb │──────────────────▶│      tdb-search      │  │
+│  │ terminusdb │──────────────────▶│      vectorlink      │  │
 │  │  :6363     │   operation ops   │        :7372         │  │
 │  └────────────┘                   │  LanceDB store (vol) │  │
 │                                   └─────────┬────────────┘  │
 │                                             │ /v1/embeddings│
 │                                   ┌─────────▼────────────┐  │
 │                                   │ embeddings (Ollama)  │  │
-│                                   │  nomic-embed-text-   │  │
-│                                   │  v2-moe (GGUF, Q8_0) │  │
+│                                   │  multilingual-e5-    │  │
+│                                   │  base (GGUF, Q8_0)   │  │
 │                                   │  @ pinned digests,CPU│  │
 │                                   └──────────────────────┘  │
 │                                                             │
@@ -47,7 +47,7 @@ This complements — does not replace — the unit and store-level tests in `spe
 
 | Service | Role in tests | Determinism controls |
 |---------|---------------|----------------------|
-| `tdb-search` | System under test | Pinned image/build; fixed config; LanceDB volume reset per run |
+| `vectorlink` | System under test | Pinned image/build; fixed config; LanceDB volume reset per run |
 | `embeddings` (Ollama) | Real embeddings | **Pinned image + GGUF digests, Q8_0**, CPU, one-input-per-request for tests |
 | `terminusdb` | Real push source | Seeded from a fixed dataset bundle (Star Wars) at a known commit |
 | `test-runner` | Drives HTTP, asserts | Talks only to public endpoints |
@@ -124,7 +124,7 @@ The fidelity smoke test, reproducing the VectorLink blog:
 - Seed TerminusDB with the Star Wars bundle; configure the `People`/`Species` embedding templates; create commit `C0`.
 - Let TerminusDB push `C0` to the indexer; wait until the indexer's `/last-indexed` reports `C0`.
 - Assert: `"Wise old man"` → top hit `People/20` (Yoda); `"Who are the squid people"` → top hit `Species/8` (Mon Calamari).
-- **Prefix-table test:** the default model receives nomic prefixes; an unknown model name receives none; embedding the same text as document vs query yields different vectors.
+- **Prefix-table test:** the default model receives its asymmetric e5 prefixes (`passage:`/`query:`); an unknown model name receives none; embedding the same text as document vs query yields different vectors.
 - **Distance-scale test:** self-distance ≈ `0.0`; reported distance ∈ `[0,1]`; equals `lance_cosine_distance / 2` within tolerance.
 - **CPU/no-network assertion:** the stack completes with no GPU and no egress.
 
@@ -154,7 +154,7 @@ When the model revision is intentionally bumped, golden vectors are regenerated 
 ```
 1. docker compose up --wait        (services report healthy)
 2. health gates:
-     GET tdb-search /statistics → 200
+     GET vectorlink /statistics → 200
      GET embeddings  (Ollama readiness) → 200
      terminusdb info           → 200
 3. seed: load Star Wars bundle (Level D) OR mount fixture ops (Levels A–C)
@@ -182,4 +182,4 @@ Health gates must use **DOM/endpoint readiness polling, not fixed sleeps** (a pr
 2. What is the single configuration choice that most directly removes the batching nondeterminism in tests? *(One input per embedding request — no padding partners.)*
 3. How do you prove incremental indexing reused parent blocks rather than recomputing? *(Show only the changed doc was embedded — call count/provenance — and that the old commit's search result is unchanged.)*
 4. Why reset the LanceDB volume between runs? *(So versions/commits/tags start clean and results are reproducible.)*
-5. Which test guards the nomic prefix requirement? *(Embedding the same text as document vs query and asserting the vectors differ.)*
+5. Which test guards the e5 prefix requirement? *(Embedding the same text as document vs query and asserting the vectors differ.)*

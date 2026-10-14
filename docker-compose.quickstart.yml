@@ -1,0 +1,100 @@
+# vectorlink quickstart stack — pre-built images only, zero builds.
+#
+# One-liner:
+#   curl -fsSL https://raw.githubusercontent.com/terminusdb-org/vectorlink/main/docker-compose.quickstart.yml \
+#     | docker compose -p vectorlink-quickstart -f - up -d
+#
+# Three services, CPU-only, no external API keys. The only wait is the
+# one-time Ollama model pull (~700 MB) on first start.
+
+name: vectorlink-quickstart
+
+services:
+  terminusdb:
+    image: terminusdb/terminusdb-server:12.1-rc
+    pull_policy: missing
+    environment:
+      - TERMINUSDB_SERVER_PORT=6363
+      - "TERMINUSDB_ADMIN_PASS=${TERMINUSDB_ADMIN_PASS:-root}"
+      - TERMINUSDB_INDEXER_BACKEND=http_vectorlink
+      - TERMINUSDB_VECTORLINK_ENDPOINT=http://vectorlink:7372
+    ports:
+      - "127.0.0.1:6365:6363"
+    volumes:
+      - terminusdb-storage:/app/terminusdb/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/6363 && echo -e \"GET /api/info HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3 && timeout 2 grep -q api:success <&3'"]
+      interval: 60s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  embeddings:
+    image: ollama/ollama:latest
+    pull_policy: missing
+    environment:
+      - OLLAMA_KEEP_ALIVE=60m
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  embeddings-init:
+    image: ollama/ollama:latest
+    pull_policy: missing
+    depends_on:
+      embeddings:
+        condition: service_healthy
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      - OLLAMA_HOST=http://embeddings:11434
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        ollama pull hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0 || true
+        ollama cp hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0 multilingual-e5-base 2>/dev/null || true
+        echo "Model ready."
+    restart: "no"
+
+  vectorlink:
+    image: ghcr.io/terminusdb-org/vectorlink:dev
+    pull_policy: missing
+    environment:
+      - VECTORLINK_ADMIN_USER=admin
+      - "VECTORLINK_ADMIN_SECRET=${VECTORLINK_ADMIN_SECRET:?set VECTORLINK_ADMIN_SECRET in .env (see .env.example)}"
+      - VECTORLINK_PORT=7372
+      - VECTORLINK_EMBED_PROVIDER=openai_compatible
+      - VECTORLINK_EMBED_URL=http://embeddings:11434
+      - VECTORLINK_DATA_DIR=/data
+      - VECTORLINK_EMBED_CACHE_SIZE=3000000
+      - VECTORLINK_TOKENIZER_PATH=/opt/vectorlink/tokenizer.json.bz2
+      - VECTORLINK_PROMETHEUS_PORT=9090
+    ports:
+      - "127.0.0.1:7372:7372"
+      - "127.0.0.1:9091:9090"
+    volumes:
+      - vectorlink-data:/data
+    depends_on:
+      terminusdb:
+        condition: service_healthy
+      embeddings:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/7372 && echo -e \"GET /health/live HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3 && timeout 2 grep -q 200 <&3'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  terminusdb-storage:
+  ollama-models:
+  vectorlink-data:

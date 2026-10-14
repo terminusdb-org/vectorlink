@@ -323,10 +323,10 @@ describe("Search semantics — /similar, /duplicates, empty-query, multilingual"
     expect(res.body.length).to.equal(0, "no FTS term match → empty array, not an error")
   })
 
-  it("multilingual: a non-English doc is retrievable by a non-English query (nomic prefix handling)", async function () {
+  it("multilingual: a non-English doc is retrievable by a non-English query", async function () {
     const D = "admin/multilingual"
-    // Spanish doc + Spanish query — the multilingual nomic-v2 model + the
-    // search_document:/search_query: prefixes must work end-to-end.
+    // Spanish doc + Spanish query — the multilingual-e5-base model + the
+    // passage:/query: role prefixes must work end-to-end.
     await pushAndWait(D, "main", "ml_c0", [
       { op: "Inserted", id: "terminusdb:///ml/Doc/es", string: "La nave espacial despegó del planeta desértico al amanecer." },
       { op: "Inserted", id: "terminusdb:///ml/Doc/other", string: "A droid repairs the hyperdrive motivator in the cargo bay." },
@@ -351,6 +351,10 @@ describe("Search semantics — /similar, /duplicates, empty-query, multilingual"
     const SABER1 = "terminusdb:///ss/Topic/saber1"
     const SABER2 = "terminusdb:///ss/Topic/saber2"
     const COOKING = "terminusdb:///ss/Topic/cooking"
+    // Calibrated for multilingual-e5-base's compressed cosine geometry: the
+    // Soresu pair measures ~0.039, the unrelated cooking doc ~0.10. A threshold
+    // of 0.07 groups the near-duplicates while excluding the unrelated doc.
+    const DUP_THRESHOLD = 0.07
 
     // A group's member ids (order-independent set membership helper).
     const groupIds = g => g.group.map(m => m.id)
@@ -383,7 +387,7 @@ describe("Search semantics — /similar, /duplicates, empty-query, multilingual"
     it("surfaces genuinely near-identical docs as a group (the rich shape)", async function () {
       const res = await agent()
         .get("/duplicates")
-        .query({ domain: DOMAIN, commit: "ss_c0", threshold: 0.2 })
+        .query({ domain: DOMAIN, commit: "ss_c0", threshold: DUP_THRESHOLD })
         .set("Authorization", authHeader())
         .expect(200)
       expect(res.body).to.be.an("array")
@@ -413,7 +417,7 @@ describe("Search semantics — /similar, /duplicates, empty-query, multilingual"
     it("tightening the threshold yields fewer or no groups", async function () {
       const loose = await agent()
         .get("/duplicates")
-        .query({ domain: DOMAIN, commit: "ss_c0", threshold: 0.2 })
+        .query({ domain: DOMAIN, commit: "ss_c0", threshold: DUP_THRESHOLD })
         .set("Authorization", authHeader())
         .expect(200)
       const tight = await agent()
@@ -432,7 +436,7 @@ describe("Search semantics — /similar, /duplicates, empty-query, multilingual"
     it("snippet=true populates group[].snippet for each member", async function () {
       const res = await agent()
         .get("/duplicates")
-        .query({ domain: DOMAIN, commit: "ss_c0", threshold: 0.2, snippet: true })
+        .query({ domain: DOMAIN, commit: "ss_c0", threshold: DUP_THRESHOLD, snippet: true })
         .set("Authorization", authHeader())
         .expect(200)
       expect(res.body).to.be.an("array")

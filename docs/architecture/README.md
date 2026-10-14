@@ -1,11 +1,11 @@
-# tdb-search Architecture Reference
+# vectorlink Architecture Reference
 
-This folder is the **teaching reference** for how TerminusDB and `tdb-search` work together. It is written to two audiences at once:
+This folder is the **teaching reference** for how TerminusDB and `vectorlink` work together. It is written to two audiences at once:
 
-1. **Implementers** building `tdb-search` — it describes the existing VectorLink behaviour precisely enough to reproduce it, and flags every place `tdb-search` deliberately diverges.
+1. **Implementers** building `vectorlink` — it describes the existing VectorLink behaviour precisely enough to reproduce it, and flags every place `vectorlink` deliberately diverges.
 2. **Testers** — it explains the system well enough to know *what correct looks like* and how to verify it (culminating in the integration-test strategy, doc 06).
 
-> **Ground truth:** unless a section is marked **🆕 New in tdb-search**, it is a direct description of how the reference implementation (`terminusdb-semantic-indexer`, the source of the `terminusdb/vectorlink` image) works today. New additions are always called out explicitly.
+> **Ground truth:** unless a section is marked **🆕 New in vectorlink**, it is a direct description of how the reference implementation (`terminusdb-semantic-indexer`, the source of the `terminusdb/vectorlink` image) works today. New additions are always called out explicitly.
 
 ---
 
@@ -16,7 +16,7 @@ Each document follows the same learning-oriented shape so you can read actively 
 - **Learning objectives** — what you will be able to *do* after reading (Bloom: understand → apply → analyse).
 - **Prerequisites** — what to read first.
 - **Concept → mechanism → worked example** — progressive disclosure: the idea, then how it actually works, then a concrete trace through real data (the Star Wars dataset, as in the original VectorLink blog).
-- **🆕 New in tdb-search** callouts — divergences from the reference.
+- **🆕 New in vectorlink** callouts — divergences from the reference.
 - **Check your understanding** — a few questions whose answers are recoverable from the text; these double as the seed for test cases.
 
 This mirrors Gagné's events of instruction (gain attention → state objective → recall prior → present material → worked example → elicit performance → assess) applied to technical reference material.
@@ -40,7 +40,7 @@ Start at 01 and read in order; later docs assume the earlier ones.
 
 ## The one-sentence mental model
 
-> TerminusDB knows *what changed between two commits*; `tdb-search` turns those changes into vectors and stores them in a versioned LanceDB table so that any commit can be searched semantically — reusing a parent commit's vectors instead of recomputing them.
+> TerminusDB knows *what changed between two commits*; `vectorlink` turns those changes into vectors and stores them in a versioned LanceDB table so that any commit can be searched semantically — reusing a parent commit's vectors instead of recomputing them.
 
 ---
 
@@ -52,6 +52,6 @@ Start at 01 and read in order; later docs assume the earlier ones.
 | **Commit** | An opaque TerminusDB commit hash. Each indexed commit is independently searchable. |
 | **Operation** | A single change to index: `Inserted`, `Changed`, `Deleted`, or `Error`, streamed as JSON. |
 | **Embedding string** | The natural-language text rendered from a document via a GraphQL query + Handlebars template, then embedded. |
-| **Index** | The searchable structure for one `(domain, commit)`. Reference: an HNSW file. tdb-search: a LanceDB table version. |
+| **Index** | The searchable structure for one `(domain, commit)`. Reference: an HNSW file. vectorlink: a LanceDB table version. |
 | **Block / fragment** | The physical unit of stored vectors. Reused across commits/branches rather than copied. |
 | **Provider** | The embedding backend (local model, OpenAI, or generic HTTP). |

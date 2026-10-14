@@ -1,6 +1,6 @@
 # 5. History & branching
 
-This is what makes tdb-search more than a vector index: every commit is an independent, reproducible snapshot, and branching shares a parent's vectors instead of recomputing them. This page proves it end-to-end with `curl`.
+This is what makes vectorlink more than a vector index: every commit is an independent, reproducible snapshot, and branching shares a parent's vectors instead of recomputing them. This page proves it end-to-end with `curl`.
 
 ## Per-commit snapshots are reproducible
 

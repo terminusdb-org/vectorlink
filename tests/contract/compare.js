@@ -3,7 +3,7 @@
  *
  * Tests:
  *   1. Identical texts → distance ≈ 0.
- *   2. Unrelated texts → distance ≈ 0.5.
+ *   2. Unrelated texts → distance clearly above near-identical (e5 band).
  *   3. Missing method query param → 400.
  *   4. Unknown method query param → 400.
  *   5. Missing source in body → 400.
@@ -52,7 +52,7 @@ describe("POST /compare — stateless semantic distance", function () {
     expect(res.body.distance).to.be.below(0.20)
   })
 
-  it("unrelated texts → distance ≈ 0.3–0.6", async function () {
+  it("unrelated texts → distance clearly above near-identical", async function () {
     const res = await agent()
       .post("/compare")
       .query({ method: "embedding" })
@@ -65,9 +65,12 @@ describe("POST /compare — stateless semantic distance", function () {
 
     expect(res.body).to.have.property("distance")
     expect(res.body.distance).to.be.a("number")
-    // Unrelated texts should have distance roughly around 0.3–0.6.
-    expect(res.body.distance).to.be.above(0.2)
-    expect(res.body.distance).to.be.below(0.8)
+    // multilingual-e5-base compresses cosine distance: near-identical texts
+    // measure ~0.05, unrelated ~0.14 (measured live). The band must sit above
+    // the near-identical floor (~0.1) yet stay well under the bogus-geometry
+    // ceiling where random noise would land.
+    expect(res.body.distance).to.be.above(0.1)
+    expect(res.body.distance).to.be.below(0.5)
   })
 
   it("response includes role transparency fields", async function () {

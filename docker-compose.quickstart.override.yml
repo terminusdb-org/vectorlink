@@ -1,0 +1,4 @@
+services:
+  vectorlink:
+    image: vectorlink:local-fix
+    pull_policy: never

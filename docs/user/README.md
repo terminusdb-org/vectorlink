@@ -1,8 +1,8 @@
-# tdb-search — user guide
+# vectorlink — user guide
 
-How to run tdb-search and use it as a standalone semantic search engine, driven entirely over HTTP. You do **not** need TerminusDB to follow this guide — every example uses `curl`.
+How to run vectorlink and use it as a standalone semantic search engine, driven entirely over HTTP. You do **not** need TerminusDB to follow this guide — every example uses `curl`.
 
-> tdb-search integrates with TerminusDB (which fronts search and drives indexing in production), but the engine is self-contained: it receives pushed text, embeds and stores it versioned-per-commit, and answers search. This guide drives it directly.
+> vectorlink integrates with TerminusDB (which fronts search and drives indexing in production), but the engine is self-contained: it receives pushed text, embeds and stores it versioned-per-commit, and answers search. This guide drives it directly.
 
 ## Contents
 
@@ -16,10 +16,10 @@ How to run tdb-search and use it as a standalone semantic search engine, driven 
 
 ## The one-paragraph mental model
 
-You **push** the text that changed between two commits; tdb-search embeds it and stores a new searchable **snapshot** bound to the target commit. Each commit is independently searchable and reproducible. Branching from a commit shares the parent's vectors rather than recomputing them. Search names a commit and returns the matching documents, nearest first.
+You **push** the text that changed between two commits; vectorlink embeds it and stores a new searchable **snapshot** bound to the target commit. Each commit is independently searchable and reproducible. Branching from a commit shares the parent's vectors rather than recomputing them. Search names a commit and returns the matching documents, nearest first.
 
 ## Conventions in these docs
 
 - Base URL is `http://localhost:7372` (the default).
-- Every request carries the admin secret as HTTP Basic auth: `-u admin:root` (change it for any exposed deployment).
+- Every request carries the admin secret as HTTP Basic auth: `-u admin:root` — `root` is the secret set by `.env.example` in the quickstart; there is no built-in default.
 - The full machine-readable contract is [`../../openapi.yaml`](../../openapi.yaml); render it with `make docs`.

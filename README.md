@@ -46,7 +46,7 @@ The same raw query text drives both sides in hybrid mode. Distances use the refe
 
 The embedding provider is configurable:
 
-- **Local CPU (default)** — `nomic-ai/nomic-embed-text-v2-moe` (768-d, multilingual), served by a local **[Ollama](https://ollama.com) sidecar** (from Nomic's official GGUF, Q8_0) exposing an OpenAI-compatible API. arm64-native, runs on CPU, no external network after the one-time model pull.
+- **Local CPU (default)** — `multilingual-e5-base` (768-d, multilingual, ~100 languages), served by a local **[Ollama](https://ollama.com) sidecar** (Q8_0 GGUF) exposing an OpenAI-compatible API. arm64-native, runs on CPU, no external network after the one-time model pull.
 - **Direct OpenAI** — `api.openai.com` for parity with the original.
 - **Generic / OpenAI-compatible HTTP** — any embeddings endpoint, configurable base URL, model, and dimension (e.g. TEI or vLLM if you prefer a different sidecar).
 
@@ -56,7 +56,7 @@ The embedding provider is configurable:
 
 ## Access
 
-The indexer is a **trusted component** behind a single shared admin secret (HTTP Basic, default `admin:root`), checked on every request (`401` on miss) — authentication only, **no RBAC**. TerminusDB fronts search and authorises the caller against its own capability system before calling the indexer. Deploy the indexer on a private network with TerminusDB as the front door.
+The indexer is a **trusted component** behind a single shared admin secret (HTTP Basic; set via `VECTORLINK_ADMIN_SECRET`, **no default**), checked on every request (`401` on miss) — authentication only, **no RBAC**. TerminusDB fronts search and authorises the caller against its own capability system before calling the indexer. Deploy the indexer on a private network with TerminusDB as the front door.
 
 ## Quickstart
 
@@ -68,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/terminusdb-org/vectorlink/main/dock
 Brings up three pre-built images on CPU, no clone, no build, no external calls (after the one-time model pull):
 
 - `vectorlink` — this server (HTTP API on `:7372`)
-- `embeddings` — Ollama serving `nomic-embed-text-v2-moe` (GGUF, Q8_0)
+- `embeddings` — Ollama serving `multilingual-e5-base` (GGUF, Q8_0)
 - `terminusdb` — a TerminusDB server for an end-to-end example
 
 Drive indexing by push, then search (all requests carry the admin secret):
