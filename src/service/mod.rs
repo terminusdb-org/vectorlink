@@ -3825,6 +3825,7 @@ mod tests_exact_duplicate_override {
             prometheus_port: None,
             lance_index_cache_bytes: 256 * 1024 * 1024,
             lance_metadata_cache_bytes: 128 * 1024 * 1024,
+            dataset_cache_max: crate::store::lance::DEFAULT_DATASET_CACHE_MAX,
         };
         let tokenizer_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets")

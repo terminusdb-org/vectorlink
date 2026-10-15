@@ -11443,3 +11443,39 @@ fn rrf_fuse_tie_breaks_on_doc_id() {
         "equal RRF scores must sort by doc id"
     );
 }
+
+/// A crash mid-cleanup can leave `_indices/` renamed to `_indices_backup_fixb`
+/// (FIX-B window in io_cleanup_old_versions / io_cleanup_aggressive). Startup
+/// must restore it — otherwise ANN/FTS silently degrade to flat scans.
+#[test]
+fn stranded_indices_backup_restored_at_startup() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let ds_dir = tmp.path().join("acme.lance");
+    let backup = ds_dir.join("_indices_backup_fixb");
+    std::fs::create_dir_all(backup.join("idx_a")).expect("mkdir");
+    std::fs::write(backup.join("idx_a/file.bin"), b"x").expect("write");
+
+    LanceStore::recover_stranded_index_backups(tmp.path());
+
+    assert!(ds_dir.join("_indices/idx_a/file.bin").exists());
+    assert!(!backup.exists());
+}
+
+/// When a crash leaves BOTH `_indices` (partially recreated) and the backup,
+/// the backup's entries are merged back in and the backup removed.
+#[test]
+fn stranded_indices_backup_merges_with_partial_indices() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let ds_dir = tmp.path().join("acme.lance");
+    let indices = ds_dir.join("_indices");
+    let backup = ds_dir.join("_indices_backup_fixb");
+    std::fs::create_dir_all(indices.join("idx_new")).expect("mkdir");
+    std::fs::create_dir_all(backup.join("idx_a")).expect("mkdir");
+    std::fs::write(backup.join("idx_a/file.bin"), b"x").expect("write");
+
+    LanceStore::recover_stranded_index_backups(tmp.path());
+
+    assert!(indices.join("idx_a/file.bin").exists());
+    assert!(indices.join("idx_new").exists());
+    assert!(!backup.exists());
+}
