@@ -178,8 +178,9 @@ All config is environment variables, read in `src/config/mod.rs`:
 | `VECTORLINK_EMBED_URL` | `http://127.0.0.1:11434` | Embedding provider URL (Ollama) |
 | `VECTORLINK_MODEL` | `multilingual-e5-base` | Embedding model name |
 | `VECTORLINK_DIM` | `768` | Embedding vector dimension |
+| `VECTORLINK_PREFIX_{DOCUMENT,QUERY,CLUSTERING,CLASSIFICATION}` | model table | Per-role task-prefix overrides for slot 1; unset roles fall back to the model's built-in table (empty for unknown models) |
 | `VECTORLINK_MODEL2` | _unset_ | Slot-2 model for the clustering role (e.g. `nomic-embed-text-v2-moe`); unset reuses slot 1 |
-| `VECTORLINK_MODEL2_PROVIDER` / `VECTORLINK_MODEL2_URL` / `VECTORLINK_MODEL2_DIM` / `VECTORLINK_MODEL2_API_KEY` | slot-1 values | Optional slot-2 overrides; endpoint and key fall back to slot 1 (key only when the endpoint matches) |
+| `VECTORLINK_MODEL2_PROVIDER` / `VECTORLINK_MODEL2_URL` / `VECTORLINK_MODEL2_DIM` / `VECTORLINK_MODEL2_API_KEY` / `VECTORLINK_MODEL2_PREFIX_*` | slot-1 values / model-2 table | Optional slot-2 overrides; endpoint and key fall back to slot 1 (key only when the endpoint matches) |
 | `VECTORLINK_MODEL2_INDEX` | `true` | ANN index on `clustering_embedding` (`false`/`0` disables → flat scan) |
 | `VECTORLINK_MODEL2_INDEX_*` | slot-1 defaults | `NUM_PARTITIONS`, `M`, `EF_CONSTRUCTION`, `NPROBES`, `REFINE_FACTOR` tune the clustering index independently |
 | `VECTORLINK_EMBED_BATCH_SIZE` | `32` | Texts per embedding HTTP call |
