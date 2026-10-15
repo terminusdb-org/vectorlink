@@ -80,8 +80,10 @@ services:
     entrypoint: ["bash", "-c"]
     command:
       - |
-        ollama pull hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0 || true
-        ollama cp hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0 multilingual-e5-base 2>/dev/null || true
+        set -e
+        ollama pull hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0
+        ollama cp hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0 multilingual-e5-base
+        ollama show multilingual-e5-base > /dev/null
         echo "Model ready."
     restart: "no"
 
@@ -107,6 +109,8 @@ services:
         condition: service_healthy
       embeddings:
         condition: service_healthy
+      embeddings-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/7372 && echo -e \"GET /health/live HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3 && timeout 2 grep -q 200 <&3'"]
       interval: 10s
