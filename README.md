@@ -50,7 +50,9 @@ The embedding provider is configurable:
 - **Direct OpenAI** — `api.openai.com` for parity with the original.
 - **Generic / OpenAI-compatible HTTP** — any embeddings endpoint, configurable base URL, model, and dimension (e.g. TEI or vLLM if you prefer a different sidecar).
 
-> The default model requires task prefixes (`search_document:` for indexed text, `search_query:` for queries); `vectorlink` injects these automatically from a hard-coded, model-keyed table, so they cannot be misconfigured per deployment.
+> The default model requires task prefixes (`passage:` for indexed text, `query:` for queries); `vectorlink` injects these automatically from a hard-coded, model-keyed table, so they cannot be misconfigured per deployment.
+>
+> The Ollama sidecar pulls `hf.co/vectorlink/multilingual-e5-base-GGUF:Q8_0` — a quantized build produced in-house from first-party `intfloat` weights (no reputable upstream GGUF exists). Reproduce it with `scripts/make-multilingual-e5-base-gguf.sh`.
 
 > An in-process (no-sidecar) embedding mode via `fastembed` is a deferred future option — it does not yet build on aarch64, so the Ollama sidecar is the canonical local runtime.
 

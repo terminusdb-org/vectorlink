@@ -1533,9 +1533,30 @@ components:
           format: float
           minimum: 0
           maximum: 1
-          description: "Normalised cosine distance: 0 identical, 0.5 unrelated, 1 opposite. Smaller is closer. This is the distance of the document's BEST-matching chunk."
+          description: "Distance on the [0,1] scale; smaller is closer. Vector/FTS modes: the normalised cosine (0 identical, 0.5 unrelated, 1 opposite) of the document's BEST-matching chunk. Hybrid mode: fused-quality distance derived from the RRF score (0 = rank 1 in both legs, 0.5 = rank 1 in only one leg, →1 = barely surfaced) — monotone, so distance order matches result order."
+        rrf_score:
+          type: number
+          format: float
+          description: "Fused document-level RRF score (k=60) — hybrid mode only; absent in vector/fts results."
+        vector:
+          $ref: '#/components/schemas/LegScore'
+        fts:
+          $ref: '#/components/schemas/LegScore'
         chunk:
           $ref: '#/components/schemas/Chunk'
+    LegScore:
+      type: object
+      required: [rank, distance]
+      additionalProperties: false
+      description: "One retrieval leg's evidence for a hybrid hit."
+      properties:
+        rank:
+          type: integer
+          description: "Document's rank within that leg's document list (0 = best)."
+        distance:
+          type: number
+          format: float
+          description: "The leg's distance for the document's best chunk (normalised cosine for the vector leg; BM25-derived 1/(1+score) for the FTS leg)."
     SearchResults:
       type: array
       description: Ranked nearest-first; empty array means genuinely no match (never an error).

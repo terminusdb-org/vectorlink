@@ -11300,3 +11300,182 @@ async fn fts_search_works_at_all_commit_versions() {
         fragment_count
     );
 }
+
+// ─────────────────────────── rrf_fuse_documents ────────────────────────────
+// Document-level RRF fusion: each document contributes exactly one rank per
+// leg (its best chunk — MaxP), fused via RRF; per-leg ranks/distances surface
+// on the hit so callers can see why a document ranked where it did.
+
+fn rrf_hit(doc: &str, distance: f32, kind: DistanceKind, chunk_index: i32, content: &str) -> ChunkHit {
+    ChunkHit {
+        doc_id: doc.to_owned(),
+        distance,
+        distance_kind: kind,
+        chunk_index,
+        chunk_count: 2,
+        chunk_token_start: 0,
+        doc_token_len: 100,
+        content: content.to_owned(),
+        embedding: Vec::new(),
+        clustering_embedding: Vec::new(),
+    }
+}
+
+// --- a document present in both legs outranks a single-leg document ---
+#[test]
+fn rrf_fuse_dual_leg_doc_outranks_single_leg() {
+    // doc/b is vector rank 2 and fts rank 0 → 1/61 + 1/61.
+    // doc/a is vector rank 0 only → 1/61. Dual presence wins.
+    let vector = vec![
+        rrf_hit("doc/a", 0.10, DistanceKind::RawCosine, 0, "a"),
+        rrf_hit("doc/c", 0.20, DistanceKind::RawCosine, 0, "c"),
+        rrf_hit("doc/b", 0.30, DistanceKind::RawCosine, 0, "b"),
+    ];
+    let fts = vec![
+        rrf_hit("doc/b", 0.5, DistanceKind::Normalised, 0, "b"),
+        rrf_hit("doc/d", 0.8, DistanceKind::Normalised, 0, "d"),
+    ];
+    let results = rrf_fuse_documents(vector, fts, false);
+    assert_eq!(results[0].id, "doc/b", "dual-leg doc must outrank single-leg doc");
+    let b = &results[0];
+    assert_eq!(b.vector.as_ref().expect("vector leg").rank, 2);
+    assert_eq!(b.fts.as_ref().expect("fts leg").rank, 0);
+    assert!(
+        b.rrf_score.unwrap() > results[1].rrf_score.unwrap(),
+        "dual-leg score must exceed single-leg score"
+    );
+}
+
+// --- doc rank is over distinct documents, not chunk positions ---
+#[test]
+fn rrf_fuse_leg_rank_uses_first_chunk_per_doc() {
+    let vector = vec![
+        rrf_hit("doc/a", 0.10, DistanceKind::RawCosine, 0, "a0"),
+        rrf_hit("doc/a", 0.11, DistanceKind::RawCosine, 1, "a1"),
+        rrf_hit("doc/b", 0.20, DistanceKind::RawCosine, 0, "b"),
+    ];
+    let results = rrf_fuse_documents(vector, vec![], false);
+    // doc/b's leg rank is 1 — doc/a's extra chunk cannot push it down.
+    let b = results.iter().find(|r| r.id == "doc/b").expect("doc/b");
+    assert_eq!(b.vector.as_ref().unwrap().rank, 1);
+    // doc/a's second chunk contributes nothing to its fused score.
+    let a = results.iter().find(|r| r.id == "doc/a").expect("doc/a");
+    assert!((a.rrf_score.unwrap() - 1.0 / 61.0).abs() < 1e-6);
+    assert!(results.iter().all(|r| r.fts.is_none()));
+}
+
+// --- representative chunk prefers the vector leg (real cosine distance) ---
+#[test]
+fn rrf_fuse_prefers_vector_chunk_as_representative() {
+    let vector = vec![rrf_hit("doc/a", 0.10, DistanceKind::RawCosine, 3, "vec chunk")];
+    let fts = vec![rrf_hit("doc/a", 0.01, DistanceKind::Normalised, 0, "fts chunk")];
+    let results = rrf_fuse_documents(vector, fts, true);
+    let a = &results[0];
+    assert_eq!(a.chunk.index, 3, "representative is the vector leg's best chunk");
+    assert_eq!(a.chunk.snippet.as_deref(), Some("vec chunk"));
+    // rank-0 in both legs → fused distance 0.0 (best possible); the raw
+    // cosine stays on the vector leg field.
+    assert_eq!(a.distance, 0.0);
+    assert_eq!(
+        a.vector.as_ref().unwrap().distance,
+        crate::kernel::distance::normalized_cosine_from_lance(0.10)
+    );
+}
+
+// --- top-level distance is monotone in fused score (rank order == distance order) ---
+#[test]
+fn rrf_fuse_distance_tracks_rank_order() {
+    // doc/a: vector rank 1 + fts rank 0 → distance ~0.008
+    // doc/b: vector rank 0 only → distance 0.5
+    // doc/c: fts rank 1 only → distance > 0.5
+    let vector = vec![
+        rrf_hit("doc/b", 0.20, DistanceKind::RawCosine, 0, "b"),
+        rrf_hit("doc/a", 0.10, DistanceKind::RawCosine, 0, "a"),
+    ];
+    let fts = vec![
+        rrf_hit("doc/a", 0.5, DistanceKind::Normalised, 0, "a"),
+        rrf_hit("doc/c", 0.9, DistanceKind::Normalised, 0, "c"),
+    ];
+    let results = rrf_fuse_documents(vector, fts, false);
+    let d = |id: &str| results.iter().find(|r| r.id == id).unwrap().distance;
+    assert!(
+        d("doc/a") < 0.05,
+        "strong dual-leg doc gets near-0 distance, got {}",
+        d("doc/a")
+    );
+    assert_eq!(d("doc/b"), 0.5, "single-leg rank-0 doc gets distance 0.5");
+    assert!(
+        d("doc/c") > 0.5 && d("doc/c") < 1.0,
+        "deeper single-leg rank lands in (0.5, 1), got {}",
+        d("doc/c")
+    );
+    // distances are non-decreasing along the result order
+    for w in results.windows(2) {
+        assert!(w[0].distance <= w[1].distance, "distance order matches rank order");
+    }
+}
+
+// --- FTS-only document uses its FTS chunk as representative ---
+#[test]
+fn rrf_fuse_fts_only_doc_uses_fts_chunk() {
+    let vector = vec![rrf_hit("doc/a", 0.10, DistanceKind::RawCosine, 0, "a")];
+    let fts = vec![rrf_hit("doc/b", 0.5, DistanceKind::Normalised, 1, "b fts")];
+    let results = rrf_fuse_documents(vector, fts, true);
+    let b = results.iter().find(|r| r.id == "doc/b").expect("doc/b");
+    assert_eq!(b.chunk.index, 1);
+    assert_eq!(b.chunk.snippet.as_deref(), Some("b fts"));
+    // FTS-only rank 0 → fused distance 0.5 (top of one leg only); the raw
+    // BM25-derived distance stays on the fts leg field.
+    assert_eq!(b.distance, 0.5);
+    assert_eq!(b.fts.as_ref().unwrap().distance, 0.5);
+    assert!(b.vector.is_none());
+}
+
+// --- equal fused scores order deterministically by document id ---
+#[test]
+fn rrf_fuse_tie_breaks_on_doc_id() {
+    let vector = vec![rrf_hit("doc/y", 0.10, DistanceKind::RawCosine, 0, "y")];
+    let fts = vec![rrf_hit("doc/x", 0.5, DistanceKind::Normalised, 0, "x")];
+    let results = rrf_fuse_documents(vector, fts, false);
+    assert_eq!(
+        [results[0].id.as_str(), results[1].id.as_str()],
+        ["doc/x", "doc/y"],
+        "equal RRF scores must sort by doc id"
+    );
+}
+
+/// A crash mid-cleanup can leave `_indices/` renamed to `_indices_backup_fixb`
+/// (FIX-B window in io_cleanup_old_versions / io_cleanup_aggressive). Startup
+/// must restore it — otherwise ANN/FTS silently degrade to flat scans.
+#[test]
+fn stranded_indices_backup_restored_at_startup() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let ds_dir = tmp.path().join("acme.lance");
+    let backup = ds_dir.join("_indices_backup_fixb");
+    std::fs::create_dir_all(backup.join("idx_a")).expect("mkdir");
+    std::fs::write(backup.join("idx_a/file.bin"), b"x").expect("write");
+
+    LanceStore::recover_stranded_index_backups(tmp.path());
+
+    assert!(ds_dir.join("_indices/idx_a/file.bin").exists());
+    assert!(!backup.exists());
+}
+
+/// When a crash leaves BOTH `_indices` (partially recreated) and the backup,
+/// the backup's entries are merged back in and the backup removed.
+#[test]
+fn stranded_indices_backup_merges_with_partial_indices() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let ds_dir = tmp.path().join("acme.lance");
+    let indices = ds_dir.join("_indices");
+    let backup = ds_dir.join("_indices_backup_fixb");
+    std::fs::create_dir_all(indices.join("idx_new")).expect("mkdir");
+    std::fs::create_dir_all(backup.join("idx_a")).expect("mkdir");
+    std::fs::write(backup.join("idx_a/file.bin"), b"x").expect("write");
+
+    LanceStore::recover_stranded_index_backups(tmp.path());
+
+    assert!(indices.join("idx_a/file.bin").exists());
+    assert!(indices.join("idx_new").exists());
+    assert!(!backup.exists());
+}
