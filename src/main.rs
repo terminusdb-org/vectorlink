@@ -116,6 +116,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         config.lance_metadata_cache_bytes,
     );
     lance_store.set_clustering_index_config(config.clustering_index.clone());
+    lance_store.set_dataset_cache_max(config.dataset_cache_max);
     let lance_store = Arc::new(lance_store);
 
     // Startup cleanup: delete any stale __compact_rebuild branches left by

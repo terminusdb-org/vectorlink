@@ -53,6 +53,18 @@ curl -u admin:root http://localhost:7372/statistics
 
 Counters are best-effort/advisory (may be approximate under concurrency) — don't gate logic on exact values.
 
+## Metrics
+
+Set `VECTORLINK_PROMETHEUS_PORT` to expose Prometheus-format metrics on a **separate** HTTP server:
+
+```bash
+curl -fsS http://localhost:9090/metrics
+```
+
+- The metrics server is **unauthenticated** — `/metrics` answers anyone who can reach the port. It exposes operational counters (pipeline progress, active tasks, cache sizes), not document data.
+- The metrics listener binds `0.0.0.0` so container deployments can reach it. In the shipped `docker-compose.yml` it is published on loopback only (`127.0.0.1:9091:9090`). In any other deployment, **firewall the port or bind it behind a private interface** — do not expose it to untrusted networks.
+- Omit `VECTORLINK_PROMETHEUS_PORT` (the default) and no metrics server starts at all.
+
 ## Configuration
 
 Resolution order per setting: **command-line flag > environment variable > built-in default**. Invalid or missing-required values **fail at startup** with a message naming the setting — the engine never starts in a half-configured state.
@@ -71,6 +83,8 @@ Resolution order per setting: **command-line flag > environment variable > built
 | negative-cache TTL (seconds) | `--neg-cache-ttl` | `..._NEG_CACHE_TTL` | `3600` |
 | admin user | `--admin-user` | `VECTORLINK_ADMIN_USER` | `admin` |
 | admin secret | `--admin-secret` | `VECTORLINK_ADMIN_SECRET` | _required — no default_ |
+| metrics port | — | `VECTORLINK_PROMETHEUS_PORT` | _unset — disabled_ |
+| dataset-handle cache size | — | `VECTORLINK_DATASET_CACHE_MAX` | `128` |
 
 The embedding dimension is fixed when an index is first created and is immutable; a query whose embedding dimension doesn't match the index fails loudly (`409`) — it is never silently padded.
 

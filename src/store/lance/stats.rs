@@ -115,8 +115,8 @@ impl LanceStore {
         // live = sum(physical_rows) - sum(fast_num_deletions). No data I/O.
         let mut deleted_total = 0u64;
         let mut physical_total = 0u64;
-        for ds_arc in datasets.values() {
-            let ds = ds_arc.read().await;
+        for entry in datasets.values() {
+            let ds = entry.ds.read().await;
             for frag in ds.get_fragments() {
                 if let Some(rows) = frag.metadata().physical_rows {
                     physical_total += rows as u64;
@@ -130,8 +130,8 @@ impl LanceStore {
         // Count pending index fragments and documents across all cached datasets.
         let mut pending_index_fragments: u64 = 0;
         let mut pending_index_documents: u64 = 0;
-        for ds_arc in datasets.values() {
-            let ds = ds_arc.read().await;
+        for entry in datasets.values() {
+            let ds = entry.ds.read().await;
             if let Ok((frags, rows)) = crate::store::vector_index::count_unindexed_rows(&ds).await {
                 pending_index_fragments += frags;
                 pending_index_documents += rows;
@@ -235,8 +235,8 @@ impl LanceStore {
         // Count live chunks from this domain's cached dataset using manifest metadata only.
         let mut deleted_total = 0u64;
         let mut physical_total = 0u64;
-        if let Some(ds_arc) = datasets.get(domain) {
-            let ds = ds_arc.read().await;
+        if let Some(entry) = datasets.get(domain) {
+            let ds = entry.ds.read().await;
             for frag in ds.get_fragments() {
                 if let Some(rows) = frag.metadata().physical_rows {
                     physical_total += rows as u64;
@@ -250,8 +250,8 @@ impl LanceStore {
         // Count pending index fragments and documents for this domain only.
         let mut pending_index_fragments: u64 = 0;
         let mut pending_index_documents: u64 = 0;
-        if let Some(ds_arc) = datasets.get(domain) {
-            let ds = ds_arc.read().await;
+        if let Some(entry) = datasets.get(domain) {
+            let ds = entry.ds.read().await;
             if let Ok((frags, rows)) = crate::store::vector_index::count_unindexed_rows(&ds).await {
                 pending_index_fragments += frags;
                 pending_index_documents += rows;
@@ -304,7 +304,12 @@ impl LanceStore {
         // counter). The scan reads only the doc_id column — no embedding data.
         let documents = if chunks > 0 {
             // Try cached dataset first, then fall back to a fresh open.
-            let cached = self.datasets.read().await.get(domain).cloned();
+            let cached = self
+                .datasets
+                .read()
+                .await
+                .get(domain)
+                .map(|e| e.ds.clone());
             if let Some(ds_arc) = cached {
                 let ds = ds_arc.read().await;
                 self.count_distinct_doc_ids(&ds).await

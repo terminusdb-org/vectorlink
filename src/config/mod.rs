@@ -321,6 +321,11 @@ pub struct Config {
     /// default is 1 GiB; we use 512 MiB as a balanced default.
     /// Configurable via `VECTORLINK_LANCE_METADATA_CACHE_BYTES`; default 512 MiB.
     pub lance_metadata_cache_bytes: usize,
+    /// Maximum number of domain dataset handles kept open in the read cache
+    /// (LRU). Each handle holds file descriptors and session references, so an
+    /// unbounded cache grows with the number of distinct domains ever touched.
+    /// Configurable via `VECTORLINK_DATASET_CACHE_MAX`; default 128.
+    pub dataset_cache_max: usize,
 }
 
 impl Config {
@@ -440,6 +445,10 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(512 * 1024 * 1024),
+            dataset_cache_max: std::env::var("VECTORLINK_DATASET_CACHE_MAX")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(crate::store::lance::DEFAULT_DATASET_CACHE_MAX),
         }
     }
 
@@ -465,6 +474,7 @@ impl Config {
             prometheus_port: None,
             lance_index_cache_bytes: 2 * 1024 * 1024 * 1024,
             lance_metadata_cache_bytes: 512 * 1024 * 1024,
+            dataset_cache_max: crate::store::lance::DEFAULT_DATASET_CACHE_MAX,
         }
     }
 }
@@ -491,6 +501,7 @@ impl Default for Config {
             prometheus_port: None,
             lance_index_cache_bytes: 2 * 1024 * 1024 * 1024,
             lance_metadata_cache_bytes: 512 * 1024 * 1024,
+            dataset_cache_max: crate::store::lance::DEFAULT_DATASET_CACHE_MAX,
         }
     }
 }

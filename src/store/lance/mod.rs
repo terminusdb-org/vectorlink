@@ -112,6 +112,23 @@ use crate::layeridx::BranchIndex;
 /// `{domain}.lance` dataset holds all TerminusDB branches as Lance branches.
 pub(super) type BranchKey = (String, String);
 
+/// Default bound on the number of cached domain dataset handles.
+/// Each cached handle holds open file descriptors and session references, so
+/// an unbounded cache grows monotonically with the number of distinct domains
+/// ever touched. Eviction only drops the cache's own Arc — in-flight readers
+/// and writers hold their own clones and are unaffected.
+/// Configurable via `VECTORLINK_DATASET_CACHE_MAX` (Config::dataset_cache_max).
+pub const DEFAULT_DATASET_CACHE_MAX: usize = 128;
+
+/// A cached domain dataset handle with a last-access stamp for LRU eviction.
+/// `last_access` is bumped on every cache hit; eviction removes the entry with
+/// the smallest stamp.
+#[derive(Debug)]
+pub(super) struct DatasetCacheEntry {
+    pub ds: Arc<RwLock<Dataset>>,
+    pub last_access: std::sync::atomic::AtomicU64,
+}
+
 /// The Lance-backed store (layout A: one dataset per domain, TerminusDB
 /// branches as Lance branches inside it; tags are dataset-global).
 #[derive(Debug)]
@@ -128,7 +145,13 @@ pub struct LanceStore {
     /// Open dataset handles, keyed by DOMAIN (layout A). The cached handle is
     /// the domain dataset opened at its default (main) branch head; branch
     /// writes check out a branch-bound handle without mutating this one.
-    pub(super) datasets: RwLock<HashMap<String, Arc<RwLock<Dataset>>>>,
+    /// LRU-bounded at `dataset_cache_max` — inserts evict the
+    /// least-recently-used entry.
+    pub(super) datasets: RwLock<HashMap<String, DatasetCacheEntry>>,
+    /// Maximum number of cached dataset handles (LRU bound).
+    pub(super) dataset_cache_max: usize,
+    /// Monotonic stamp source for LRU ordering of `datasets`.
+    pub(super) dataset_access_seq: std::sync::atomic::AtomicU64,
     /// Per-(domain, branch) index tracking (branch-precise).
     pub(super) branch_indexes: RwLock<HashMap<BranchKey, BranchIndex>>,
     /// Tasks by task ID, with insertion timestamp for TTL-based eviction.
@@ -216,6 +239,7 @@ pub struct LanceStore {
 impl LanceStore {
     /// Create a new LanceStore backed by the given directory.
     pub fn new(base_dir: &Path, dim: usize, lance_index_cache_bytes: usize, lance_metadata_cache_bytes: usize) -> Self {
+        Self::recover_stranded_index_backups(base_dir);
         let domain_settings = DomainSettingsMap::load(base_dir);
         let vector_index_config = VectorIndexConfig::default_for_dim(dim);
         Self {
@@ -224,6 +248,8 @@ impl LanceStore {
             vector_index_config,
             clustering_index_config: Some(VectorIndexConfig::default_for_dim(dim)),
             datasets: RwLock::new(HashMap::new()),
+            dataset_cache_max: DEFAULT_DATASET_CACHE_MAX,
+            dataset_access_seq: std::sync::atomic::AtomicU64::new(0),
             branch_indexes: RwLock::new(HashMap::new()),
             tasks: RwLock::new(HashMap::new()),
             pipeline_locks: RwLock::new(HashMap::new()),
@@ -265,6 +291,141 @@ impl LanceStore {
             2 => CleanupMode::TargetWithPatch,
             _ => CleanupMode::CurrentCode,
         }
+    }
+
+    /// Set the dataset-handle cache bound (`VECTORLINK_DATASET_CACHE_MAX`,
+    /// default `DEFAULT_DATASET_CACHE_MAX`). Called once at startup.
+    pub fn set_dataset_cache_max(&mut self, max: usize) {
+        self.dataset_cache_max = max.max(1);
+    }
+
+    /// Crash recovery for the FIX-B `_indices` rename window. If the process
+    /// died between `rename(_indices → _indices_backup_fixb)` and the restore
+    /// in `io_cleanup_old_versions` / `io_cleanup_aggressive`, the dataset's
+    /// entire index directory stays hidden: ANN/FTS silently degrade to flat
+    /// scans and the backup is stranded. At startup, restore it — merge the
+    /// backup's entries into `_indices` when one was partially recreated,
+    /// otherwise rename the backup back wholesale.
+    fn recover_stranded_index_backups(base_dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(base_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !(path.is_dir() && path.extension().is_some_and(|e| e == "lance")) {
+                continue;
+            }
+            let indices = path.join("_indices");
+            let backup = path.join("_indices_backup_fixb");
+            if !backup.exists() {
+                continue;
+            }
+            if indices.exists() {
+                // Merge stranded entries back, then remove the backup dir.
+                if let Ok(items) = std::fs::read_dir(&backup) {
+                    for item in items.flatten() {
+                        let _ = std::fs::rename(item.path(), indices.join(item.file_name()));
+                    }
+                }
+                match std::fs::remove_dir(&backup) {
+                    Ok(()) => eprintln!(
+                        "[startup] recovered stranded _indices_backup_fixb entries in {}",
+                        path.display()
+                    ),
+                    Err(e) => eprintln!(
+                        "[startup] WARNING: merged entries but could not remove {}: {}",
+                        backup.display(),
+                        e
+                    ),
+                }
+            } else {
+                match std::fs::rename(&backup, &indices) {
+                    Ok(()) => eprintln!(
+                        "[startup] restored _indices from stranded backup in {}",
+                        path.display()
+                    ),
+                    Err(e) => eprintln!(
+                        "[startup] WARNING: failed to restore {}: {}",
+                        backup.display(),
+                        e
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Bump the LRU stamp on a cache hit.
+    fn touch_entry(&self, entry: &DatasetCacheEntry) {
+        let seq = self
+            .dataset_access_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        entry.last_access.store(seq, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Insert a handle into the domain cache and evict the least-recently-used
+    /// entry when the bound is exceeded. Callers must already hold the write
+    /// lock on `datasets`.
+    fn evict_lru_if_over(&self, datasets: &mut HashMap<String, DatasetCacheEntry>) {
+        while datasets.len() > self.dataset_cache_max {
+            let oldest = datasets
+                .iter()
+                .min_by_key(|(_, e)| e.last_access.load(std::sync::atomic::Ordering::Relaxed))
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(domain) => {
+                    eprintln!("[cache] evicting LRU dataset handle: {}", domain);
+                    datasets.remove(&domain);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Insert a freshly opened handle under the write lock. Returns the cached
+    /// Arc (or an existing entry's Arc if a concurrent opener beat us).
+    async fn insert_cached_dataset(
+        &self,
+        domain: &str,
+        ds: Dataset,
+    ) -> Arc<RwLock<Dataset>> {
+        let mut datasets = self.datasets.write().await;
+        if let Some(existing) = datasets.get(domain) {
+            self.touch_entry(existing);
+            return Arc::clone(&existing.ds);
+        }
+        let arc_ds = self.upsert_entry(&mut datasets, domain, ds);
+        self.evict_lru_if_over(&mut datasets);
+        arc_ds
+    }
+
+    /// Replace the cached handle unconditionally — used by
+    /// `io_refresh_cached_dataset` after a write so subsequent reads see the
+    /// new version. Evicts LRU if the cache is at capacity.
+    async fn replace_cached_dataset(&self, domain: &str, ds: Dataset) {
+        let mut datasets = self.datasets.write().await;
+        self.upsert_entry(&mut datasets, domain, ds);
+        self.evict_lru_if_over(&mut datasets);
+    }
+
+    /// Insert/overwrite an entry. Caller holds the write lock.
+    fn upsert_entry(
+        &self,
+        datasets: &mut HashMap<String, DatasetCacheEntry>,
+        domain: &str,
+        ds: Dataset,
+    ) -> Arc<RwLock<Dataset>> {
+        let arc_ds = Arc::new(RwLock::new(ds));
+        let seq = self
+            .dataset_access_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        datasets.insert(
+            domain.to_owned(),
+            DatasetCacheEntry {
+                ds: Arc::clone(&arc_ds),
+                last_access: std::sync::atomic::AtomicU64::new(seq),
+            },
+        );
+        arc_ds
     }
 
     /// Get the index delta count for a (domain, branch) — the number of delta
@@ -432,8 +593,9 @@ impl LanceStore {
         // Check cache first (keyed by domain — layout A).
         {
             let datasets = self.datasets.read().await;
-            if let Some(ds) = datasets.get(domain) {
-                return Ok(Arc::clone(ds));
+            if let Some(entry) = datasets.get(domain) {
+                self.touch_entry(entry);
+                return Ok(Arc::clone(&entry.ds));
             }
         }
 
@@ -458,14 +620,9 @@ impl LanceStore {
                 .map_err(|e| StoreError::Internal(format!("failed to create dataset: {}", e)))?
         };
 
-        let arc_ds = Arc::new(RwLock::new(ds));
-        let mut datasets = self.datasets.write().await;
-        // Re-check: a concurrent opener may have inserted while we were opening.
-        if let Some(existing) = datasets.get(domain) {
-            return Ok(Arc::clone(existing));
-        }
-        datasets.insert(domain.to_owned(), Arc::clone(&arc_ds));
-        Ok(arc_ds)
+        // insert_cached_dataset holds the write lock, re-checks for a
+        // concurrent insert, and evicts LRU if the cache is at capacity.
+        Ok(self.insert_cached_dataset(domain, ds).await)
     }
 
     /// READ-ONLY domain dataset open (layout A) — NEVER auto-creates.
@@ -486,8 +643,9 @@ impl LanceStore {
         // Check cache first (keyed by domain — layout A).
         {
             let datasets = self.datasets.read().await;
-            if let Some(ds) = datasets.get(domain) {
-                return Ok(Some(Arc::clone(ds)));
+            if let Some(entry) = datasets.get(domain) {
+                self.touch_entry(entry);
+                return Ok(Some(Arc::clone(&entry.ds)));
             }
         }
 
@@ -502,14 +660,9 @@ impl LanceStore {
         // handle and never re-open (BUG-FD24).
         let ds = self.io_open_fresh(&uri).await?;
 
-        let arc_ds = Arc::new(RwLock::new(ds));
-        let mut datasets = self.datasets.write().await;
-        // Re-check: a concurrent opener may have inserted while we were opening.
-        if let Some(existing) = datasets.get(domain) {
-            return Ok(Some(Arc::clone(existing)));
-        }
-        datasets.insert(domain.to_owned(), Arc::clone(&arc_ds));
-        Ok(Some(arc_ds))
+        // insert_cached_dataset holds the write lock, re-checks for a
+        // concurrent insert, and evicts LRU if the cache is at capacity.
+        Ok(Some(self.insert_cached_dataset(domain, ds).await))
     }
 
     /// Open a FRESH, branch-bound dataset handle for WRITING to `branch`
@@ -783,9 +936,9 @@ impl LanceStore {
         // `io_open_fresh` so even this write-side re-open is VISIBLE to the FD guard.
         let ds = self.io_open_fresh(&uri).await?;
 
-        let arc_ds = Arc::new(RwLock::new(ds));
-        let mut datasets = self.datasets.write().await;
-        datasets.insert(domain.to_owned(), arc_ds);
+        // Replace unconditionally — the write just advanced the version, so the
+        // cached handle must be swapped, not re-checked (LRU-bounded).
+        self.replace_cached_dataset(domain, ds).await;
         Ok(())
     }
 

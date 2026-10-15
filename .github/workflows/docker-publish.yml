@@ -23,6 +23,7 @@ name: Publish (AMD64, ARM64)
 # This workflow is kept for manual multi-arch publishing only.
 on:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
