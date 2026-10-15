@@ -2580,12 +2580,12 @@ async fn io_run_index_pipeline_stream(
     let mut all_rows: Vec<ChunkRow> = Vec::new();
 
     // ─── Micro-batch flush helper ───────────────────────────────────────
-    // Embeds, deletes old chunks (for Changed docs), appends new rows,
-    // then drops all Vecs to free memory. Returns (indexed, skipped) for this batch.
+    // Embeds and accumulates rows for the single end-of-push append; records
+    // Changed doc ids for the single end-of-push delete. Returns via the
+    // indexed_count/skipped accumulators for this batch.
     #[allow(clippy::too_many_arguments)]
     async fn flush_microbatch(
         ctx: &PipelineCtx<'_>,
-        ds: &mut lance::dataset::Dataset,
         batch_docs: &mut Vec<DocToEmbed>,
         all_delete_ids: &mut Vec<String>,
         all_rows: &mut Vec<ChunkRow>,
@@ -2724,22 +2724,11 @@ async fn io_run_index_pipeline_stream(
 
                 let doc_type = ingest::extract_doc_type(&doc.id);
 
-                // For Changed docs: delete old chunks BEFORE appending new ones.
-                // FAIL-LOUD: a failed delete leaves stale chunks alongside new
-                // ones (data corruption). Abort the pipeline rather than silently
-                // appending on top of old data.
+                // For Changed docs: record the id for the single end-of-push
+                // delete (run before the append, same as io_batch_delete_append).
+                // Only successfully embedded docs land here — a Changed doc whose
+                // embed failed `continue`d above, so its old rows are retained.
                 if doc.is_changed {
-                    let expr = lance::deps::datafusion::logical_expr::col("doc_id")
-                        .eq(lance::deps::datafusion::logical_expr::lit(doc.id.as_str()));
-                    let result = lance::dataset::write::DeleteBuilder::from_expr(
-                        std::sync::Arc::new(ds.clone()),
-                        expr,
-                    ).execute().await
-                        .map_err(|e| format!(
-                            "Changed doc delete failed for {}: {} (aborting to prevent stale+new chunk corruption)",
-                            doc.id, e
-                        ))?;
-                    *ds = result.new_dataset.as_ref().clone();
                     all_delete_ids.push(doc.id.clone());
                 }
 
@@ -2855,7 +2844,7 @@ async fn io_run_index_pipeline_stream(
         // Flush when the micro-batch is full.
         if batch_docs.len() >= MICRO_BATCH_DOCS {
             flush_microbatch(
-                ctx, &mut ds, &mut batch_docs, &mut all_delete_ids, &mut all_rows,
+                ctx, &mut batch_docs, &mut all_delete_ids, &mut all_rows,
                 &mut skipped, store_clustering, &progress_tx,
                 &mut total_docs_seen, &mut indexed_count,
                 cancel_token,
@@ -2884,17 +2873,22 @@ async fn io_run_index_pipeline_stream(
 
     // Channel closed — flush any remaining docs in the buffer.
     flush_microbatch(
-        ctx, &mut ds, &mut batch_docs, &mut all_delete_ids, &mut all_rows,
+        ctx, &mut batch_docs, &mut all_delete_ids, &mut all_rows,
         &mut skipped, store_clustering, &progress_tx,
         &mut total_docs_seen, &mut indexed_count,
         cancel_token,
     ).await?;
 
-    // ─── Write phase: single append + boundary indexing + tag ───────────
+    // ─── Write phase: single delete + single append + boundary indexing + tag ─
+    // Mirrors io_batch_delete_append: at most TWO version advances in a fixed,
+    // crash-safe order — delete first, append second. `all_delete_ids` carries
+    // BOTH pure `Deleted` ids and `Changed` ids (recorded after a successful
+    // embed). Running the delete unconditionally is required: gating it on
+    // `indexed_count == 0` dropped pure deletions from mixed commits, leaving
+    // deleted docs searchable at the tagged commit.
     let has_work = indexed_count > 0 || !all_delete_ids.is_empty();
 
-    // For pure Deleted docs (not Changed), do one delete now.
-    if !all_delete_ids.is_empty() && indexed_count == 0 {
+    if !all_delete_ids.is_empty() {
         ctx.store.io_microbatch_delete(&mut ds, &all_delete_ids).await
             .map_err(|e| format!("final delete failed: {}", e))?;
     }
@@ -3705,6 +3699,91 @@ mod tests_streaming {
             Some("c1_delete"),
             "streaming pipeline must advance last_indexed for delete-only commit"
         );
+    }
+
+    /// Mixed commit: a single streaming commit carrying BOTH a pure Deleted op
+    /// and an Inserted doc must apply the delete — not skip it because inserts
+    /// exist. Regression test for the gating bug where the final delete only
+    /// ran when `indexed_count == 0`, leaving deleted docs searchable at the
+    /// tagged commit.
+    #[tokio::test]
+    async fn stream_mixed_delete_and_insert_applies_delete() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
+        let tokenizer = test_tokenizer();
+        let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
+        let provider = dummy_provider();
+        let http_client = reqwest::Client::new();
+        let domain = "admin/stream_mixed";
+        let branch = "main";
+
+        // Pre-warm the embed cache for the new doc's (unprefixed) chunk text.
+        let cache = crate::embed::cache::EmbedCache::open(&tmp.path().join("embed_cache"), Some(100));
+        let new_text = "replacement document text".to_owned();
+        let key = crate::embed::cache::EmbedCache::cache_key(provider.model_name(), &new_text);
+        cache.put(&key, &[0.2_f32; 8]);
+
+        // Seed doc/seed so there is a real document to delete.
+        let seed_row = ChunkRow {
+            doc_id: "doc/seed".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: vec![0.1; 8],
+            clustering_embedding: vec![0.1; 8],
+            content: "seed".to_owned(),
+        };
+        let v_seed = store
+            .io_upsert_chunks(domain, branch, "doc/seed", std::slice::from_ref(&seed_row))
+            .await
+            .expect("seed upsert");
+        store.io_tag_commit(domain, branch, "c0_seed", v_seed).await.expect("tag seed");
+        store.update_last_indexed(domain, branch, "c0_seed", v_seed).await;
+
+        // ACT: one commit containing a Deleted AND an Inserted op.
+        let (tx, rx) = mpsc::channel::<Operation>(16);
+        tx.send(Operation::Deleted { id: "doc/seed".to_owned() }).await.unwrap();
+        tx.send(Operation::Inserted { id: "doc/new".to_owned(), string: new_text }).await.unwrap();
+        drop(tx);
+
+        let ctx = PipelineCtx {
+            embed_cache: &cache,
+            ..make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch)
+        };
+        let (indexed, skipped) = io_run_index_pipeline_stream(&ctx, "c1_mixed", rx, None, &tokio_util::sync::CancellationToken::new(), None)
+            .await
+            .expect("streaming pipeline must succeed for mixed commit");
+
+        assert_eq!(indexed, 1, "the inserted doc must be indexed");
+        assert_eq!(skipped.len(), 0, "no docs should be skipped");
+
+        // The deleted doc must be gone at the branch head that the commit tagged.
+        let deleted = store
+            .io_lookup_doc_chunks(domain, branch, "doc/seed")
+            .await
+            .expect("lookup deleted doc");
+        assert!(
+            deleted.is_empty(),
+            "doc/seed must be deleted by the mixed streaming commit"
+        );
+
+        // The inserted doc must be present.
+        let inserted = store
+            .io_lookup_doc_chunks(domain, branch, "doc/new")
+            .await
+            .expect("lookup inserted doc");
+        assert_eq!(inserted.len(), 1, "doc/new must have one chunk indexed");
+
+        let li = store
+            .last_indexed(
+                &Domain::from_resource_path(&parse_domain(domain).unwrap()),
+                &BranchName::new(branch.to_owned()),
+            )
+            .await
+            .expect("last_indexed read");
+        assert_eq!(li.commit.as_deref(), Some("c1_mixed"));
     }
 }
 
