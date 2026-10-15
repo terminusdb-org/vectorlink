@@ -76,7 +76,8 @@ Resolution order per setting: **command-line flag > environment variable > built
 | embedding provider | `--provider` | `..._PROVIDER` | local sidecar (OpenAI-compatible) |
 | provider URL | `--embed-url` | `..._EMBED_URL` | the bundled embeddings service |
 | embedding model | `--model` | `VECTORLINK_MODEL` | `multilingual-e5-base` |
-| clustering model (slot 2) | — | `VECTORLINK_MODEL2` | _unset — slot 1 serves clustering too_ |
+| clustering model (slot 2) | — | `VECTORLINK_MODEL2` (+ `..._PROVIDER`, `..._URL`, `..._DIM`, `..._API_KEY` overrides) | _unset — slot 1 serves clustering too_ |
+| task prefixes (per role) | — | `VECTORLINK_PREFIX_{DOCUMENT,QUERY,CLUSTERING,CLASSIFICATION}` and `VECTORLINK_MODEL2_PREFIX_*` | built-in per-model table; unset roles inherit it |
 | embedding dimension | `--dim` | `..._DIM` | `768` (fixed per index once created) |
 | clustering ANN index | — | `VECTORLINK_MODEL2_INDEX` (+ `..._NUM_PARTITIONS`, `..._M`, `..._EF_CONSTRUCTION`, `..._NPROBES`, `..._REFINE_FACTOR`) | enabled, slot-1 defaults |
 | provider key (if the provider needs one) | `--embed-key` | `..._EMBED_KEY` / `OPENAI_API_KEY` | — |

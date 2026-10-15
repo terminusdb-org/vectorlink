@@ -340,7 +340,7 @@ async fn prime_embed_cache(args: &[String]) -> Result<(), Box<dyn std::error::Er
             if embedding.len() == dim {
                 let prefixed = embed::apply_prefix(
                     &[content.to_owned()],
-                    model,
+                    config.embed_provider.effective_prefixes().as_ref(),
                     EmbeddingRole::Document,
                 );
                 let key = EmbedCache::cache_key(model, &prefixed[0]);
@@ -358,9 +358,14 @@ async fn prime_embed_cache(args: &[String]) -> Result<(), Box<dyn std::error::Er
                 let clust_emb: Vec<f32> = clust_flat.values().to_vec();
 
                 if clust_emb.len() == dim {
+                    let clustering_prefixes = config
+                        .provider2
+                        .as_ref()
+                        .unwrap_or(&config.embed_provider)
+                        .effective_prefixes();
                     let prefixed = embed::apply_prefix(
                         &[content.to_owned()],
-                        clustering_model,
+                        clustering_prefixes.as_ref(),
                         EmbeddingRole::Clustering,
                     );
                     let key = EmbedCache::cache_key(clustering_model, &prefixed[0]);

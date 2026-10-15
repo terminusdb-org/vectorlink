@@ -189,11 +189,26 @@ impl SearchService {
             let cache_dir = std::path::Path::new(&config.data_dir).join("embed_cache");
             crate::embed::cache::EmbedCache::open(&cache_dir, config.embed_cache_size)
         };
-        let prefix = match embed::prefixes_for_model(config.embed_provider.model_name()) {
-            Some(p) => embed::prefix_for_role(&p, EmbeddingRole::Document).to_owned(),
-            None => String::new(),
-        };
-        let chunk_params = chunk::params_for_window(&tokenizer, &prefix)
+        // Chunk budget: every produced chunk is embedded twice — Document role
+        // on slot 1 and Clustering role on the clustering provider — so the
+        // window must hold under the LONGEST applicable prefix, not just
+        // slot 1's document prefix (e.g. nomic's `clustering: ` costs more
+        // tokens than e5's `passage: `).
+        let doc_prefix = config
+            .embed_provider
+            .effective_prefixes()
+            .map(|p| embed::prefix_for_role(&p, EmbeddingRole::Document).to_owned());
+        let clustering_prefix = config
+            .provider2
+            .as_ref()
+            .unwrap_or(&config.embed_provider)
+            .effective_prefixes()
+            .map(|p| embed::prefix_for_role(&p, EmbeddingRole::Clustering).to_owned());
+        let chunk_params = [doc_prefix, clustering_prefix]
+            .into_iter()
+            .flatten()
+            .filter_map(|p| chunk::params_for_window(&tokenizer, &p).ok())
+            .min_by_key(|c| c.max_tokens)
             .unwrap_or(ChunkParams { max_tokens: 480, overlap: 64 });
 
         let ready_index = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -3058,6 +3073,7 @@ mod tests_risk26 {
             base_url: "http://127.0.0.1:0/never-called".to_owned(),
             model: "test-noop".to_owned(),
             dim: 8,
+            prefixes: None,
         }
     }
 
@@ -3441,6 +3457,7 @@ mod tests_streaming {
             base_url: "http://127.0.0.1:0/never-called".to_owned(),
             model: "test-noop".to_owned(),
             dim: 8,
+            prefixes: None,
         }
     }
 
@@ -3701,11 +3718,15 @@ mod tests_streaming {
         );
     }
 
-    /// Mixed commit: a single streaming commit carrying BOTH a pure Deleted op
-    /// and an Inserted doc must apply the delete — not skip it because inserts
-    /// exist. Regression test for the gating bug where the final delete only
-    /// ran when `indexed_count == 0`, leaving deleted docs searchable at the
-    /// tagged commit.
+    /// Regression guard (mixed-commit delete loss): a streaming commit that
+    /// contains BOTH a pure `Deleted` op and an `Inserted`/`Changed` op must
+    /// apply the delete. The write phase previously gated the final delete on
+    /// `indexed_count == 0`, so a mixed commit appended rows and tagged the
+    /// commit while the deleted doc stayed searchable.
+    ///
+    /// The embed cache is pre-warmed for the inserted doc's chunk text so the
+    /// pipeline produces a real embedding with no live provider (io_embed
+    /// short-circuits when every text is a cache hit).
     #[tokio::test]
     async fn stream_mixed_delete_and_insert_applies_delete() {
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -3813,6 +3834,7 @@ mod tests_exact_duplicate_override {
                 base_url: "http://127.0.0.1:0/no-server".to_owned(),
                 model: "test-model".to_owned(),
                 dim,
+                prefixes: None,
             },
             provider2: None,
             embed_api_key: None,
@@ -4722,6 +4744,7 @@ mod tests_concurrent_search {
             base_url: "http://127.0.0.1:0/never-called".to_owned(),
             model: "test-noop".to_owned(),
             dim: 8,
+            prefixes: None,
         }
     }
 

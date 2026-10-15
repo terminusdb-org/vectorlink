@@ -31,55 +31,75 @@ pub enum EmbeddingRole {
 }
 
 /// Task prefix set for a model (e.g. the four nomic roles, or e5's
-/// passage:/query: asymmetric pair).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// passage:/query: asymmetric pair). Fields are owned so env-configured
+/// prefixes can live here too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskPrefix {
-    pub document: &'static str,
-    pub query: &'static str,
-    pub clustering: &'static str,
-    pub classification: &'static str,
+    pub document: String,
+    pub query: String,
+    pub clustering: String,
+    pub classification: String,
+}
+
+impl TaskPrefix {
+    fn new(document: &str, query: &str, clustering: &str, classification: &str) -> Self {
+        Self {
+            document: document.to_owned(),
+            query: query.to_owned(),
+            clustering: clustering.to_owned(),
+            classification: classification.to_owned(),
+        }
+    }
 }
 
 /// Hard-coded model → prefix table. Returns None for unknown models (no prefix).
+/// Per-role overrides exist via `VECTORLINK_PREFIX_*` / `VECTORLINK_MODEL2_PREFIX_*`
+/// env vars (resolved at config time onto `Provider::prefixes`) — this table is
+/// only the default for known models.
 pub fn prefixes_for_model(model: &str) -> Option<TaskPrefix> {
     match model {
         "nomic-ai/nomic-embed-text-v2-moe"
         | "nomic-embed-text-v2-moe"
         | "nomic-embed-v2"
-        | "nomic-ai/nomic-embed-text-v1.5" => Some(TaskPrefix {
-            document: "search_document: ",
-            query: "search_query: ",
-            clustering: "clustering: ",
-            classification: "classification: ",
-        }),
+        | "nomic-ai/nomic-embed-text-v1.5" => Some(TaskPrefix::new(
+            "search_document: ",
+            "search_query: ",
+            "clustering: ",
+            "classification: ",
+        )),
         // E5 asymmetric convention: `query: ` for queries, `passage: ` for
         // corpus texts. Symmetric tasks (clustering, classification) use
         // `query: ` on all inputs.
-        "intfloat/multilingual-e5-base" | "multilingual-e5-base" => Some(TaskPrefix {
-            document: "passage: ",
-            query: "query: ",
-            clustering: "query: ",
-            classification: "query: ",
-        }),
+        "intfloat/multilingual-e5-base" | "multilingual-e5-base" => Some(TaskPrefix::new(
+            "passage: ",
+            "query: ",
+            "query: ",
+            "query: ",
+        )),
         _ => None,
     }
 }
 
 /// Select the appropriate prefix for the given role.
-pub fn prefix_for_role(prefix: &TaskPrefix, role: EmbeddingRole) -> &'static str {
+pub fn prefix_for_role(prefix: &TaskPrefix, role: EmbeddingRole) -> &str {
     match role {
-        EmbeddingRole::Document => prefix.document,
-        EmbeddingRole::Query => prefix.query,
-        EmbeddingRole::Clustering => prefix.clustering,
-        EmbeddingRole::Classification => prefix.classification,
+        EmbeddingRole::Document => &prefix.document,
+        EmbeddingRole::Query => &prefix.query,
+        EmbeddingRole::Clustering => &prefix.clustering,
+        EmbeddingRole::Classification => &prefix.classification,
     }
 }
 
-/// Apply the task prefix to each input text.
-pub fn apply_prefix(texts: &[String], model: &str, role: EmbeddingRole) -> Vec<String> {
-    match prefixes_for_model(model) {
+/// Apply the task prefix to each input text. `None` prefixes → texts pass
+/// through unchanged.
+pub fn apply_prefix(
+    texts: &[String],
+    prefixes: Option<&TaskPrefix>,
+    role: EmbeddingRole,
+) -> Vec<String> {
+    match prefixes {
         Some(prefix) => {
-            let p = prefix_for_role(&prefix, role);
+            let p = prefix_for_role(prefix, role);
             texts.iter().map(|t| format!("{}{}", p, t)).collect()
         }
         None => texts.to_vec(),
@@ -87,6 +107,11 @@ pub fn apply_prefix(texts: &[String], model: &str, role: EmbeddingRole) -> Vec<S
 }
 
 /// Embedding provider configuration.
+///
+/// `prefixes` is the resolved task-prefix set: per-role env overrides
+/// (`VECTORLINK_PREFIX_*`, `VECTORLINK_MODEL2_PREFIX_*`) when set, otherwise
+/// the model's built-in table. `None` means "no prefixes" — either unknown
+/// model or explicit empty overrides.
 #[derive(Debug, Clone)]
 pub enum Provider {
     /// OpenAI-compatible endpoint (default — Ollama sidecar).
@@ -94,18 +119,21 @@ pub enum Provider {
         base_url: String,
         model: String,
         dim: usize,
+        prefixes: Option<TaskPrefix>,
     },
     /// Real OpenAI API.
     OpenAi {
         base_url: String,
         model: String,
         dim: usize,
+        prefixes: Option<TaskPrefix>,
     },
     /// Generic HTTP endpoint with custom request shape.
     GenericHttp {
         base_url: String,
         model: String,
         dim: usize,
+        prefixes: Option<TaskPrefix>,
     },
 }
 
@@ -140,6 +168,29 @@ impl Provider {
             Provider::OpenAiCompatible { base_url, .. } => base_url,
             Provider::OpenAi { base_url, .. } => base_url,
             Provider::GenericHttp { base_url, .. } => base_url,
+        }
+    }
+
+    /// Effective task prefixes: the configured value when present, otherwise
+    /// the model's built-in table (None for unknown models).
+    pub fn effective_prefixes(&self) -> Option<TaskPrefix> {
+        self.prefixes().cloned().or_else(|| prefixes_for_model(self.model_name()))
+    }
+
+    fn prefixes(&self) -> Option<&TaskPrefix> {
+        match self {
+            Provider::OpenAiCompatible { prefixes, .. } => prefixes.as_ref(),
+            Provider::OpenAi { prefixes, .. } => prefixes.as_ref(),
+            Provider::GenericHttp { prefixes, .. } => prefixes.as_ref(),
+        }
+    }
+
+    /// Set the resolved prefixes (env overlay already applied by config).
+    pub fn set_prefixes(&mut self, p: Option<TaskPrefix>) {
+        match self {
+            Provider::OpenAiCompatible { prefixes, .. } => *prefixes = p,
+            Provider::OpenAi { prefixes, .. } => *prefixes = p,
+            Provider::GenericHttp { prefixes, .. } => *prefixes = p,
         }
     }
 }
@@ -224,7 +275,7 @@ pub async fn io_embed(
         return Ok(Vec::new());
     }
 
-    let prefixed = apply_prefix(texts, provider.model_name(), role);
+    let prefixed = apply_prefix(texts, provider.effective_prefixes().as_ref(), role);
     let dim = provider.expected_dim();
     let model = provider.model_name();
 
@@ -445,9 +496,9 @@ mod tests {
     #[test]
     fn apply_prefix_e5_query_and_document() {
         let texts = vec!["hello world".to_owned()];
-        let doc = apply_prefix(&texts, "multilingual-e5-base", EmbeddingRole::Document);
+        let doc = apply_prefix(&texts, prefixes_for_model("multilingual-e5-base").as_ref(), EmbeddingRole::Document);
         assert_eq!(doc, vec!["passage: hello world"]);
-        let query = apply_prefix(&texts, "multilingual-e5-base", EmbeddingRole::Query);
+        let query = apply_prefix(&texts, prefixes_for_model("multilingual-e5-base").as_ref(), EmbeddingRole::Query);
         assert_eq!(query, vec!["query: hello world"]);
     }
 
@@ -461,21 +512,21 @@ mod tests {
     #[test]
     fn apply_prefix_document_role() {
         let texts = vec!["hello world".to_owned()];
-        let result = apply_prefix(&texts, "nomic-ai/nomic-embed-text-v2-moe", EmbeddingRole::Document);
+        let result = apply_prefix(&texts, prefixes_for_model("nomic-ai/nomic-embed-text-v2-moe").as_ref(), EmbeddingRole::Document);
         assert_eq!(result, vec!["search_document: hello world"]);
     }
 
     #[test]
     fn apply_prefix_query_role() {
         let texts = vec!["hello world".to_owned()];
-        let result = apply_prefix(&texts, "nomic-ai/nomic-embed-text-v2-moe", EmbeddingRole::Query);
+        let result = apply_prefix(&texts, prefixes_for_model("nomic-ai/nomic-embed-text-v2-moe").as_ref(), EmbeddingRole::Query);
         assert_eq!(result, vec!["search_query: hello world"]);
     }
 
     #[test]
     fn apply_prefix_unknown_model_no_prefix() {
         let texts = vec!["hello world".to_owned()];
-        let result = apply_prefix(&texts, "unknown-model", EmbeddingRole::Document);
+        let result = apply_prefix(&texts, prefixes_for_model("unknown-model").as_ref(), EmbeddingRole::Document);
         assert_eq!(result, vec!["hello world"]);
     }
 
@@ -483,28 +534,28 @@ mod tests {
     #[test]
     fn apply_prefix_clustering_role() {
         let texts = vec!["hello world".to_owned()];
-        let result = apply_prefix(&texts, "nomic-ai/nomic-embed-text-v2-moe", EmbeddingRole::Clustering);
+        let result = apply_prefix(&texts, prefixes_for_model("nomic-ai/nomic-embed-text-v2-moe").as_ref(), EmbeddingRole::Clustering);
         assert_eq!(result, vec!["clustering: hello world"]);
     }
 
     #[test]
     fn apply_prefix_classification_role() {
         let texts = vec!["hello world".to_owned()];
-        let result = apply_prefix(&texts, "nomic-ai/nomic-embed-text-v2-moe", EmbeddingRole::Classification);
+        let result = apply_prefix(&texts, prefixes_for_model("nomic-ai/nomic-embed-text-v2-moe").as_ref(), EmbeddingRole::Classification);
         assert_eq!(result, vec!["classification: hello world"]);
     }
 
     #[test]
     fn apply_prefix_clustering_short_name() {
         let texts = vec!["test".to_owned()];
-        let result = apply_prefix(&texts, "nomic-embed-v2", EmbeddingRole::Clustering);
+        let result = apply_prefix(&texts, prefixes_for_model("nomic-embed-v2").as_ref(), EmbeddingRole::Clustering);
         assert_eq!(result, vec!["clustering: test"]);
     }
 
     #[test]
     fn apply_prefix_classification_short_name() {
         let texts = vec!["test".to_owned()];
-        let result = apply_prefix(&texts, "nomic-embed-v2", EmbeddingRole::Classification);
+        let result = apply_prefix(&texts, prefixes_for_model("nomic-embed-v2").as_ref(), EmbeddingRole::Classification);
         assert_eq!(result, vec!["classification: test"]);
     }
 

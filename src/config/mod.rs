@@ -117,6 +117,12 @@ pub struct LockedEmbeddingParams {
     pub base_url: String,
     pub model: String,
     pub dim: usize,
+    /// Effective task prefixes (env overlay already applied). `None` means
+    /// "no prefixes" for a newly locked store; a lock file written before
+    /// this field existed also deserializes to `None` and is interpreted as
+    /// the model's built-in table for comparison.
+    #[serde(default)]
+    pub prefixes: Option<crate::embed::TaskPrefix>,
     /// Slot-2 (clustering) provider parameters, recorded when
     /// `VECTORLINK_MODEL2` is configured. `None` means the slot-1 provider
     /// serves the clustering role too — the vectors in `clustering_embedding`
@@ -137,8 +143,34 @@ impl LockedEmbeddingParams {
             base_url: provider.base_url().trim_end_matches('/').to_owned(),
             model: provider.model_name().to_owned(),
             dim: provider.expected_dim(),
+            prefixes: provider.effective_prefixes(),
             clustering: None,
         }
+    }
+
+    /// Prefixes actually used when producing the stored vectors: the recorded
+    /// set, or — for lock files written before prefixes were recorded — the
+    /// locked model's built-in table.
+    fn effective_prefixes(&self) -> Option<crate::embed::TaskPrefix> {
+        self.prefixes
+            .clone()
+            .or_else(|| crate::embed::prefixes_for_model(&self.model))
+    }
+
+    /// Semantic equality for the lock check: identical to `PartialEq` except
+    /// that `prefixes` compares the *effective* sets (a pre-field lock file
+    /// implicitly used the model's table).
+    fn params_match(&self, other: &LockedEmbeddingParams) -> bool {
+        self.provider == other.provider
+            && self.base_url == other.base_url
+            && self.model == other.model
+            && self.dim == other.dim
+            && self.effective_prefixes() == other.effective_prefixes()
+            && match (&self.clustering, &other.clustering) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.params_match(b),
+                _ => false,
+            }
     }
 }
 
@@ -169,7 +201,7 @@ pub fn verify_or_lock_embedding_params(
                 e
             )
         })?;
-        if locked != current {
+        if !locked.params_match(&current) {
             return Err(format!(
                 "embedding parameters mismatch: the vectorlink store at {} was created with\n{}\n\
                  but the current configuration resolves to\n{}\n\
@@ -210,24 +242,65 @@ pub fn verify_or_lock_embedding_params(
 }
 
 /// Build a provider from its kind string + endpoint parts.
-fn resolve_provider(kind: &str, base_url: String, model: String, dim: usize) -> Provider {
+fn resolve_provider(
+    kind: &str,
+    base_url: String,
+    model: String,
+    dim: usize,
+    prefixes: Option<crate::embed::TaskPrefix>,
+) -> Provider {
     match kind {
         "openai" => Provider::OpenAi {
             base_url,
             model,
             dim,
+            prefixes,
         },
         "generic_http" => Provider::GenericHttp {
             base_url,
             model,
             dim,
+            prefixes,
         },
         _ => Provider::OpenAiCompatible {
             base_url,
             model,
             dim,
+            prefixes,
         },
     }
+}
+
+/// Resolve task prefixes for one provider slot: per-role env overrides
+/// (`{ns}PREFIX_DOCUMENT` / `_QUERY` / `_CLUSTERING` / `_CLASSIFICATION`)
+/// layered over the model's built-in table. When any override is set, unset
+/// roles fall back to the table entry (empty string for unknown models), so a
+/// single `..._PREFIX_CLUSTERING=clustering: ` is enough to enable clustering
+/// prefixes on a model the table doesn't know. `None` when neither env vars
+/// nor a table entry exist — texts then pass through unprefixed.
+pub fn resolve_prefixes<F>(model: &str, get: F, ns: &str) -> Option<crate::embed::TaskPrefix>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let table = crate::embed::prefixes_for_model(model);
+    let role = |name: &str, table_val: Option<&String>| {
+        get(&format!("{}PREFIX_{}", ns, name))
+            .or_else(|| table_val.cloned())
+    };
+    let t = table.as_ref();
+    let document = role("DOCUMENT", t.map(|p| &p.document));
+    let query = role("QUERY", t.map(|p| &p.query));
+    let clustering = role("CLUSTERING", t.map(|p| &p.clustering));
+    let classification = role("CLASSIFICATION", t.map(|p| &p.classification));
+    if document.is_none() && query.is_none() && clustering.is_none() && classification.is_none() {
+        return None;
+    }
+    Some(crate::embed::TaskPrefix {
+        document: document.unwrap_or_default(),
+        query: query.unwrap_or_default(),
+        clustering: clustering.unwrap_or_default(),
+        classification: classification.unwrap_or_default(),
+    })
 }
 
 /// Resolve the optional slot-2 (clustering) embedding provider.
@@ -249,7 +322,8 @@ where
     let dim = get("VECTORLINK_MODEL2_DIM")
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| slot1.expected_dim());
-    Some(resolve_provider(&kind, base_url, model, dim))
+    let prefixes = resolve_prefixes(&model, &get, "VECTORLINK_MODEL2_");
+    Some(resolve_provider(&kind, base_url, model, dim, prefixes))
 }
 
 /// Slot-2 embed endpoint bearer token: `VECTORLINK_MODEL2_API_KEY`, falling
@@ -342,9 +416,9 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(768);
 
-        let embed_provider = resolve_provider(&provider_str, embed_url, model, dim);
-
         let env = |k: &str| std::env::var(k).ok();
+        let prefixes = resolve_prefixes(&model, env, "VECTORLINK_");
+        let embed_provider = resolve_provider(&provider_str, embed_url, model, dim, prefixes);
         let provider2 = resolve_provider2(&embed_provider, env);
         let api_key2 = provider2.as_ref().and_then(|p2| {
             let same_endpoint = p2.base_url().trim_end_matches('/')
@@ -462,6 +536,7 @@ impl Config {
                 base_url: "http://localhost:11434".to_owned(),
                 model: "multilingual-e5-base".to_owned(),
                 dim: 768,
+                prefixes: None,
             },
             provider2: None,
             embed_api_key: None,
@@ -489,6 +564,7 @@ impl Default for Config {
                 base_url: "http://localhost:11434".to_owned(),
                 model: "multilingual-e5-base".to_owned(),
                 dim: 768,
+                prefixes: None,
             },
             provider2: None,
             embed_api_key: None,
@@ -515,6 +591,7 @@ mod tests {
             base_url: "http://localhost:11434".to_owned(),
             model: model.to_owned(),
             dim,
+            prefixes: None,
         }
     }
 
@@ -596,6 +673,7 @@ mod tests {
             base_url: "http://custom:9000".to_owned(),
             model: "multilingual-e5-base".to_owned(),
             dim: 768,
+            prefixes: None,
         };
         let p2 = resolve_provider2(&slot1, env(&[("VECTORLINK_MODEL2", "nomic-embed-v2")]))
             .expect("MODEL2 set → provider2 must resolve");
@@ -649,6 +727,74 @@ mod tests {
         assert_eq!(resolve_api_key2(&vars, false), None);
     }
 
+    // --- prefix resolution: model table + per-role env overrides ---
+
+    #[test]
+    fn prefixes_fall_back_to_model_table() {
+        let p = resolve_prefixes("multilingual-e5-base", env(&[]), "VECTORLINK_").unwrap();
+        assert_eq!(p.document, "passage: ");
+        assert_eq!(p.clustering, "query: ");
+    }
+
+    #[test]
+    fn prefixes_env_overrides_one_role_keeps_table_rest() {
+        let vars = env(&[("VECTORLINK_PREFIX_CLUSTERING", "cluster: ")]);
+        let p = resolve_prefixes("multilingual-e5-base", vars, "VECTORLINK_").unwrap();
+        assert_eq!(p.clustering, "cluster: ");
+        assert_eq!(p.document, "passage: ");
+        assert_eq!(p.query, "query: ");
+    }
+
+    #[test]
+    fn prefixes_unknown_model_built_entirely_from_env() {
+        let vars = env(&[
+            ("VECTORLINK_PREFIX_DOCUMENT", "doc: "),
+            ("VECTORLINK_PREFIX_QUERY", "q: "),
+            ("VECTORLINK_PREFIX_CLUSTERING", "cl: "),
+            ("VECTORLINK_PREFIX_CLASSIFICATION", "cls: "),
+        ]);
+        let p = resolve_prefixes("some-unknown-model", vars, "VECTORLINK_").unwrap();
+        assert_eq!(p.clustering, "cl: ");
+        assert_eq!(p.document, "doc: ");
+    }
+
+    #[test]
+    fn prefixes_partial_env_on_unknown_model_empties_rest() {
+        // Only clustering set → other roles get "" (explicit no-prefix), and
+        // the provider must NOT silently fall back to a wrong table.
+        let vars = env(&[("VECTORLINK_PREFIX_CLUSTERING", "cl: ")]);
+        let p = resolve_prefixes("some-unknown-model", vars, "VECTORLINK_").unwrap();
+        assert_eq!(p.clustering, "cl: ");
+        assert_eq!(p.document, "");
+    }
+
+    #[test]
+    fn prefixes_none_when_unknown_model_and_no_env() {
+        assert!(resolve_prefixes("some-unknown-model", env(&[]), "VECTORLINK_").is_none());
+    }
+
+    #[test]
+    fn provider2_prefixes_resolve_via_model2_namespace() {
+        let slot1 = provider("multilingual-e5-base", 768);
+        let p2 = resolve_provider2(&slot1, env(&[("VECTORLINK_MODEL2", "nomic-embed-v2")]))
+            .unwrap();
+        // Known model → its table applies for the clustering role.
+        assert_eq!(
+            p2.effective_prefixes().unwrap().clustering,
+            "clustering: "
+        );
+        // Env override beats the table.
+        let p2 = resolve_provider2(
+            &slot1,
+            env(&[
+                ("VECTORLINK_MODEL2", "nomic-embed-v2"),
+                ("VECTORLINK_MODEL2_PREFIX_CLUSTERING", "group: "),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(p2.effective_prefixes().unwrap().clustering, "group: ");
+    }
+
     // --- params lock covers slot 2 ---
 
     #[test]
@@ -669,6 +815,39 @@ mod tests {
             Some("nomic-embed-v2"),
             "clustering model must be recorded in the lock"
         );
+    }
+
+    #[test]
+    fn params_lock_rejects_changed_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        verify_or_lock_embedding_params(dir.path(), &provider("nomic-embed-v2", 768), None)
+            .unwrap();
+        // Same model, different prefix set → stored vectors are in a
+        // different space → must refuse.
+        let mut p = provider("nomic-embed-v2", 768);
+        let mut prefixes = p.effective_prefixes().unwrap();
+        prefixes.clustering = "group: ".to_owned();
+        p.set_prefixes(Some(prefixes));
+        let err = verify_or_lock_embedding_params(dir.path(), &p, None)
+            .expect_err("changed prefixes must fail the lock check");
+        assert!(err.contains("embedding parameters mismatch"), "{err}");
+    }
+
+    #[test]
+    fn params_lock_prefield_file_matches_model_table() {
+        // A lock file written before `prefixes` existed has no field —
+        // deserializes to None and must compare equal when the model's
+        // table is still in effect.
+        let dir = tempfile::tempdir().unwrap();
+        let mut locked = LockedEmbeddingParams::from_provider(&provider("nomic-embed-v2", 768));
+        locked.prefixes = None; // simulate a pre-field lock file
+        std::fs::write(
+            dir.path().join(EMBEDDING_PARAMS_FILE),
+            serde_json::to_string(&locked).unwrap(),
+        )
+        .unwrap();
+        verify_or_lock_embedding_params(dir.path(), &provider("nomic-embed-v2", 768), None)
+            .unwrap();
     }
 
     #[test]
