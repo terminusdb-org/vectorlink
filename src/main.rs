@@ -33,6 +33,7 @@ use vectorlink::store::lance::{encode_domain_path, LanceStore};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() > 1 && args[1] == "prime-embed-cache" {

@@ -100,7 +100,7 @@ pub async fn io_ensure_vector_index(
         // First time: create the vector index with adaptive partition count.
         let mut adaptive_config = config.clone();
         adaptive_config.num_partitions = num_partitions;
-        eprintln!(
+        log::debug!(
             "[io_ensure_vector_index] creating index: {} partitions for {} rows",
             num_partitions, row_count
         );

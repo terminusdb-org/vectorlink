@@ -158,7 +158,7 @@ pub async fn start_metrics_server(
     );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    eprintln!("[metrics] Prometheus metrics server listening on :{}", port);
+    log::info!("[metrics] Prometheus metrics server listening on :{}", port);
     axum::serve(listener, app).await
 }
 

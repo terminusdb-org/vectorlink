@@ -359,11 +359,11 @@ impl LanceStore {
                     }
                 }
                 match std::fs::remove_dir(&backup) {
-                    Ok(()) => eprintln!(
+                    Ok(()) => log::debug!(
                         "[startup] recovered stranded _indices_backup_fixb entries in {}",
                         path.display()
                     ),
-                    Err(e) => eprintln!(
+                    Err(e) => log::warn!(
                         "[startup] WARNING: merged entries but could not remove {}: {}",
                         backup.display(),
                         e
@@ -371,11 +371,11 @@ impl LanceStore {
                 }
             } else {
                 match std::fs::rename(&backup, &indices) {
-                    Ok(()) => eprintln!(
+                    Ok(()) => log::debug!(
                         "[startup] restored _indices from stranded backup in {}",
                         path.display()
                     ),
-                    Err(e) => eprintln!(
+                    Err(e) => log::warn!(
                         "[startup] WARNING: failed to restore {}: {}",
                         backup.display(),
                         e
@@ -404,7 +404,7 @@ impl LanceStore {
                 .map(|(k, _)| k.clone());
             match oldest {
                 Some(domain) => {
-                    eprintln!("[cache] evicting LRU dataset handle: {}", domain);
+                    log::debug!("[cache] evicting LRU dataset handle: {}", domain);
                     datasets.remove(&domain);
                 }
                 None => break,
@@ -1147,7 +1147,7 @@ impl LanceStore {
         let stats = cleanup_result
             .map_err(|e| StoreError::Internal(format!("aggressive cleanup failed: {}", e)))?;
 
-        eprintln!(
+        log::debug!(
             "[garbage collection] main: removed {} bytes, {} old versions, {} data files, {} index files",
             stats.bytes_removed, stats.old_versions, stats.data_files_removed, stats.index_files_removed
         );
@@ -1157,10 +1157,10 @@ impl LanceStore {
         // This runs under the pipeline lock (caller holds it), so the
         // TOCTOU race with concurrent index creation is prevented.
         if let Err(e) = self.io_prune_stale_index_dirs(domain, _branch).await {
-            eprintln!("[garbage collection] removing unreferenced index dirs failed (soft): {}", e);
+            log::warn!("[garbage collection] removing unreferenced index dirs failed (soft): {}", e);
         }
         if let Err(e) = self.io_prune_empty_index_dirs(domain) {
-            eprintln!("[garbage collection] prune empty index dirs failed (soft): {}", e);
+            log::warn!("[garbage collection] prune empty index dirs failed (soft): {}", e);
         }
 
         Ok(())
@@ -1190,7 +1190,7 @@ impl LanceStore {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("[garbage collection] prune: skipping unreadable entry: {}", e);
+                    log::warn!("[garbage collection] prune: skipping unreadable entry: {}", e);
                     continue;
                 }
             };
@@ -1217,7 +1217,7 @@ impl LanceStore {
                 match std::fs::remove_dir_all(&dir_path) {
                     Ok(_) => removed += 1,
                     Err(e) => {
-                        eprintln!(
+                        log::warn!(
                             "[garbage collection] prune: failed to remove empty dir {:?}: {}",
                             dir_path, e
                         );
@@ -1227,7 +1227,7 @@ impl LanceStore {
         }
 
         if removed > 0 {
-            eprintln!("[garbage collection] pruned {} empty index directories", removed);
+            log::debug!("[garbage collection] pruned {} empty index directories", removed);
         }
 
         Ok(removed)
@@ -1269,7 +1269,7 @@ impl LanceStore {
         // for any reason, we must NOT prune, or we risk deleting live index dirs.
         let live_uuids = self.io_collect_all_live_index_uuids_strict(domain).await?;
 
-        eprintln!(
+        log::debug!(
             "[garbage collection] index dir scan: keeping {} index versions referenced by tagged commits; looking for unreferenced dirs",
             live_uuids.len(),
         );
@@ -1282,7 +1282,7 @@ impl LanceStore {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("[garbage collection] prune stale: skipping unreadable entry: {}", e);
+                    log::warn!("[garbage collection] prune stale: skipping unreadable entry: {}", e);
                     continue;
                 }
             };
@@ -1296,14 +1296,14 @@ impl LanceStore {
             let dir_uuid = dir_name.to_string_lossy().to_string();
 
             if !live_uuids.contains(&dir_uuid) {
-                eprintln!(
+                log::debug!(
                     "[garbage collection] index dir scan: removing unreferenced index dir {}",
                     dir_uuid
                 );
                 match std::fs::remove_dir_all(&dir_path) {
                     Ok(_) => removed += 1,
                     Err(e) => {
-                        eprintln!(
+                        log::warn!(
                             "[garbage collection] prune stale: failed to remove dir {:?}: {}",
                             dir_path, e
                         );
@@ -1313,7 +1313,7 @@ impl LanceStore {
         }
 
         if removed > 0 {
-            eprintln!("[garbage collection] pruned {} stale index directories", removed);
+            log::debug!("[garbage collection] pruned {} stale index directories", removed);
         }
 
         Ok(removed)

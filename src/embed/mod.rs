@@ -293,7 +293,7 @@ pub async fn io_embed(
             }
         }
         let hits = texts.len() - miss_indices.len();
-        eprintln!(
+        log::debug!(
             "[embed] cache: role={:?} hits={} misses={} of {}",
             role, hits, miss_indices.len(), texts.len()
         );
@@ -414,7 +414,7 @@ pub async fn io_embed_batched(
                 // CONSEQUENCE: Only the actually toxic text(s) are marked Failed; all
                 // other texts in the batch get their correct embeddings. The caller
                 // (pipeline scatter phase) skips only the affected doc(s).
-                eprintln!(
+                log::warn!(
                     "[embed] batch of {} texts failed, retrying individually: {}",
                     batch.len(),
                     batch_err

@@ -129,7 +129,7 @@ impl LanceStore {
                         e
                     )));
                 }
-                eprintln!("[integrity] collect UUIDs: load_indices failed for HEAD on main: {}", e);
+                log::warn!("[integrity] collect UUIDs: load_indices failed for HEAD on main: {}", e);
             }
         }
 
@@ -147,7 +147,7 @@ impl LanceStore {
                                 branch_name, e
                             )));
                         }
-                        eprintln!(
+                        log::warn!(
                             "[integrity] collect UUIDs: skipping branch {} (checkout failed: {})",
                             branch_name, e
                         );
@@ -168,7 +168,7 @@ impl LanceStore {
                             branch_name, e
                         )));
                     }
-                    eprintln!(
+                    log::warn!(
                         "[integrity] collect UUIDs: load_indices failed for HEAD on branch {}: {}",
                         branch_name, e
                     );
@@ -190,7 +190,7 @@ impl LanceStore {
                                 branch_name, e
                             )));
                         }
-                        eprintln!(
+                        log::warn!(
                             "[integrity] collect UUIDs: skipping branch {} (checkout failed: {})",
                             branch_name, e
                         );
@@ -215,7 +215,7 @@ impl LanceStore {
                                         version, branch_name, e
                                     )));
                                 }
-                                eprintln!(
+                                log::warn!(
                                     "[integrity] collect UUIDs: load_indices failed for version {} on branch {}: {}",
                                     version, branch_name, e
                                 );
@@ -229,7 +229,7 @@ impl LanceStore {
                                 version, branch_name, e
                             )));
                         }
-                        eprintln!(
+                        log::warn!(
                             "[integrity] collect UUIDs: checkout version {} on branch {} failed: {}",
                             version, branch_name, e
                         );

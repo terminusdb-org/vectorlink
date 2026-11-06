@@ -117,7 +117,7 @@ impl LanceStore {
                 if msg.contains("INVERTED index") || msg.contains("full text search") {
                     // FTS index missing — fall through to substring fallback.
                     let fallback_hits = self.substring_suggest(&snapshot, query).await.unwrap_or_else(|e2| {
-                        eprintln!("[suggest] substring fallback (stream err) failed: {e2}");
+                        log::warn!("[suggest] substring fallback (stream err) failed: {e2}");
                         Vec::new()
                     });
                     return Ok(self.build_suggest_result(fallback_hits, query));
@@ -133,7 +133,7 @@ impl LanceStore {
                 if msg.contains("INVERTED index") || msg.contains("full text search") {
                     // FTS index missing — fall through to substring fallback.
                     let fallback_hits = self.substring_suggest(&snapshot, query).await.unwrap_or_else(|e2| {
-                        eprintln!("[suggest] substring fallback (collect err) failed: {e2}");
+                        log::warn!("[suggest] substring fallback (collect err) failed: {e2}");
                         Vec::new()
                     });
                     return Ok(self.build_suggest_result(fallback_hits, query));
@@ -149,7 +149,7 @@ impl LanceStore {
         // (e.g. "elect" → "electrical") that the inverted index misses.
         let chunk_hits = if chunk_hits.is_empty() && !query.query_text.is_empty() {
             self.substring_suggest(&snapshot, query).await.unwrap_or_else(|e| {
-                eprintln!("[suggest] substring fallback failed: {e}");
+                log::warn!("[suggest] substring fallback failed: {e}");
                 Vec::new()
             })
         } else {

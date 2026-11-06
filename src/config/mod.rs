@@ -48,7 +48,7 @@ impl DomainSettingsMap {
                     .unwrap_or_default()
                 }
                 Err(_) => {
-                    eprintln!(
+                    log::warn!(
                         "[config] warning: failed to read {}, starting with empty settings",
                         path.display()
                     );
@@ -228,7 +228,7 @@ pub fn verify_or_lock_embedding_params(
         })
         .unwrap_or(false);
     if has_datasets {
-        eprintln!(
+        log::warn!(
             "[config] warning: existing store at {} has no {}; locking current embedding parameters",
             data_dir.display(),
             EMBEDDING_PARAMS_FILE

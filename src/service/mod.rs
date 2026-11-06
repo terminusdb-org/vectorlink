@@ -205,7 +205,7 @@ impl SearchService {
     ) -> Self {
         if embed_cache.locked_elsewhere() {
             store.set_read_only(true);
-            eprintln!(
+            log::debug!(
                 "[vectorlink] read-only mode: data dir {} is write-locked by another \
                  process — answering search queries only",
                 config.data_dir
@@ -2447,7 +2447,7 @@ async fn io_run_index_pipeline(
                         .unwrap_or((0, 0));
 
                 if idx_after != idx_before {
-                    eprintln!(
+                    log::debug!(
                         "[pipeline] cascade: domain={} branch={} delta_count={} indices {}→{}",
                         ctx.domain, ctx.branch, delta_count, idx_before, idx_after
                     );
@@ -2456,7 +2456,7 @@ async fn io_run_index_pipeline(
                 ctx.store.io_refresh_cached_dataset(ctx.domain, ctx.branch).await
                     .map_err(|e| format!("cascade cache refresh failed: {}", e))?;
 
-                eprintln!(
+                log::debug!(
                     "[pipeline] boundary index created: domain={} branch={} commit_position={}",
                     ctx.domain, ctx.branch, commit_position
                 );
@@ -2493,7 +2493,7 @@ async fn io_run_index_pipeline(
 
         // Aggressively prune untagged intermediate versions after tagging.
         if let Err(e) = ctx.store.io_cleanup_aggressive(ctx.domain, ctx.branch).await {
-            eprintln!("[pipeline] aggressive cleanup failed (soft): {}", e);
+            log::warn!("[pipeline] aggressive cleanup failed (soft): {}", e);
         }
     } else {
         // ─── NO-OP path (RISK-26 fix): tag + advance without writing data ──────
@@ -3004,7 +3004,7 @@ async fn io_run_index_pipeline_stream(
                     .unwrap_or((0, 0));
 
             if idx_after != idx_before {
-                eprintln!(
+                log::debug!(
                     "[pipeline] cascade: domain={} branch={} delta_count={} indices {}→{}",
                     ctx.domain, ctx.branch, delta_count, idx_before, idx_after
                 );
@@ -3013,7 +3013,7 @@ async fn io_run_index_pipeline_stream(
             ctx.store.io_refresh_cached_dataset(ctx.domain, ctx.branch).await
                 .map_err(|e| format!("cascade cache refresh failed: {}", e))?;
 
-            eprintln!(
+            log::debug!(
                 "[pipeline] boundary index created: domain={} branch={} commit_position={}",
                 ctx.domain, ctx.branch, commit_position
             );
@@ -3046,7 +3046,7 @@ async fn io_run_index_pipeline_stream(
 
         // Aggressively prune untagged intermediate versions after tagging.
         if let Err(e) = ctx.store.io_cleanup_aggressive(ctx.domain, ctx.branch).await {
-            eprintln!("[pipeline] aggressive cleanup failed (soft): {}", e);
+            log::warn!("[pipeline] aggressive cleanup failed (soft): {}", e);
         }
     } else {
         // No-op commit: tag at current version.

@@ -43,13 +43,13 @@ macro_rules! perf_mark {
     ($start:expr, $label:expr) => {
         if perf_enabled() {
             let elapsed = $start.elapsed();
-            eprintln!("[resolve-perf] {}: {:.1}ms", $label, elapsed.as_secs_f64() * 1000.0);
+            log::debug!("[resolve-perf] {}: {:.1}ms", $label, elapsed.as_secs_f64() * 1000.0);
         }
     };
     ($start:expr, $label:expr, $($arg:tt)*) => {
         if perf_enabled() {
             let elapsed = $start.elapsed();
-            eprintln!("[resolve-perf] {} ({}): {:.1}ms", $label, format!($($arg)*), elapsed.as_secs_f64() * 1000.0);
+            log::debug!("[resolve-perf] {} ({}): {:.1}ms", $label, format!($($arg)*), elapsed.as_secs_f64() * 1000.0);
         }
     };
 }

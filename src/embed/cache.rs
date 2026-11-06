@@ -102,7 +102,7 @@ impl EmbedCache {
                     Err(sled::Error::Io(ref e))
                         if e.to_string().contains("could not acquire lock") =>
                     {
-                        eprintln!(
+                        log::warn!(
                             "[vectorlink] embed cache disabled: could not acquire lock on {} — \
                              another vectorlink process is using this data directory; \
                              running read-only (search queries only)",
