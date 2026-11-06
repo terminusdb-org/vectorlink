@@ -115,6 +115,7 @@ impl LanceStore {
     ///
     /// Called from `run_server()` on startup, before the server starts listening.
     pub async fn io_cleanup_compaction_branches(&self) -> Result<Vec<(String, String)>, StoreError> {
+        self.ensure_writable()?;
         let domains = self.discover_on_disk_datasets();
         let mut cleaned: Vec<(String, String)> = Vec::new();
 
@@ -124,7 +125,7 @@ impl LanceStore {
                 .io_cleanup_orphaned_tags_and_stale_branches(domain)
                 .await
                 .unwrap_or_else(|e| {
-                    eprintln!(
+                    log::warn!(
                         "[startup] WARNING: orphaned tag/stale branch cleanup failed for domain '{}': {}",
                         domain, e
                     );
@@ -152,6 +153,7 @@ impl LanceStore {
         &self,
         domain: &str,
     ) -> Result<Vec<(String, String)>, StoreError> {
+        self.ensure_writable()?;
         let path = self.dataset_path(domain);
         if !path.exists() {
             return Ok(Vec::new());
@@ -186,8 +188,8 @@ impl LanceStore {
             .collect();
 
         if !orphaned_tags.is_empty() {
-            eprintln!(
-                "[cleanup] domain={} deleting {} orphaned tags (point to non-existent branches)",
+            log::debug!(
+                "[garbage collection] domain={} deleting {} orphaned tags (point to non-existent branches)",
                 domain,
                 orphaned_tags.len()
             );
@@ -196,15 +198,15 @@ impl LanceStore {
                 let ds_main = ds_main_arc.write().await;
                 match ds_main.tags().delete(tag_name).await {
                     Ok(()) => {
-                        eprintln!(
-                            "[cleanup] domain={} deleted orphaned tag '{}'",
+                        log::debug!(
+                            "[garbage collection] domain={} deleted orphaned tag '{}'",
                             domain, tag_name
                         );
                         cleaned.push((domain.to_owned(), format!("orphaned_tag:{}", tag_name)));
                     }
                     Err(e) => {
-                        eprintln!(
-                            "[cleanup] domain={} WARNING: failed to delete orphaned tag '{}': {}",
+                        log::warn!(
+                            "[garbage collection] domain={} WARNING: failed to delete orphaned tag '{}': {}",
                             domain, tag_name, e
                         );
                     }
@@ -238,23 +240,23 @@ impl LanceStore {
                 continue;
             }
 
-            eprintln!(
-                "[cleanup] domain={} deleting stale rebuild branch '{}' (no tags reference it)",
+            log::debug!(
+                "[garbage collection] domain={} deleting stale rebuild branch '{}' (no tags reference it)",
                 domain, branch
             );
 
             let mut ds_fresh = self.io_open_fresh(&uri).await?;
             match ds_fresh.delete_branch(branch).await {
                 Ok(()) => {
-                    eprintln!(
-                        "[cleanup] domain={} deleted stale rebuild branch '{}'",
+                    log::debug!(
+                        "[garbage collection] domain={} deleted stale rebuild branch '{}'",
                         domain, branch
                     );
                     cleaned.push((domain.to_owned(), format!("stale_branch:{}", branch)));
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[cleanup] domain={} WARNING: failed to delete stale rebuild branch '{}': {}",
+                    log::warn!(
+                        "[garbage collection] domain={} WARNING: failed to delete stale rebuild branch '{}': {}",
                         domain, branch, e
                     );
                 }
@@ -266,23 +268,23 @@ impl LanceStore {
         // even when no orphaned tags or stale branches were found.
         if !cleaned.is_empty() {
             if let Err(e) = self.io_cleanup_aggressive(domain, "main").await {
-                eprintln!(
-                    "[cleanup] domain={} WARNING: aggressive cleanup after orphaned tag removal failed: {}",
+                log::warn!(
+                    "[garbage collection] domain={} WARNING: compaction pass after orphaned tag removal failed: {}",
                     domain, e
                 );
             }
         }
 
         if let Err(e) = self.io_prune_stale_index_dirs(domain, "main").await {
-            eprintln!(
-                "[cleanup] domain={} WARNING: prune stale index dirs failed: {}",
+            log::warn!(
+                "[garbage collection] domain={} WARNING: removing unreferenced index dirs failed: {}",
                 domain, e
             );
         }
 
         if let Err(e) = self.io_prune_empty_index_dirs(domain) {
-            eprintln!(
-                "[cleanup] domain={} WARNING: prune empty index dirs failed: {}",
+            log::warn!(
+                "[garbage collection] domain={} WARNING: prune empty index dirs failed: {}",
                 domain, e
             );
         }
@@ -439,6 +441,7 @@ impl LanceStore {
         ds: &mut lance::dataset::Dataset,
         delta: &VersionDelta,
     ) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
         use arrow_array::RecordBatchIterator;
         use lance::dataset::write::DeleteBuilder;
         use lance::deps::datafusion::logical_expr::{col, lit, in_list};
@@ -632,6 +635,7 @@ impl LanceStore {
         commit: &str,
         version: u64,
     ) -> Result<(), StoreError> {
+        self.ensure_writable()?;
         let tag = layeridx::encode_commit_tag(commit);
 
         if branch == MAIN_BRANCH {
@@ -700,6 +704,7 @@ impl LanceStore {
         branch: &str,
         _compact_version: u64,
     ) -> Result<(usize, usize), StoreError> {
+        self.ensure_writable()?;
         let commit_versions = self.io_list_commit_versions(domain).await?;
 
         if commit_versions.len() <= 2 {
@@ -747,7 +752,7 @@ impl LanceStore {
             return Ok((total_tags, 0));
         }
 
-        eprintln!(
+        log::debug!(
             "[retag] domain={} branch={} total_tags={} retagging {} intermediate tags to boundaries ({} boundaries retained)",
             domain, branch, total_tags, retag_plan.len(), boundary_positions.len()
         );
@@ -768,7 +773,7 @@ impl LanceStore {
                 .create(&old_tag, *new_version)
                 .await
                 .map_err(|e| StoreError::Internal(format!("retag: create tag failed: {}", e)))?;
-            eprintln!(
+            log::debug!(
                 "[retag] {}: version {}→{}",
                 commit, old_version, new_version
             );
@@ -780,7 +785,7 @@ impl LanceStore {
         // Refresh cached dataset so tag changes are visible.
         self.io_refresh_cached_dataset(domain, branch).await?;
 
-        eprintln!(
+        log::debug!(
             "[retag] domain={} branch={} retagged {}/{} tags ({} boundaries retained)",
             domain, branch, retagged, total_tags, boundary_positions.len()
         );
@@ -810,6 +815,7 @@ impl LanceStore {
         branch: &str,
         _compact_version: u64,
     ) -> Result<(usize, usize), StoreError> {
+        self.ensure_writable()?;
         let commit_versions = self.io_list_commit_versions(domain).await?;
 
         if commit_versions.len() <= 2 {
@@ -839,7 +845,7 @@ impl LanceStore {
         // at a base-3 boundary position and become a boundary then.
         boundary_positions.remove(&(total_tags - 1));
 
-        eprintln!(
+        log::debug!(
             "[delta-fork] domain={} branch={} total_tags={} boundaries={:?}",
             domain, branch, total_tags, boundary_positions
         );
@@ -909,7 +915,7 @@ impl LanceStore {
                     // this commit was an intermediate). In that case, Phase 2b will
                     // migrate it to the new rebuild branch.
                     boundary_versions.push((commit.clone(), new_version));
-                    eprintln!(
+                    log::debug!(
                         "[delta-fork] boundary commit {} at rebuild version {} (no retag)",
                         commit, new_version
                     );
@@ -921,7 +927,7 @@ impl LanceStore {
 
                     retag_plan.push((commit.clone(), indexed_version));
 
-                    eprintln!(
+                    log::debug!(
                         "[delta-fork] intermediate commit {} at rebuild version {} → indexed version {} (will retag)",
                         commit, new_version, indexed_version
                     );
@@ -934,14 +940,14 @@ impl LanceStore {
         if let Err(e) = phase1_result {
             // Phase 1 failed — delete the rebuild branch so no stale branch
             // is left on disk. Tags were not touched, so the state is clean.
-            eprintln!(
+            log::warn!(
                 "[delta-fork] Phase 1 failed, deleting rebuild branch '{}': {}",
                 rebuild_branch, e
             );
             drop(ds_rebuild);
             let mut ds_fresh = self.io_open_fresh(&uri).await?;
             if let Err(del_e) = ds_fresh.delete_branch(&rebuild_branch).await {
-                eprintln!(
+                log::warn!(
                     "[delta-fork] WARNING: failed to delete rebuild branch '{}' after Phase 1 failure: {}",
                     rebuild_branch, del_e
                 );
@@ -949,7 +955,7 @@ impl LanceStore {
             return Err(e);
         }
 
-        eprintln!(
+        log::debug!(
             "[delta-fork] Phase 1 complete: {} intermediate commits ready for retagging",
             retag_plan.len()
         );
@@ -980,7 +986,7 @@ impl LanceStore {
                 .create(&tag, *indexed_version)
                 .await
                 .map_err(|e| StoreError::Internal(format!("delta-fork retag: create tag failed: {}", e)))?;
-            eprintln!(
+            log::debug!(
                 "[delta-fork] retagged {} → version {} (on {} handle)",
                 commit, indexed_version, rebuild_branch
             );
@@ -1017,7 +1023,7 @@ impl LanceStore {
                             .create(&tag, *version)
                             .await
                             .map_err(|e| StoreError::Internal(format!("delta-fork boundary migration: create tag failed: {}", e)))?;
-                        eprintln!(
+                        log::debug!(
                             "[delta-fork] migrated boundary tag {} from {} → version {} on {}",
                             commit, tag_branch, version, rebuild_branch
                         );
@@ -1027,7 +1033,7 @@ impl LanceStore {
             }
         }
         if migrated > 0 {
-            eprintln!(
+            log::debug!(
                 "[delta-fork] Phase 2b: migrated {} boundary tags from old rebuild branches",
                 migrated
             );
@@ -1049,10 +1055,10 @@ impl LanceStore {
                 let mut ds_fresh = self.io_open_fresh(&uri).await?;
                 match ds_fresh.delete_branch(old_branch).await {
                     Ok(()) => {
-                        eprintln!("[delta-fork] deleted old rebuild branch {}", old_branch);
+                        log::debug!("[delta-fork] deleted old rebuild branch {}", old_branch);
                     }
                     Err(e) => {
-                        eprintln!(
+                        log::warn!(
                             "[delta-fork] WARNING: failed to delete old rebuild branch {}: {}",
                             old_branch, e
                         );
@@ -1069,7 +1075,7 @@ impl LanceStore {
             .io_cleanup_orphaned_tags_and_stale_branches(domain)
             .await
         {
-            eprintln!(
+            log::warn!(
                 "[delta-fork] WARNING: orphaned tag/stale branch cleanup failed: {}",
                 e
             );
@@ -1078,7 +1084,7 @@ impl LanceStore {
         // Refresh cached dataset so tag changes are visible.
         self.io_refresh_cached_dataset(domain, branch).await?;
 
-        eprintln!(
+        log::debug!(
             "[delta-fork] domain={} branch={} retagged {}/{} tags ({} boundaries retained, {} migrated), rebuild branch={}",
             domain, branch, retagged, total_tags, boundary_positions.len(), migrated, rebuild_branch
         );
@@ -1121,6 +1127,7 @@ impl LanceStore {
         source_commit: &str,
         target_commit: &str,
     ) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
         let source_version = self
             .io_resolve_commit(domain, branch, source_commit)
             .await?

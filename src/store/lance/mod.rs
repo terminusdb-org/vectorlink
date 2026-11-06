@@ -234,6 +234,11 @@ pub struct LanceStore {
     /// rebuild-branch index files. Default is `CurrentCode` (existing
     /// FIX-B behaviour). Can be changed at runtime for testing.
     pub(super) cleanup_mode: std::sync::atomic::AtomicU8,
+    /// Read-only mode: another process holds the data-dir write lock (the
+    /// embed-cache sled lock is the signal). All io_* write methods refuse
+    /// with `StoreError::ReadOnly`; search queries still work — Lance reads
+    /// are snapshot-safe under a single live writer.
+    read_only: std::sync::atomic::AtomicBool,
 }
 
 impl LanceStore {
@@ -272,7 +277,33 @@ impl LanceStore {
             lance_metadata_cache_capacity: lance_metadata_cache_bytes,
             index_delta_counts: RwLock::new(HashMap::new()),
             cleanup_mode: std::sync::atomic::AtomicU8::new(CleanupMode::CurrentCode as u8),
+            read_only: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Mark the store read-only (data-dir write lock held by another
+    /// process). Every io_* write method then refuses with
+    /// `StoreError::ReadOnly` — a second instance on one data dir answers
+    /// search queries but never races the writer.
+    pub fn set_read_only(&self, read_only: bool) {
+        self.read_only
+            .store(read_only, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the store is read-only.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Guard placed at the top of every io_* write method.
+    pub(super) fn ensure_writable(&self) -> Result<(), StoreError> {
+        if self.is_read_only() {
+            return Err(StoreError::ReadOnly(format!(
+                "data dir {} is write-locked by another process — writes refused",
+                self.base_dir.display()
+            )));
+        }
+        Ok(())
     }
 
     /// Set the cleanup mode. Controls how version cleanup interacts with
@@ -328,11 +359,11 @@ impl LanceStore {
                     }
                 }
                 match std::fs::remove_dir(&backup) {
-                    Ok(()) => eprintln!(
+                    Ok(()) => log::debug!(
                         "[startup] recovered stranded _indices_backup_fixb entries in {}",
                         path.display()
                     ),
-                    Err(e) => eprintln!(
+                    Err(e) => log::warn!(
                         "[startup] WARNING: merged entries but could not remove {}: {}",
                         backup.display(),
                         e
@@ -340,11 +371,11 @@ impl LanceStore {
                 }
             } else {
                 match std::fs::rename(&backup, &indices) {
-                    Ok(()) => eprintln!(
+                    Ok(()) => log::debug!(
                         "[startup] restored _indices from stranded backup in {}",
                         path.display()
                     ),
-                    Err(e) => eprintln!(
+                    Err(e) => log::warn!(
                         "[startup] WARNING: failed to restore {}: {}",
                         backup.display(),
                         e
@@ -373,7 +404,7 @@ impl LanceStore {
                 .map(|(k, _)| k.clone());
             match oldest {
                 Some(domain) => {
-                    eprintln!("[cache] evicting LRU dataset handle: {}", domain);
+                    log::debug!("[cache] evicting LRU dataset handle: {}", domain);
                     datasets.remove(&domain);
                 }
                 None => break,
@@ -607,6 +638,7 @@ impl LanceStore {
         let ds = if path.exists() {
             self.io_open_fresh(&uri).await?
         } else {
+            self.ensure_writable()?;
             // Create a new empty dataset with the schema.
             let schema = self.chunk_schema();
             let empty_batch = self.empty_batch();
@@ -681,6 +713,7 @@ impl LanceStore {
         domain: &str,
         branch: &str,
     ) -> Result<Dataset, StoreError> {
+        self.ensure_writable()?;
         let path = self.dataset_path(domain);
         let uri = path.to_string_lossy().to_string();
         // Write path: a fresh branch-bound handle is intentional (it must not
@@ -765,6 +798,7 @@ impl LanceStore {
         branch: &str,
         from_version: u64,
     ) -> Result<(), StoreError> {
+        self.ensure_writable()?;
         if branch == MAIN_BRANCH {
             return Err(StoreError::Internal(
                 "cannot create the default 'main' branch — it always exists".to_owned(),
@@ -806,6 +840,7 @@ impl LanceStore {
         branch: &str,
         commit: &str,
     ) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
         if branch == MAIN_BRANCH {
             return Err(StoreError::Internal(
                 "cannot create the default 'main' branch — it always exists".to_owned(),
@@ -955,6 +990,7 @@ impl LanceStore {
         domain: &str,
         _branch: &str,
     ) -> Result<(), StoreError> {
+        self.ensure_writable()?;
         let path = self.dataset_path(domain);
         if !path.exists() {
             return Ok(());
@@ -1042,6 +1078,7 @@ impl LanceStore {
         domain: &str,
         _branch: &str,
     ) -> Result<(), StoreError> {
+        self.ensure_writable()?;
         let path = self.dataset_path(domain);
         if !path.exists() {
             return Ok(());
@@ -1110,8 +1147,8 @@ impl LanceStore {
         let stats = cleanup_result
             .map_err(|e| StoreError::Internal(format!("aggressive cleanup failed: {}", e)))?;
 
-        eprintln!(
-            "[cleanup_aggressive] main: removed {} bytes, {} old versions, {} data files, {} index files",
+        log::debug!(
+            "[garbage collection] main: removed {} bytes, {} old versions, {} data files, {} index files",
             stats.bytes_removed, stats.old_versions, stats.data_files_removed, stats.index_files_removed
         );
 
@@ -1120,10 +1157,10 @@ impl LanceStore {
         // This runs under the pipeline lock (caller holds it), so the
         // TOCTOU race with concurrent index creation is prevented.
         if let Err(e) = self.io_prune_stale_index_dirs(domain, _branch).await {
-            eprintln!("[cleanup_aggressive] prune stale index dirs failed (soft): {}", e);
+            log::warn!("[garbage collection] removing unreferenced index dirs failed (soft): {}", e);
         }
         if let Err(e) = self.io_prune_empty_index_dirs(domain) {
-            eprintln!("[cleanup_aggressive] prune empty index dirs failed (soft): {}", e);
+            log::warn!("[garbage collection] prune empty index dirs failed (soft): {}", e);
         }
 
         Ok(())
@@ -1138,6 +1175,7 @@ impl LanceStore {
     ///
     /// Returns the count of directories removed.
     pub fn io_prune_empty_index_dirs(&self, domain: &str) -> Result<usize, StoreError> {
+        self.ensure_writable()?;
         let path = self.dataset_path(domain);
         let indices_dir = path.join("_indices");
 
@@ -1152,7 +1190,7 @@ impl LanceStore {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("[cleanup] prune: skipping unreadable entry: {}", e);
+                    log::warn!("[garbage collection] prune: skipping unreadable entry: {}", e);
                     continue;
                 }
             };
@@ -1179,8 +1217,8 @@ impl LanceStore {
                 match std::fs::remove_dir_all(&dir_path) {
                     Ok(_) => removed += 1,
                     Err(e) => {
-                        eprintln!(
-                            "[cleanup] prune: failed to remove empty dir {:?}: {}",
+                        log::warn!(
+                            "[garbage collection] prune: failed to remove empty dir {:?}: {}",
                             dir_path, e
                         );
                     }
@@ -1189,7 +1227,7 @@ impl LanceStore {
         }
 
         if removed > 0 {
-            eprintln!("[cleanup] pruned {} empty index directories", removed);
+            log::debug!("[garbage collection] pruned {} empty index directories", removed);
         }
 
         Ok(removed)
@@ -1218,6 +1256,7 @@ impl LanceStore {
         domain: &str,
         _branch: &str,
     ) -> Result<usize, StoreError> {
+        self.ensure_writable()?;
         let path = self.dataset_path(domain);
         let indices_dir = path.join("_indices");
 
@@ -1230,8 +1269,8 @@ impl LanceStore {
         // for any reason, we must NOT prune, or we risk deleting live index dirs.
         let live_uuids = self.io_collect_all_live_index_uuids_strict(domain).await?;
 
-        eprintln!(
-            "[cleanup] prune stale: {} live index UUIDs from all tagged versions",
+        log::debug!(
+            "[garbage collection] index dir scan: keeping {} index versions referenced by tagged commits; looking for unreferenced dirs",
             live_uuids.len(),
         );
 
@@ -1243,7 +1282,7 @@ impl LanceStore {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("[cleanup] prune stale: skipping unreadable entry: {}", e);
+                    log::warn!("[garbage collection] prune stale: skipping unreadable entry: {}", e);
                     continue;
                 }
             };
@@ -1257,15 +1296,15 @@ impl LanceStore {
             let dir_uuid = dir_name.to_string_lossy().to_string();
 
             if !live_uuids.contains(&dir_uuid) {
-                eprintln!(
-                    "[cleanup] prune stale: removing stale index dir {} (not in live set of {} UUIDs)",
-                    dir_uuid, live_uuids.len()
+                log::debug!(
+                    "[garbage collection] index dir scan: removing unreferenced index dir {}",
+                    dir_uuid
                 );
                 match std::fs::remove_dir_all(&dir_path) {
                     Ok(_) => removed += 1,
                     Err(e) => {
-                        eprintln!(
-                            "[cleanup] prune stale: failed to remove dir {:?}: {}",
+                        log::warn!(
+                            "[garbage collection] prune stale: failed to remove dir {:?}: {}",
                             dir_path, e
                         );
                     }
@@ -1274,7 +1313,7 @@ impl LanceStore {
         }
 
         if removed > 0 {
-            eprintln!("[cleanup] pruned {} stale index directories", removed);
+            log::debug!("[garbage collection] pruned {} stale index directories", removed);
         }
 
         Ok(removed)

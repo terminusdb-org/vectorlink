@@ -135,7 +135,7 @@ pub async fn io_exponential_rollup(
         return Ok((count_before, count_before));
     }
 
-    eprintln!(
+    log::debug!(
         "[rollup] {} indices, base={}, partitions={:?}",
         count_before, base, partitions
     );
@@ -145,7 +145,7 @@ pub async fn io_exponential_rollup(
     // the oldest indices), then progressively smaller groups.
     for (start, end) in partitions.iter().rev() {
         let size = end - start + 1;
-        eprintln!("[rollup] merging {} indices (range {}..{})", size, start, end);
+        log::debug!("[rollup] merging {} indices (range {}..{})", size, start, end);
         ds.optimize_indices(&OptimizeOptions::merge(size))
             .await
             .map_err(|e| {
@@ -160,7 +160,7 @@ pub async fn io_exponential_rollup(
 
     let count_after = indices_after.len();
 
-    eprintln!(
+    log::debug!(
         "[rollup] indices {}→{} ({} merges)",
         count_before,
         count_after,
@@ -217,7 +217,7 @@ pub async fn io_incremental_cascade(
         return Ok((count_before, count_before));
     }
 
-    eprintln!(
+    log::debug!(
         "[cascade] {} indices, delta_count={}, merges_needed={}",
         count_before, delta_count, needed
     );
@@ -229,14 +229,14 @@ pub async fn io_incremental_cascade(
             .map_err(|e| StoreError::Internal(format!("load indices in cascade failed: {}", e)))?;
 
         if indices.len() < 3 {
-            eprintln!(
+            log::debug!(
                 "[cascade] stopping at merge {}/{} — only {} indices < 3",
                 i + 1, needed, indices.len()
             );
             break;
         }
 
-        eprintln!(
+        log::debug!(
             "[cascade] merge {}/{} ({} indices → merge(3))",
             i + 1, needed, indices.len()
         );
@@ -253,7 +253,7 @@ pub async fn io_incremental_cascade(
 
     let count_after = indices_after.len();
 
-    eprintln!(
+    log::debug!(
         "[cascade] indices {}→{} ({} merges attempted)",
         count_before, count_after, needed
     );
@@ -321,7 +321,7 @@ mod tests {
 
         let indices_after_append = ds.load_indices().await.expect("load indices after append");
         let count_after_append = indices_after_append.len();
-        eprintln!(
+        log::debug!(
             "[merge3_test] indices after create={}, after append={}",
             count_after_create, count_after_append
         );
@@ -337,7 +337,7 @@ mod tests {
         let indices_after_merge = ds.load_indices().await.expect("load indices after merge");
         let count_after_merge = indices_after_merge.len();
 
-        eprintln!(
+        log::debug!(
             "[merge3_test] merge(3) completed in {:?}, indices {}→{}→{}",
             elapsed, count_after_create, count_after_append, count_after_merge
         );

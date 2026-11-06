@@ -46,4 +46,9 @@ pub enum IngestError {
 pub enum StoreError {
     #[error("store error: {0}")]
     Internal(String),
+
+    /// Another process holds the data-dir write lock — this instance opened
+    /// read-only. Writes are refused; search queries still work.
+    #[error("read-only: {0}")]
+    ReadOnly(String),
 }
