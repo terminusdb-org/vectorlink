@@ -119,26 +119,39 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     lance_store.set_dataset_cache_max(config.dataset_cache_max);
     let lance_store = Arc::new(lance_store);
 
+    // Probe the embed cache: a held sled lock means another process owns
+    // this data dir — run read-only (search queries only). Opened once and
+    // handed to the service — a second open would see this process's own
+    // lock and falsely report read-only.
+    let embed_cache = vectorlink::embed::cache::EmbedCache::open(
+        &data_dir.join("embed_cache"),
+        config.embed_cache_size,
+    );
+
+    // Clone the store Arc for the shutdown handler (before it's moved into SearchService).
+    let store_for_shutdown = Arc::clone(&lance_store);
+    let service = SearchService::new_with_cache(lance_store, config.clone(), tokenizer, embed_cache);
+
     // Startup cleanup: delete any stale __compact_rebuild branches left by
     // a crashed compaction. This is a critical safety check — a lingering
     // rebuild branch indicates a crashed compaction and should not be served.
-    let cleaned = lance_store.io_cleanup_compaction_branches().await?;
-    if !cleaned.is_empty() {
-        eprintln!(
-            "[startup] cleaned {} stale {} branch(es) from crashed compaction(s)",
-            cleaned.len(),
-            vectorlink::store::lance::COMPACT_REBUILD_PREFIX
-        );
+    // A write — skipped entirely in read-only mode.
+    if !service.is_read_only() {
+        let cleaned = store_for_shutdown.io_cleanup_compaction_branches().await?;
+        if !cleaned.is_empty() {
+            eprintln!(
+                "[startup] cleaned {} stale {} branch(es) from crashed compaction(s)",
+                cleaned.len(),
+                vectorlink::store::lance::COMPACT_REBUILD_PREFIX
+            );
+        }
     }
 
     let port = config.port;
     let data_dir = config.data_dir.clone();
     let model_name = config.embed_provider.model_name().to_owned();
     let prometheus_port = config.prometheus_port;
-    // Clone the store Arc for the shutdown handler (before it's moved into SearchService).
-    let store_for_shutdown = Arc::clone(&lance_store);
 
-    let service = SearchService::new(lance_store, config.clone(), tokenizer);
     let app = http_api::router(service.clone(), config);
 
     // Spawn Prometheus metrics server on a separate port if configured.

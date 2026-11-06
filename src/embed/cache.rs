@@ -37,6 +37,9 @@ const SLED_CACHE_CAPACITY_BYTES: u64 = 5_000 * 4096;
 pub struct EmbedCache {
     db: Option<sled::Db>,
     enabled: bool,
+    /// True when `open` found the sled lock held by another process — the
+    /// signal the engine uses to switch the whole store read-only.
+    locked_elsewhere: bool,
     /// Atomic entry counter shared across all clones via Arc.
     /// Incremented on `put`, never decremented (sled doesn't expose eviction
     /// callbacks). Initialized lazily on first `len()` call by scanning the
@@ -50,6 +53,7 @@ impl Clone for EmbedCache {
         Self {
             db: self.db.clone(),
             enabled: self.enabled,
+            locked_elsewhere: self.locked_elsewhere,
             entry_count: std::sync::Arc::clone(&self.entry_count),
         }
     }
@@ -61,6 +65,7 @@ impl EmbedCache {
         Self {
             db: None,
             enabled: false,
+            locked_elsewhere: false,
             entry_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -72,34 +77,52 @@ impl EmbedCache {
     /// persists all entries to disk and uses LRU eviction for in-memory pages.
     pub fn open(path: &Path, max_entries: Option<usize>) -> Self {
         match max_entries {
-            None => Self {
-                db: None,
-                enabled: false,
-                entry_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            },
+            None => Self::disabled(),
             Some(_) => {
-                let db = sled::Config::default()
+                let open_result = sled::Config::default()
                     .path(path)
                     .flush_every_ms(Some(SLED_FLUSH_MS))
                     .cache_capacity(SLED_CACHE_CAPACITY_BYTES)
-                    .open()
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "failed to open sled embed cache at {}: {} — \
-                             if this is a lock acquisition error, another vectorlink process is \
-                             using the same data directory (check for a running instance or a \
-                             stale process holding the sled lock)",
-                            path.display(),
-                            e
-                        )
-                    });
-                Self {
-                    db: Some(db),
-                    enabled: true,
-                    entry_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
+                    .open();
+                match open_result {
+                    Ok(db) => Self {
+                        db: Some(db),
+                        enabled: true,
+                        locked_elsewhere: false,
+                        entry_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                            usize::MAX,
+                        )),
+                    },
+                    // Another process holds the sled lock: degrade to a
+                    // disabled cache instead of panicking — lookups miss and
+                    // repeat embeddings get recomputed (slower, still correct).
+                    // sled squashes the lock failure to io ErrorKind::Other
+                    // with the original os error only in the message text —
+                    // the message is the sole reliable discriminator.
+                    Err(sled::Error::Io(ref e))
+                        if e.to_string().contains("could not acquire lock") =>
+                    {
+                        eprintln!(
+                            "[vectorlink] embed cache disabled: could not acquire lock on {} — \
+                             another vectorlink process is using this data directory; \
+                             running read-only (search queries only)",
+                            path.display()
+                        );
+                        Self {
+                            locked_elsewhere: true,
+                            ..Self::disabled()
+                        }
+                    }
+                    Err(e) => panic!("failed to open sled embed cache at {}: {}", path.display(), e),
                 }
             }
         }
+    }
+
+    /// True when `open` found the sled lock held by another process.
+    /// Callers use this as the signal to open the whole store read-only.
+    pub fn locked_elsewhere(&self) -> bool {
+        self.locked_elsewhere
     }
 
     /// Compute the 32-byte SHA-256 cache key from model name and prefixed text.
@@ -312,5 +335,21 @@ mod tests {
         let (_dir, cache) = make_tmp_cache();
         let key = EmbedCache::cache_key("model", "never_stored");
         assert!(cache.get(&key, 768).is_none(), "missing key → None");
+    }
+
+    #[test]
+    fn second_open_on_locked_dir_disables_cache() {
+        let dir = TempDir::new().expect("tempdir");
+        let _first = EmbedCache::open(dir.path(), Some(1000));
+        // A second instance on the same data dir must not panic on the sled
+        // lock: it degrades to a disabled cache (embeddings get recomputed).
+        let second = EmbedCache::open(dir.path(), Some(1000));
+        assert!(!second.is_enabled(), "locked sled dir → cache disabled");
+        assert!(second.locked_elsewhere(), "lock held elsewhere → flag set");
+        assert!(!_first.locked_elsewhere(), "lock holder → flag unset");
+        let key = EmbedCache::cache_key("model", "text");
+        assert!(second.get(&key, 768).is_none(), "disabled cache misses");
+        second.put(&key, &[0.1_f32; 768]);
+        assert_eq!(second.len(), 0, "disabled put is a no-op");
     }
 }

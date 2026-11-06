@@ -529,7 +529,12 @@ async fn handle_push(
                         }
                         Err(e) => {
                             let error_msg = format!("malformed NDJSON at line {}: {}", line_num, e);
-                            state.service.record_error_task(&task_id, error_msg).await;
+                            state.service.record_error_task(&task_id, error_msg.clone()).await;
+                            // Feed the parse failure into the pipeline as an
+                            // Operation::Error so it lands in `skipped` — the
+                            // truncated-push error then reports the real cause
+                            // instead of a bare "received 0".
+                            let _ = op_tx.send(Operation::Error { message: error_msg }).await;
                             // Drop op_tx to signal the pipeline to stop.
                             drop(op_tx);
                             return;

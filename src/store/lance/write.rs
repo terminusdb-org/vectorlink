@@ -29,6 +29,7 @@ impl LanceStore {
         doc_id: &str,
         rows: &[ChunkRow],
     ) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
         if rows.is_empty() {
             return Ok(0);
         }
@@ -101,6 +102,7 @@ impl LanceStore {
         delete_ids: &[String],
         rows: &[ChunkRow],
     ) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
         // Serialise dataset creation against DELETE /domain (BLOCKER-2 / #6):
         let _domain_guard = self.acquire_domain_guard(domain).await;
 
@@ -160,6 +162,7 @@ impl LanceStore {
         ds: &mut Dataset,
         rows: &[ChunkRow],
     ) -> Result<(), StoreError> {
+        self.ensure_writable()?;
         if rows.is_empty() {
             return Ok(());
         }
@@ -180,6 +183,7 @@ impl LanceStore {
         ds: &mut Dataset,
         delete_ids: &[String],
     ) -> Result<(), StoreError> {
+        self.ensure_writable()?;
         if delete_ids.is_empty() {
             return Ok(());
         }
@@ -201,6 +205,7 @@ impl LanceStore {
         branch: &str,
         doc_id: &str,
     ) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
         // A delete against a domain that does not exist is a no-op — it must NOT
         // create the dataset (BLOCKER-2 resurrection guard). Only a genuine
         // insert/change creates a domain.

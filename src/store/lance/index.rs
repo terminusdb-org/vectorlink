@@ -27,6 +27,7 @@ impl LanceStore {
         domain: &str,
         branch: &str,
     ) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
         let ds_arc = self.io_open_dataset(domain, branch).await?;
         let mut ds = ds_arc.write().await;
 
@@ -59,6 +60,7 @@ impl LanceStore {
         domain: &str,
         branch: &str,
     ) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
         let ds_arc = self.io_open_dataset(domain, branch).await?;
         let mut ds = ds_arc.write().await;
 

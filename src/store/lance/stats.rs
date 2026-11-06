@@ -355,6 +355,7 @@ impl LanceStore {
     /// intact — never a half-deleted footprint (searchable map entry with no
     /// dataset, or a dataset with no map entry).
     pub async fn io_delete_domain(&self, domain: &str) -> Result<(), StoreError> {
+        self.ensure_writable()?;
         // Hold the per-domain guard across the WHOLE remove-then-purge so a
         // concurrent first-write that creates the dataset cannot interleave
         // (BLOCKER-2 / #6): either the create completes before we remove (and we
@@ -437,6 +438,7 @@ impl LanceStore {
         domain: &str,
         branch: &str,
     ) -> Result<(), StoreError> {
+        self.ensure_writable()?;
         let key: BranchKey = (domain.to_owned(), branch.to_owned());
 
         // 1. Cancel any in-flight pipeline task for this branch.

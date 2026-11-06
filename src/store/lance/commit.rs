@@ -115,6 +115,7 @@ impl LanceStore {
     ///
     /// Called from `run_server()` on startup, before the server starts listening.
     pub async fn io_cleanup_compaction_branches(&self) -> Result<Vec<(String, String)>, StoreError> {
+        self.ensure_writable()?;
         let domains = self.discover_on_disk_datasets();
         let mut cleaned: Vec<(String, String)> = Vec::new();
 
@@ -152,6 +153,7 @@ impl LanceStore {
         &self,
         domain: &str,
     ) -> Result<Vec<(String, String)>, StoreError> {
+        self.ensure_writable()?;
         let path = self.dataset_path(domain);
         if !path.exists() {
             return Ok(Vec::new());
@@ -187,7 +189,7 @@ impl LanceStore {
 
         if !orphaned_tags.is_empty() {
             eprintln!(
-                "[cleanup] domain={} deleting {} orphaned tags (point to non-existent branches)",
+                "[garbage collection] domain={} deleting {} orphaned tags (point to non-existent branches)",
                 domain,
                 orphaned_tags.len()
             );
@@ -197,14 +199,14 @@ impl LanceStore {
                 match ds_main.tags().delete(tag_name).await {
                     Ok(()) => {
                         eprintln!(
-                            "[cleanup] domain={} deleted orphaned tag '{}'",
+                            "[garbage collection] domain={} deleted orphaned tag '{}'",
                             domain, tag_name
                         );
                         cleaned.push((domain.to_owned(), format!("orphaned_tag:{}", tag_name)));
                     }
                     Err(e) => {
                         eprintln!(
-                            "[cleanup] domain={} WARNING: failed to delete orphaned tag '{}': {}",
+                            "[garbage collection] domain={} WARNING: failed to delete orphaned tag '{}': {}",
                             domain, tag_name, e
                         );
                     }
@@ -239,7 +241,7 @@ impl LanceStore {
             }
 
             eprintln!(
-                "[cleanup] domain={} deleting stale rebuild branch '{}' (no tags reference it)",
+                "[garbage collection] domain={} deleting stale rebuild branch '{}' (no tags reference it)",
                 domain, branch
             );
 
@@ -247,14 +249,14 @@ impl LanceStore {
             match ds_fresh.delete_branch(branch).await {
                 Ok(()) => {
                     eprintln!(
-                        "[cleanup] domain={} deleted stale rebuild branch '{}'",
+                        "[garbage collection] domain={} deleted stale rebuild branch '{}'",
                         domain, branch
                     );
                     cleaned.push((domain.to_owned(), format!("stale_branch:{}", branch)));
                 }
                 Err(e) => {
                     eprintln!(
-                        "[cleanup] domain={} WARNING: failed to delete stale rebuild branch '{}': {}",
+                        "[garbage collection] domain={} WARNING: failed to delete stale rebuild branch '{}': {}",
                         domain, branch, e
                     );
                 }
@@ -267,7 +269,7 @@ impl LanceStore {
         if !cleaned.is_empty() {
             if let Err(e) = self.io_cleanup_aggressive(domain, "main").await {
                 eprintln!(
-                    "[cleanup] domain={} WARNING: aggressive cleanup after orphaned tag removal failed: {}",
+                    "[garbage collection] domain={} WARNING: compaction pass after orphaned tag removal failed: {}",
                     domain, e
                 );
             }
@@ -275,14 +277,14 @@ impl LanceStore {
 
         if let Err(e) = self.io_prune_stale_index_dirs(domain, "main").await {
             eprintln!(
-                "[cleanup] domain={} WARNING: prune stale index dirs failed: {}",
+                "[garbage collection] domain={} WARNING: removing unreferenced index dirs failed: {}",
                 domain, e
             );
         }
 
         if let Err(e) = self.io_prune_empty_index_dirs(domain) {
             eprintln!(
-                "[cleanup] domain={} WARNING: prune empty index dirs failed: {}",
+                "[garbage collection] domain={} WARNING: prune empty index dirs failed: {}",
                 domain, e
             );
         }
@@ -439,6 +441,7 @@ impl LanceStore {
         ds: &mut lance::dataset::Dataset,
         delta: &VersionDelta,
     ) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
         use arrow_array::RecordBatchIterator;
         use lance::dataset::write::DeleteBuilder;
         use lance::deps::datafusion::logical_expr::{col, lit, in_list};
@@ -632,6 +635,7 @@ impl LanceStore {
         commit: &str,
         version: u64,
     ) -> Result<(), StoreError> {
+        self.ensure_writable()?;
         let tag = layeridx::encode_commit_tag(commit);
 
         if branch == MAIN_BRANCH {
@@ -700,6 +704,7 @@ impl LanceStore {
         branch: &str,
         _compact_version: u64,
     ) -> Result<(usize, usize), StoreError> {
+        self.ensure_writable()?;
         let commit_versions = self.io_list_commit_versions(domain).await?;
 
         if commit_versions.len() <= 2 {
@@ -810,6 +815,7 @@ impl LanceStore {
         branch: &str,
         _compact_version: u64,
     ) -> Result<(usize, usize), StoreError> {
+        self.ensure_writable()?;
         let commit_versions = self.io_list_commit_versions(domain).await?;
 
         if commit_versions.len() <= 2 {
@@ -1121,6 +1127,7 @@ impl LanceStore {
         source_commit: &str,
         target_commit: &str,
     ) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
         let source_version = self
             .io_resolve_commit(domain, branch, source_commit)
             .await?

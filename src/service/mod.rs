@@ -189,6 +189,28 @@ impl SearchService {
             let cache_dir = std::path::Path::new(&config.data_dir).join("embed_cache");
             crate::embed::cache::EmbedCache::open(&cache_dir, config.embed_cache_size)
         };
+        Self::new_with_cache(store, config, tokenizer, embed_cache)
+    }
+
+    /// Construct the service with a caller-probed embed cache. Inits that
+    /// need the lock signal early (before running startup writes like
+    /// compaction-branch cleanup) open the cache first, then delegate here —
+    /// a second `EmbedCache::open` on the same dir would see its OWN lock and
+    /// falsely report read-only.
+    pub fn new_with_cache(
+        store: Arc<LanceStore>,
+        config: Config,
+        tokenizer: Tokenizer,
+        embed_cache: crate::embed::cache::EmbedCache,
+    ) -> Self {
+        if embed_cache.locked_elsewhere() {
+            store.set_read_only(true);
+            eprintln!(
+                "[vectorlink] read-only mode: data dir {} is write-locked by another \
+                 process — answering search queries only",
+                config.data_dir
+            );
+        }
         // Chunk budget: every produced chunk is embedded twice — Document role
         // on slot 1 and Clustering role on the clustering provider — so the
         // window must hold under the LONGEST applicable prefix, not just
@@ -285,6 +307,12 @@ impl SearchService {
     /// Check if the service is ready for search.
     pub fn is_search_ready(&self) -> bool {
         self.ready_search.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether the store is read-only (data-dir write lock held by another
+    /// process — this instance answers search queries only).
+    pub fn is_read_only(&self) -> bool {
+        self.store.is_read_only()
     }
 
     /// Get last-indexed commit for a (domain, branch).
@@ -2875,10 +2903,22 @@ async fn io_run_index_pipeline_stream(
     if let Some(expected) = expected_docs {
         let received = total_docs_seen + all_delete_ids.len() as u64;
         if received < expected {
-            let msg = format!(
-                "truncated push: expected {} document ops, received {}",
-                expected, received
-            );
+            // received counts New/Changed/Deleted only — a stream of
+            // Operation::Error entries (e.g. server-side render failures)
+            // or a producer-side parse abort yields 0 without these. The
+            // first failure is the real cause; include it so callers do
+            // not have to read the task record to diagnose the push.
+            let msg = if let Some(first) = skipped.first() {
+                format!(
+                    "truncated push: expected {} document ops, received {} (first failure: {})",
+                    expected, received, first.message
+                )
+            } else {
+                format!(
+                    "truncated push: expected {} document ops, received {}",
+                    expected, received
+                )
+            };
             if let Some(tx) = &progress_tx {
                 let _ = tx.send(ProgressUpdate::Error { error: msg.clone() }).await;
             }

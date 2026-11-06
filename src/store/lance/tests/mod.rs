@@ -11479,3 +11479,93 @@ fn stranded_indices_backup_merges_with_partial_indices() {
     assert!(indices.join("idx_new").exists());
     assert!(!backup.exists());
 }
+
+/// Read-only mode (data-dir write lock held by another process): every io_*
+/// write method refuses with StoreError::ReadOnly — a second instance on one
+/// data dir may answer search queries but must never race the writer.
+#[tokio::test]
+async fn read_only_store_refuses_writes_but_serves_reads() {
+    let (store, _tmp) = make_test_store(8);
+    store.set_read_only(true);
+    assert!(store.is_read_only());
+
+    let writes: Vec<StoreError> = vec![
+        store
+            .io_open_branch_for_write("acme", "main")
+            .await
+            .map(|_| ())
+            .unwrap_err(),
+        store
+            .io_create_branch("acme", "dev", 1)
+            .await
+            .unwrap_err(),
+        store
+            .io_tag_commit("acme", "main", "c1", 1)
+            .await
+            .unwrap_err(),
+        store
+            .io_delete_domain("acme")
+            .await
+            .unwrap_err(),
+        store
+            .io_cleanup_compaction_branches()
+            .await
+            .map(|_| ())
+            .unwrap_err(),
+    ];
+    assert!(
+        writes
+            .iter()
+            .all(|e| matches!(e, StoreError::ReadOnly(_))),
+        "every write must fail with ReadOnly, got: {:?}",
+        writes
+    );
+
+    // Reads unaffected: absent datasets resolve to None, no ReadOnly errors.
+    let missing = store
+        .io_open_dataset_readonly("acme")
+        .await
+        .expect("read open must not fail in read-only mode");
+    assert!(missing.is_none());
+    assert_eq!(store.io_get_delta_count("acme", "main").await, 0);
+}
+
+/// A dataset that already exists may still be opened (read) under
+/// read-only — only creation is refused.
+#[tokio::test]
+async fn read_only_store_opens_existing_dataset_but_never_creates() {
+    let (store, _tmp) = make_test_store(8);
+    // Create the dataset while writable (io_open_dataset auto-creates).
+    store
+        .io_open_dataset("acme", "main")
+        .await
+        .expect("create while writable");
+    drop(store);
+
+    let (store, _tmp2) = {
+        // Reopen the same dir — fresh store marked read-only, as a second
+        // process would see it.
+        let store = LanceStore::new(
+            _tmp.path(),
+            8,
+            256 * 1024 * 1024,
+            128 * 1024 * 1024,
+        );
+        store.set_read_only(true);
+        (store, _tmp)
+    };
+
+    // Existing dataset: open succeeds (reads work).
+    store
+        .io_open_dataset("acme", "main")
+        .await
+        .expect("existing dataset opens read-only");
+
+    // New domain: creation is a write → ReadOnly.
+    let err = store
+        .io_open_dataset("newdomain", "main")
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ReadOnly(_)), "got: {:?}", err);
+}
