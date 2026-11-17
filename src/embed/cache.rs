@@ -22,12 +22,15 @@ const ZSTD_LEVEL: CompressionLevel = CompressionLevel::Fastest;
 /// Sled background flush interval in milliseconds.
 const SLED_FLUSH_MS: u64 = 2000;
 
+/// How often `put` checks the size bound — every Nth put, i.e. ~1% of puts.
+const EVICT_CHECK_INTERVAL: u64 = 100;
+
 // Sled's `cache_capacity` is a soft limit on the in-memory page cache.
-// Sled persists ALL entries to disk (unbounded for now) and uses an internal
+// Sled persists ALL entries to disk and uses an internal
 // LRU to evict in-memory pages when the cache is full.
 // We keep the in-memory page cache small (~20MB) — just enough for hot
 // entries. The old formula (max_entries × 4KB) caused 12 GB RAM usage when
-// max_entries was set to 3M. Disk-side LRU eviction will be added later.
+// max_entries was set to 3M. Disk-side eviction is enforced by `evict_if_over_max`.
 const SLED_CACHE_CAPACITY_BYTES: u64 = 5_000 * 4096;
 
 /// Disk-backed embedding cache.
@@ -40,12 +43,15 @@ pub struct EmbedCache {
     /// True when `open` found the sled lock held by another process — the
     /// signal the engine uses to switch the whole store read-only.
     locked_elsewhere: bool,
+    /// Disk-side entry bound from `open` — enforced by periodic eviction.
+    max_entries: Option<usize>,
     /// Atomic entry counter shared across all clones via Arc.
-    /// Incremented on `put`, never decremented (sled doesn't expose eviction
-    /// callbacks). Initialized lazily on first `len()` call by scanning the
-    /// sled tree. After that, reads are O(1).
+    /// Incremented on `put`, decremented on eviction. Initialized lazily on
+    /// first `len()` call by scanning the sled tree. After that, reads are O(1).
     /// Uses `AtomicUsize::MAX` as a sentinel for "not yet initialized".
     entry_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Put counter driving the periodic (~1%) eviction check.
+    put_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Clone for EmbedCache {
@@ -54,7 +60,9 @@ impl Clone for EmbedCache {
             db: self.db.clone(),
             enabled: self.enabled,
             locked_elsewhere: self.locked_elsewhere,
+            max_entries: self.max_entries,
             entry_count: std::sync::Arc::clone(&self.entry_count),
+            put_count: std::sync::Arc::clone(&self.put_count),
         }
     }
 }
@@ -66,15 +74,19 @@ impl EmbedCache {
             db: None,
             enabled: false,
             locked_elsewhere: false,
+            max_entries: None,
             entry_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            put_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     /// Open or create the sled cache at `path`.
     ///
     /// `max_entries` controls whether the cache is enabled (Some) or disabled
-    /// (None). The in-memory page cache is fixed at ~20 MB regardless — sled
-    /// persists all entries to disk and uses LRU eviction for in-memory pages.
+    /// (None), and bounds the on-disk entry count: every ~100th `put` evicts
+    /// the overflow back down to the bound. The in-memory page cache is fixed
+    /// at ~20 MB regardless — sled persists all entries to disk and uses LRU
+    /// eviction for in-memory pages.
     pub fn open(path: &Path, max_entries: Option<usize>) -> Self {
         match max_entries {
             None => Self::disabled(),
@@ -89,9 +101,11 @@ impl EmbedCache {
                         db: Some(db),
                         enabled: true,
                         locked_elsewhere: false,
+                        max_entries,
                         entry_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
                             usize::MAX,
                         )),
+                        put_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     },
                     // Another process holds the sled lock: degrade to a
                     // disabled cache instead of panicking — lookups miss and
@@ -160,6 +174,7 @@ impl EmbedCache {
     }
 
     /// Store an embedding in the cache. No-op if disabled.
+    /// Every ~100th put checks the on-disk bound and evicts the overflow.
     pub fn put(&self, key: &[u8; 32], embedding: &[f32]) {
         if !self.enabled {
             return;
@@ -174,7 +189,43 @@ impl EmbedCache {
             if was_new {
                 self.entry_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            if self.put_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % EVICT_CHECK_INTERVAL
+                == EVICT_CHECK_INTERVAL - 1
+            {
+                self.evict_if_over_max();
+            }
         }
+    }
+
+    /// Evict entries down to `max_entries` when the cache has grown past it.
+    /// Keys are SHA-256 hashes, so lexicographic order is uniform-random with
+    /// respect to content — removing the first `excess` keys in key order is
+    /// effectively random eviction. Bounded work: at most `excess` removes,
+    /// and `excess` stays small because the check runs every ~100 puts.
+    fn evict_if_over_max(&self) {
+        let (Some(max), Some(db)) = (self.max_entries, self.db.as_ref()) else {
+            return;
+        };
+        let excess = self.len().saturating_sub(max);
+        if excess == 0 {
+            return;
+        }
+        let victim_keys: Vec<_> = db
+            .iter()
+            .keys()
+            .take(excess)
+            .flatten()
+            .collect();
+        let mut removed = 0usize;
+        for key in victim_keys {
+            if db.remove(key).is_ok() {
+                removed += 1;
+            }
+        }
+        // entry_count holds usize::MAX until the first len() call initialises
+        // it — but len() above already did, so a plain subtract is safe.
+        self.entry_count
+            .fetch_sub(removed, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether the cache is enabled.
@@ -351,5 +402,25 @@ mod tests {
         assert!(second.get(&key, 768).is_none(), "disabled cache misses");
         second.put(&key, &[0.1_f32; 768]);
         assert_eq!(second.len(), 0, "disabled put is a no-op");
+    }
+
+    #[test]
+    fn eviction_enforces_max_entries() {
+        let dir = TempDir::new().expect("tempdir");
+        let cache = EmbedCache::open(dir.path(), Some(5));
+        assert!(cache.is_enabled());
+
+        // 105 puts: the periodic check (every 100th put) must evict down to
+        // max_entries — keys are SHA-256 so lexicographic removal is uniform.
+        for i in 0..105 {
+            let key = EmbedCache::cache_key("model", &format!("text{}", i));
+            cache.put(&key, &[0.1_f32; 8]);
+        }
+        assert!(
+            cache.len() <= 10,
+            "after the eviction pass the cache must be at max_entries + the puts since: {}",
+            cache.len()
+        );
+        assert!(!cache.is_empty(), "eviction must not empty the cache");
     }
 }
