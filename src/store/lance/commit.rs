@@ -1547,10 +1547,7 @@ impl LanceStore {
         // Phase 1: TTL eviction — remove terminal tasks older than TASK_TTL.
         tasks.retain(|_, (status, ts)| {
             let is_terminal = matches!(status, TaskStatus::Complete { .. } | TaskStatus::Error { .. });
-            if is_terminal && now.duration_since(*ts) > TASK_TTL {
-                return false;
-            }
-            true
+            !(is_terminal && now.duration_since(*ts) > TASK_TTL)
         });
 
         // Phase 2: Hard cap — if still over MAX_TASKS, evict oldest terminal first.
