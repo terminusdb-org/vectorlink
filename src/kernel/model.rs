@@ -171,6 +171,12 @@ pub enum Operation {
     Changed { id: String, string: String },
     Deleted { id: String },
     Error { message: String },
+    /// Push-level failure emitted by the vectorlink body reader on protocol
+    /// corruption (malformed NDJSON, invalid UTF-8, broken stream) — the input
+    /// is truncated, so the push must fail and never tag. Distinct from
+    /// `Error`, which a producer sends as a per-document render-failure skip.
+    /// Producers never emit this; a client-requested cancel is `Abort`.
+    Fatal { message: String },
     Abort,
 }
 

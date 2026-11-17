@@ -105,6 +105,11 @@ pub struct CandidatesResult {
 /// stacked spikes from exhausting the default nofile=1024 limit under load.
 const HEAVY_SCAN_MAX_CONCURRENT: usize = 4;
 
+/// Bound on a single embedding-provider call. Without it a wedged provider
+/// socket stalls the push for the OS TCP timeout while holding the branch
+/// pipeline lock; 300s is generous for slow CPU models yet finite.
+const EMBED_CLIENT_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// The search service — owns the store and config, provides the transport-agnostic API.
 #[derive(Clone)]
 pub struct SearchService {
@@ -240,7 +245,8 @@ impl SearchService {
             .unwrap_or(true);
         let ready_search = Arc::new(std::sync::atomic::AtomicBool::new(search_ready));
 
-        let mut http_client_builder = reqwest::Client::builder();
+        let mut http_client_builder = reqwest::Client::builder()
+            .timeout(EMBED_CLIENT_TIMEOUT);
         if let Some(key) = &config.embed_api_key {
             let mut headers = reqwest::header::HeaderMap::new();
             headers.insert(
@@ -257,7 +263,8 @@ impl SearchService {
 
         // Slot-2 client — a separate Authorization default so the slot-1 key
         // is never sent to a different endpoint.
-        let mut http_client2_builder = reqwest::Client::builder();
+        let mut http_client2_builder = reqwest::Client::builder()
+            .timeout(EMBED_CLIENT_TIMEOUT);
         if let Some(key) = &config.api_key2 {
             let mut headers = reqwest::header::HeaderMap::new();
             headers.insert(
@@ -2213,6 +2220,11 @@ async fn io_run_index_pipeline(
                     message: format!("operation error: {}", message),
                 });
             }
+            Operation::Fatal { message } => {
+                // Body-reader protocol corruption: the input is truncated, so
+                // tagging would index a partial commit — fail instead.
+                return Err(format!("push failed on protocol error: {}", message));
+            }
             Operation::Abort => {
                 // Abort: cancel in-process work immediately.
                 return Err("push aborted by client".to_string());
@@ -2251,7 +2263,8 @@ async fn io_run_index_pipeline(
         ctx.http_client,
         Some(ctx.embed_cache),
     )
-    .await;
+    .await
+    .map_err(|e| e.to_string())?;
 
     let embed_results_query = if store_clustering {
         embed::io_embed_batched(
@@ -2263,6 +2276,7 @@ async fn io_run_index_pipeline(
             Some(ctx.embed_cache),
         )
         .await
+        .map_err(|e| e.to_string())?
     } else {
         // Clustering disabled — fill with zeros (same dimension, no embed call).
         flat_texts
@@ -2752,7 +2766,8 @@ async fn io_run_index_pipeline_stream(
                 embed_heartbeat_interval(),
                 cancel_token,
             )
-            .await?;
+            .await?
+            .map_err(|e| e.to_string())?;
 
             // Embed clustering role (or zeros if disabled, cancellation-aware).
             let embed_results_query = if store_clustering {
@@ -2775,6 +2790,7 @@ async fn io_run_index_pipeline_stream(
                     cancel_token,
                 )
                 .await?
+                .map_err(|e| e.to_string())?
             } else {
                 flat_texts.iter().map(|_| EmbedResult::Ok(vec![0.0; ctx.store.dim])).collect::<Vec<_>>()
             };
@@ -2947,6 +2963,15 @@ async fn io_run_index_pipeline_stream(
             }
             Operation::Error { message } => {
                 skipped.push(SkippedDoc { id: "unknown".to_owned(), message: format!("operation error: {}", message) });
+            }
+            Operation::Fatal { message } => {
+                // Body-reader protocol corruption: the input is truncated, so
+                // tagging would index a partial commit — fail instead.
+                let msg = format!("push failed on protocol error: {}", message);
+                if let Some(tx) = &progress_tx {
+                    let _ = tx.send(ProgressUpdate::Error { error: msg.clone() }).await;
+                }
+                return Err(msg);
             }
             Operation::Abort => {
                 if let Some(tx) = &progress_tx {
@@ -3336,6 +3361,72 @@ mod tests_risk26 {
             Some("c0_seed"),
             "last_indexed must NOT advance after abort"
         );
+    }
+
+    /// A Fatal operation (produced by the body reader on protocol corruption —
+    /// malformed NDJSON, invalid UTF-8, broken stream) must fail the whole
+    /// push and never tag, unlike Operation::Error which is a doc-level skip.
+    #[tokio::test]
+    async fn fatal_operation_returns_error_and_does_not_tag() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
+        let tokenizer = test_tokenizer();
+        let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
+        let provider = dummy_provider();
+        let http_client = reqwest::Client::new();
+        let domain = "admin/fatal_test";
+        let branch = "main";
+
+        // Seed with one doc so a prior version exists.
+        let seed_row = ChunkRow {
+            doc_id: "doc/seed".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: vec![0.1; 8],
+            clustering_embedding: vec![0.1; 8],
+            content: "seed".to_owned(),
+        };
+        let v_seed = store
+            .io_upsert_chunks(domain, branch, "doc/seed", std::slice::from_ref(&seed_row))
+            .await
+            .expect("seed upsert");
+        store.io_tag_commit(domain, branch, "c0_seed", v_seed).await.expect("tag seed");
+        store.update_last_indexed(domain, branch, "c0_seed", v_seed).await;
+
+        // ACT: a commit whose stream was cut short by a body parse error.
+        let operations = vec![
+            Operation::Deleted { id: "doc/seed".to_owned() },
+            Operation::Fatal { message: "malformed NDJSON at line 7".to_owned() },
+        ];
+        let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
+        let result = io_run_index_pipeline(&ctx, "c1_fatal", operations).await;
+
+        // ASSERT: pipeline returns Err carrying the reader's message.
+        let err = result.expect_err("Fatal must return an error");
+        assert!(err.contains("malformed NDJSON at line 7"), "error must carry the parse cause: {}", err);
+
+        // ASSERT: last_indexed NOT advanced and the commit untagged.
+        let li = store
+            .last_indexed(
+                &Domain::from_resource_path(&parse_domain(domain).unwrap()),
+                &BranchName::new(branch.to_owned()),
+            )
+            .await
+            .expect("last_indexed read");
+        assert_eq!(
+            li.commit.as_deref(),
+            Some("c0_seed"),
+            "last_indexed must NOT advance after a Fatal op"
+        );
+        let resolved = store.io_resolve_commit(domain, branch, "c1_fatal").await.expect("resolve");
+        assert!(resolved.is_none(), "a Fatal push must never tag the commit");
+
+        // The pending delete must not have been applied either.
+        let deleted = store.io_lookup_doc_chunks(domain, branch, "doc/seed").await.expect("lookup");
+        assert!(!deleted.is_empty(), "doc/seed must survive a push that never tags");
     }
 
     /// regression (b): an empty-operations commit must tag + advance last_indexed.
@@ -3770,6 +3861,65 @@ mod tests_streaming {
             Some("c0_seed"),
             "last_indexed must NOT advance after abort in streaming pipeline"
         );
+    }
+
+    /// A Fatal op (body-reader protocol corruption) must abort the streaming
+    /// pipeline before the tag — a truncated push can never mark a commit
+    /// indexed.
+    #[tokio::test]
+    async fn stream_fatal_operation_returns_error_and_does_not_tag() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = LanceStore::new(tmp.path(), 8, 256 * 1024 * 1024, 128 * 1024 * 1024);
+        let tokenizer = test_tokenizer();
+        let chunk_params = ChunkParams { max_tokens: 512, overlap: 64 };
+        let provider = dummy_provider();
+        let http_client = reqwest::Client::new();
+        let domain = "admin/stream_fatal";
+        let branch = "main";
+
+        // Seed.
+        let seed_row = ChunkRow {
+            doc_id: "doc/seed".to_owned(),
+            doc_type: "T".to_owned(),
+            chunk_index: 0,
+            chunk_count: 1,
+            chunk_token_start: 0,
+            doc_token_len: 5,
+            embedding: vec![0.1; 8],
+            clustering_embedding: vec![0.1; 8],
+            content: "seed".to_owned(),
+        };
+        let v_seed = store
+            .io_upsert_chunks(domain, branch, "doc/seed", std::slice::from_ref(&seed_row))
+            .await
+            .expect("seed upsert");
+        store.io_tag_commit(domain, branch, "c0_seed", v_seed).await.expect("tag seed");
+        store.update_last_indexed(domain, branch, "c0_seed", v_seed).await;
+
+        // ACT: docs arrive, then the reader hits a parse error and drops.
+        let (tx, rx) = mpsc::channel::<Operation>(16);
+        tx.send(Operation::Deleted { id: "doc/seed".to_owned() }).await.unwrap();
+        tx.send(Operation::Fatal { message: "malformed NDJSON at line 7".to_owned() }).await.unwrap();
+        drop(tx);
+
+        let ctx = make_ctx(&store, &tokenizer, &chunk_params, &provider, &http_client, domain, branch);
+        let result = io_run_index_pipeline_stream(&ctx, "c1_fatal", rx, None, &tokio_util::sync::CancellationToken::new(), None).await;
+
+        let err = result.expect_err("Fatal must return error in streaming pipeline");
+        assert!(err.contains("malformed NDJSON at line 7"), "error must carry the parse cause: {}", err);
+
+        let li = store
+            .last_indexed(
+                &Domain::from_resource_path(&parse_domain(domain).unwrap()),
+                &BranchName::new(branch.to_owned()),
+            )
+            .await
+            .expect("last_indexed read");
+        assert_eq!(li.commit.as_deref(), Some("c0_seed"), "last_indexed must NOT advance after Fatal");
+        let resolved = store.io_resolve_commit(domain, branch, "c1_fatal").await.expect("resolve");
+        assert!(resolved.is_none(), "a Fatal push must never tag the commit");
+        let deleted = store.io_lookup_doc_chunks(domain, branch, "doc/seed").await.expect("lookup");
+        assert!(!deleted.is_empty(), "doc/seed must survive a push that never tags");
     }
 
     /// The streaming pipeline must handle Deleted operations and advance last_indexed.

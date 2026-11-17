@@ -530,11 +530,9 @@ async fn handle_push(
                         Err(e) => {
                             let error_msg = format!("malformed NDJSON at line {}: {}", line_num, e);
                             state.service.record_error_task(&task_id, error_msg.clone()).await;
-                            // Feed the parse failure into the pipeline as an
-                            // Operation::Error so it lands in `skipped` — the
-                            // truncated-push error then reports the real cause
-                            // instead of a bare "received 0".
-                            let _ = op_tx.send(Operation::Error { message: error_msg }).await;
+                            // The body is truncated: Fatal fails the push
+                            // before the pipeline can tag a partial commit.
+                            let _ = op_tx.send(Operation::Fatal { message: error_msg }).await;
                             // Drop op_tx to signal the pipeline to stop.
                             drop(op_tx);
                             return;
@@ -556,13 +554,17 @@ async fn handle_push(
                                     e.valid_up_to(),
                                     e
                                 );
-                                state.service.record_error_task(&task_id, error_msg).await;
+                                state.service.record_error_task(&task_id, error_msg.clone()).await;
+                                let _ = op_tx.send(Operation::Fatal { message: error_msg }).await;
                                 drop(op_tx);
                                 return;
                             }
                         }
                     }
-                    Some(Err(_)) => {
+                    Some(Err(e)) => {
+                        let error_msg = format!("broken push stream: {}", e);
+                        state.service.record_error_task(&task_id, error_msg.clone()).await;
+                        let _ = op_tx.send(Operation::Fatal { message: error_msg }).await;
                         drop(op_tx);
                         return;
                     }
@@ -583,7 +585,8 @@ async fn handle_push(
                     }
                     Err(e) => {
                         let error_msg = format!("malformed NDJSON at line {}: {}", line_num, e);
-                        state.service.record_error_task(&task_id, error_msg).await;
+                        state.service.record_error_task(&task_id, error_msg.clone()).await;
+                        let _ = op_tx.send(Operation::Fatal { message: error_msg }).await;
                     }
                 }
             }
@@ -657,8 +660,10 @@ async fn handle_push(
                 }
                 Err(e) => {
                     let error_msg = format!("malformed NDJSON at line {}: {}", line_num, e);
-                    state.service.record_error_task(&task_id, error_msg).await;
-                    // Drop op_tx to signal the pipeline to stop.
+                    state.service.record_error_task(&task_id, error_msg.clone()).await;
+                    // The body is truncated: Fatal fails the push before the
+                    // pipeline can tag a partial commit.
+                    let _ = op_tx.send(Operation::Fatal { message: error_msg }).await;
                     drop(op_tx);
                     return (StatusCode::OK, task_id).into_response();
                 }
@@ -708,22 +713,25 @@ async fn handle_push(
             }
             Err(e) => {
                 let error_msg = format!("malformed NDJSON at line {}: {}", line_num, e);
-                state.service.record_error_task(&task_id, error_msg).await;
+                state.service.record_error_task(&task_id, error_msg.clone()).await;
+                let _ = op_tx.send(Operation::Fatal { message: error_msg }).await;
                 drop(op_tx);
                 return (StatusCode::OK, task_id).into_response();
             }
         }
     }
 
-    // Drop the sender to signal the pipeline that all operations have been sent.
-    drop(op_tx);
-
     if let Some(err) = stream_error {
-        // Record the error on the task so TerminusDB polling /check sees it
-        // (the pipeline task itself has no way to know why the channel closed).
-        state.service.record_error_task(&task_id, err).await;
+        // Record the error on the task so TerminusDB polling /check sees it,
+        // and fail the pipeline: a broken stream means a truncated body.
+        state.service.record_error_task(&task_id, err.clone()).await;
+        let _ = op_tx.send(Operation::Fatal { message: err }).await;
+        drop(op_tx);
         return (StatusCode::OK, task_id).into_response();
     }
+
+    // Drop the sender to signal the pipeline that all operations have been sent.
+    drop(op_tx);
 
     (StatusCode::OK, task_id).into_response()
 }

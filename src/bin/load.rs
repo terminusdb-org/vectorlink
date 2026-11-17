@@ -292,6 +292,10 @@ async fn main() -> ExitCode {
                 eprintln!("  skip {}: operation error — {}", i + 1, message);
                 skipped_count += 1;
             }
+            Operation::Fatal { message } => {
+                eprintln!("  fatal: protocol error at line {} — {}", i + 1, message);
+                break;
+            }
             Operation::Abort => {
                 eprintln!("  abort: client requested abort at line {}", i + 1);
                 break;

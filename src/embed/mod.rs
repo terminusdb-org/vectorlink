@@ -208,6 +208,21 @@ pub enum EmbedError {
     ParseError(String),
 }
 
+impl EmbedError {
+    /// True when the failure is provider-level — unreachable, 5xx, rate-limit,
+    /// or a malformed response — so no document is at fault and the push must
+    /// fail rather than skip documents into silent search misses. False only
+    /// for per-request 4xx rejections, where a toxic document is the cause.
+    pub fn is_fatal(&self) -> bool {
+        match self {
+            EmbedError::Unreachable(_)
+            | EmbedError::DimensionMismatch { .. }
+            | EmbedError::ParseError(_) => true,
+            EmbedError::ProviderError { status, .. } => *status >= 500 || *status == 429,
+        }
+    }
+}
+
 /// OpenAI-compatible embedding request body.
 #[derive(Debug, Serialize)]
 struct EmbedRequest {
@@ -375,9 +390,14 @@ pub enum EmbedResult {
 /// Batch-embed a flat list of texts in groups of `batch_size`, calling `io_embed`
 /// per batch. Returns one `EmbedResult` per input text, preserving order.
 ///
-/// Per-doc failure isolation: if a batch call fails, the batch is retried as
-/// INDIVIDUAL per-text calls. Only the actually toxic text(s) get `EmbedResult::Failed`;
-/// the rest succeed. This ensures a single bad document does not fail the whole commit.
+/// Per-doc failure isolation: if a batch call fails with a per-request
+/// rejection (4xx), the batch is retried as INDIVIDUAL per-text calls. Only
+/// the actually toxic text(s) get `EmbedResult::Failed`; the rest succeed.
+///
+/// Provider-level failures (unreachable, 5xx, rate-limit, malformed response)
+/// are fatal: the whole call returns `Err` so the pipeline aborts the push
+/// before tagging — tagging would mark the commit indexed while documents
+/// silently missed their embeddings, and the tag blocks re-push forever.
 ///
 /// Panics if `batch_size == 0` (configuration error — fail-loud).
 pub async fn io_embed_batched(
@@ -387,11 +407,11 @@ pub async fn io_embed_batched(
     role: EmbeddingRole,
     client: &reqwest::Client,
     cache: Option<&EmbedCache>,
-) -> Vec<EmbedResult> {
+) -> Result<Vec<EmbedResult>, EmbedError> {
     assert!(batch_size > 0, "embed_batch_size must be > 0 (configuration error)");
 
     if texts.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut results: Vec<EmbedResult> = Vec::with_capacity(texts.len());
@@ -404,10 +424,14 @@ pub async fn io_embed_batched(
                     results.push(EmbedResult::Ok(emb));
                 }
             }
+            Err(batch_err) if batch_err.is_fatal() => {
+                return Err(batch_err);
+            }
             Err(batch_err) => {
-                // WHY: A batch failure does not mean ALL texts in it are bad — often a
-                // single toxic input (empty, over-long, provider-rejected) poisons the
-                // whole request. We retry individually to isolate the toxic text(s).
+                // WHY: A batch rejection (4xx) does not mean ALL texts in it are bad —
+                // often a single toxic input (empty, over-long, provider-rejected)
+                // poisons the whole request. We retry individually to isolate the
+                // toxic text(s).
                 // INVARIANT: io_embed_batched guarantees exactly one EmbedResult per input
                 // text. The individual retries below fulfil that for every text in the
                 // failed batch — successes get Ok, failures get Failed.
@@ -431,6 +455,11 @@ pub async fn io_embed_batched(
                                 ));
                             }
                         }
+                        Err(individual_err) if individual_err.is_fatal() => {
+                            // The provider died mid-retry — remaining texts are
+                            // not toxic docs, the push must fail.
+                            return Err(individual_err);
+                        }
                         Err(individual_err) => {
                             results.push(EmbedResult::Failed(format!(
                                 "embedding failed after individual retry: {}",
@@ -443,7 +472,7 @@ pub async fn io_embed_batched(
         }
     }
 
-    results
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -625,5 +654,91 @@ mod tests {
             768,
         );
         assert!(matches!(result, Err(EmbedError::ParseError(_))));
+    }
+
+    // --- fatal vs per-doc failure classification ---
+    #[test]
+    fn is_fatal_classification() {
+        assert!(EmbedError::Unreachable("down".to_owned()).is_fatal());
+        assert!(EmbedError::ParseError("garbage".to_owned()).is_fatal());
+        assert!(EmbedError::DimensionMismatch { expected: 8, actual: 4 }.is_fatal());
+        assert!(EmbedError::ProviderError { status: 500, body: String::new() }.is_fatal());
+        assert!(EmbedError::ProviderError { status: 503, body: String::new() }.is_fatal());
+        assert!(EmbedError::ProviderError { status: 429, body: String::new() }.is_fatal());
+        assert!(!EmbedError::ProviderError { status: 400, body: String::new() }.is_fatal());
+        assert!(!EmbedError::ProviderError { status: 404, body: String::new() }.is_fatal());
+        assert!(!EmbedError::ProviderError { status: 422, body: String::new() }.is_fatal());
+    }
+
+    /// A stub OpenAI-compatible endpoint that answers every POST with `status`.
+    async fn spawn_stub_provider(status: axum::http::StatusCode) -> String {
+        let app = axum::Router::new().route(
+            "/v1/embeddings",
+            axum::routing::post(move || async move { status }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{}", addr)
+    }
+
+    fn stub_provider(base_url: &str) -> Provider {
+        Provider::OpenAiCompatible {
+            base_url: base_url.to_owned(),
+            model: "stub".to_owned(),
+            dim: 8,
+            prefixes: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn batched_embed_unreachable_provider_errors() {
+        // Port 0 routes nowhere — every call fails to connect.
+        let provider = stub_provider("http://127.0.0.1:0");
+        let client = reqwest::Client::new();
+        let texts = vec!["a".to_owned(), "b".to_owned()];
+        let result = io_embed_batched(
+            &provider, &texts, 32, EmbeddingRole::Document, &client, None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(EmbedError::Unreachable(_))),
+            "unreachable provider must be a fatal Err, not per-doc Failed: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn batched_embed_5xx_errors_without_retrying_per_text() {
+        let url = spawn_stub_provider(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+        let provider = stub_provider(&url);
+        let client = reqwest::Client::new();
+        let texts = vec!["a".to_owned(), "b".to_owned()];
+        let result = io_embed_batched(
+            &provider, &texts, 32, EmbeddingRole::Document, &client, None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(EmbedError::ProviderError { status: 500, .. })),
+            "5xx must be a fatal Err, not per-doc Failed: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn batched_embed_4xx_isolates_to_per_doc_failed() {
+        // A 4xx rejects the whole batch; per-text retry then isolates each
+        // document — they are toxic-candidate failures, not provider outages.
+        let url = spawn_stub_provider(axum::http::StatusCode::BAD_REQUEST).await;
+        let provider = stub_provider(&url);
+        let client = reqwest::Client::new();
+        let texts = vec!["a".to_owned(), "b".to_owned()];
+        let result = io_embed_batched(
+            &provider, &texts, 32, EmbeddingRole::Document, &client, None,
+        )
+        .await
+        .expect("4xx must not be a fatal Err");
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().all(|r| matches!(r, EmbedResult::Failed(_))));
     }
 }
