@@ -11569,3 +11569,79 @@ async fn read_only_store_opens_existing_dataset_but_never_creates() {
         .unwrap_err();
     assert!(matches!(err, StoreError::ReadOnly(_)), "got: {:?}", err);
 }
+
+/// REGRESSION: a doc-id/doc-type filter must be applied BEFORE the top-K
+/// candidate cap, not after. `vector_search`/`fts_search` cap candidates at
+/// 3*(start+count); without Lance prefiltering, excluded documents can occupy
+/// every candidate slot and an eligible match is silently lost — a recall bug
+/// in all three modes (Hybrid runs both legs). Guarded by searching a corpus
+/// of one "allowed" doc plus 12 closer/stronger-matching excluded docs.
+#[tokio::test]
+async fn filtered_topk_survives_excluded_neighbours() {
+    for mode in [SearchMode::Vector, SearchMode::Fts, SearchMode::Hybrid] {
+        let mut ids_by_corpus = Vec::new();
+        for with_distractors in [false, true] {
+            let (store, _tmp) = make_test_store(8);
+            let domain = "admin/filtered_topk";
+            let mut rows = Vec::new();
+            for i in 0..if with_distractors { 13 } else { 1 } {
+                let eligible = i == 0;
+                let embedding = if eligible {
+                    vec![0., 1., 0., 0., 0., 0., 0., 0.]
+                } else {
+                    vec![1., 0., 0., 0., 0., 0., 0., 0.]
+                };
+                rows.push(ChunkRow {
+                    doc_id: if eligible {
+                        "allowed".into()
+                    } else {
+                        format!("excluded-{}", i)
+                    },
+                    doc_type: "Observation".into(),
+                    chunk_index: 0,
+                    chunk_count: 1,
+                    chunk_token_start: 0,
+                    doc_token_len: 20,
+                    embedding: embedding.clone(),
+                    clustering_embedding: embedding,
+                    content: if eligible {
+                        "sensor calibration context uncertainty observation conditions outcome review".into()
+                    } else {
+                        "sensor sensor sensor".into()
+                    },
+                });
+            }
+            store
+                .io_upsert_chunks(domain, "main", "fixture", &rows)
+                .await
+                .unwrap();
+            let version = store.io_ensure_fts_index(domain, "main").await.unwrap();
+            store.io_tag_commit(domain, "main", "c0", version).await.unwrap();
+            store.io_refresh_cached_dataset(domain, "main").await.unwrap();
+            let q = SearchQuery {
+                query_embedding: vec![1., 0., 0., 0., 0., 0., 0., 0.],
+                query_text: "sensor".into(),
+                mode,
+                start: 0,
+                count: 1,
+                doc_type_filter: vec![],
+                doc_id_filter: vec!["allowed".into()],
+                snippet: false,
+            };
+            let hits = store.io_search(domain, "main", "c0", &q).await.unwrap();
+            ids_by_corpus.push(hits.iter().map(|h| h.doc_id.clone()).collect::<Vec<_>>());
+        }
+        assert_eq!(
+            ids_by_corpus[0],
+            vec!["allowed".to_string()],
+            "{:?} eligible-only control",
+            mode
+        );
+        assert_eq!(
+            ids_by_corpus[1],
+            vec!["allowed".to_string()],
+            "{:?} doc_id filter must run before the top-K candidate cap",
+            mode
+        );
+    }
+}

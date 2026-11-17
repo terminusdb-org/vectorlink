@@ -107,6 +107,9 @@ impl LanceStore {
         if !query.doc_type_filter.is_empty() || !query.doc_id_filter.is_empty() {
             if let Some(expr) = build_filter_expr(&query.doc_type_filter, &query.doc_id_filter) {
                 scanner.filter_expr(expr);
+                // Filter before the limit: otherwise excluded rows can consume
+                // the whole candidate cap and eligible matches are lost.
+                scanner.prefilter(true);
             }
         }
 
@@ -354,6 +357,9 @@ impl LanceStore {
         if !query.doc_type_filter.is_empty() || !query.doc_id_filter.is_empty() {
             if let Some(expr) = build_filter_expr(&query.doc_type_filter, &query.doc_id_filter) {
                 scanner.filter_expr(expr);
+                // Filter before the KNN top-K: otherwise excluded rows can
+                // consume the whole candidate cap and eligible matches are lost.
+                scanner.prefilter(true);
             }
         }
 
@@ -398,6 +404,9 @@ impl LanceStore {
         if !query.doc_type_filter.is_empty() || !query.doc_id_filter.is_empty() {
             if let Some(expr) = build_filter_expr(&query.doc_type_filter, &query.doc_id_filter) {
                 scanner.filter_expr(expr);
+                // Filter before the limit: otherwise excluded rows can consume
+                // the whole candidate cap and eligible matches are lost.
+                scanner.prefilter(true);
             }
         }
 

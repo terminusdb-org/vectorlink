@@ -575,6 +575,9 @@ async fn io_collect_top_k_cross_ann(
             })?;
             // filter_expr: pre-parsed DataFusion Expr — NO SQL string parsing.
             scanner.filter_expr(expr);
+            // Filter before the ANN top-K: otherwise out-of-candidate rows can
+            // consume the whole fetch_k cap and in-scope neighbours are lost.
+            scanner.prefilter(true);
 
             let batches: Vec<RecordBatch> = scanner
                 .try_into_stream()
@@ -853,6 +856,10 @@ async fn io_nearest_neighbour(
         .project(projection)
         .map_err(|e| StoreError::Internal(format!("duplicates nearest projection failed: {}", e)))?;
     scanner.filter_expr(filter);
+    // Filter before the ANN top-K: otherwise out-of-scope rows (incl. the
+    // point's own doc) can consume the whole NEIGHBOUR_K cap and in-scope
+    // neighbours are lost.
+    scanner.prefilter(true);
 
     let batches: Vec<RecordBatch> = scanner
         .try_into_stream()
