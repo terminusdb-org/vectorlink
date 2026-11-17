@@ -9,6 +9,7 @@
 //! Wires the full pipeline: parse → chunk → embed → store → tag.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokenizers::Tokenizer;
@@ -2564,6 +2565,62 @@ fn should_create_index(commit_position: usize) -> IndexAction {
     }
 }
 
+/// Default interval between heartbeat progress lines while a long-running
+/// await is in flight. The TerminusDB indexer watchdog aborts the server
+/// after ~60 s without a progress line, and a progress line is only
+/// produced per finished embed batch — a single slow call or an internal
+/// per-text retry loop emits nothing for its whole duration. Heartbeats
+/// report liveness at well under the watchdog deadline.
+const DEFAULT_EMBED_HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// Heartbeat interval, tunable via VECTORLINK_EMBED_HEARTBEAT_MS for
+/// watchdog-verification runs (a heartbeat below the watchdog deadline
+/// must keep a slow push alive; one above it must still trip).
+fn embed_heartbeat_interval() -> Duration {
+    std::env::var("VECTORLINK_EMBED_HEARTBEAT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .filter(|d| !d.is_zero())
+        .unwrap_or(DEFAULT_EMBED_HEARTBEAT)
+}
+
+/// Await `fut`, emitting a heartbeat `ProgressUpdate` every `heartbeat`
+/// while it is in flight. The TerminusDB indexer counts any progress line
+/// as liveness, so a slow-but-healthy call keeps the watchdog fed while a
+/// genuinely wedged engine still goes silent and trips it. Cancellation
+/// maps to the pipeline's superseded error. Heartbeat sends are
+/// best-effort — a full channel already proves progress lines flow.
+async fn await_with_heartbeat<F, S>(
+    fut: F,
+    progress_tx: &Option<mpsc::Sender<ProgressUpdate>>,
+    snapshot: S,
+    heartbeat: Duration,
+    cancel_token: &tokio_util::sync::CancellationToken,
+) -> Result<F::Output, String>
+where
+    F: std::future::Future,
+    S: Fn() -> ProgressUpdate,
+{
+    tokio::pin!(fut);
+    let mut ticker = tokio::time::interval(heartbeat);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await; // the first tick fires immediately — swallow it
+    loop {
+        tokio::select! {
+            out = &mut fut => return Ok(out),
+            _ = cancel_token.cancelled() => {
+                return Err("pipeline superseded by new push (reindex)".to_string());
+            }
+            _ = ticker.tick() => {
+                if let Some(tx) = progress_tx {
+                    let _ = tx.try_send(snapshot());
+                }
+            }
+        }
+    }
+}
+
 /// The pipeline lock is held for the entire loop (still one commit at a time).
 /// Multiple appends produce multiple fragments — compaction merges them later.
 /// The commit is untagged until the end, so no search sees partial data.
@@ -2673,36 +2730,51 @@ async fn io_run_index_pipeline_stream(
 
             let sub_chunk_count = flat_texts.len() as u64;
 
-            // Embed document role (cancellation-aware).
-            let embed_results_doc = tokio::select! {
-                r = embed::io_embed_batched(
+            // Embed document role (cancellation-aware, heartbeated). One
+            // slow provider call or an internal per-text retry emits no
+            // progress for its whole duration — the heartbeat keeps the
+            // indexer watchdog counting liveness meanwhile.
+            let embed_results_doc = await_with_heartbeat(
+                embed::io_embed_batched(
                     ctx.provider,
                     &flat_texts,
                     ctx.embed_batch_size,
                     EmbeddingRole::Document,
                     ctx.http_client,
                     Some(ctx.embed_cache),
-                ) => r,
-                _ = cancel_token.cancelled() => {
-                    return Err("pipeline superseded by new push (reindex)".to_string());
-                }
-            };
+                ),
+                progress_tx,
+                || ProgressUpdate::Progress {
+                    indexed: *indexed_count,
+                    total_seen: *total_docs_seen,
+                    skipped: skipped.len() as u64,
+                },
+                embed_heartbeat_interval(),
+                cancel_token,
+            )
+            .await?;
 
             // Embed clustering role (or zeros if disabled, cancellation-aware).
             let embed_results_query = if store_clustering {
-                tokio::select! {
-                    r = embed::io_embed_batched(
+                await_with_heartbeat(
+                    embed::io_embed_batched(
                         ctx.clustering_provider,
                         &flat_texts,
                         ctx.embed_batch_size,
                         EmbeddingRole::Clustering,
                         ctx.clustering_client,
                         Some(ctx.embed_cache),
-                    ) => r,
-                    _ = cancel_token.cancelled() => {
-                        return Err("pipeline superseded by new push (reindex)".to_string());
-                    }
-                }
+                    ),
+                    progress_tx,
+                    || ProgressUpdate::Progress {
+                        indexed: *indexed_count,
+                        total_seen: *total_docs_seen,
+                        skipped: skipped.len() as u64,
+                    },
+                    embed_heartbeat_interval(),
+                    cancel_token,
+                )
+                .await?
             } else {
                 flat_texts.iter().map(|_| EmbedResult::Ok(vec![0.0; ctx.store.dim])).collect::<Vec<_>>()
             };
@@ -5184,5 +5256,132 @@ mod tests_index_trigger {
         assert_eq!(should_create_index(4), IndexAction::Skip);
         assert_eq!(should_create_index(6), IndexAction::Skip);
         assert_eq!(should_create_index(7), IndexAction::Skip);
+    }
+}
+
+#[cfg(test)]
+mod tests_embed_heartbeat {
+    use super::*;
+    use std::time::Duration;
+
+    /// A slow in-flight await (one embedding call, or an internal retry
+    /// loop) must emit heartbeat Progress lines so the TerminusDB indexer
+    /// watchdog keeps counting liveness. With the clock paused, the runtime
+    /// auto-advances to each timer — heartbeats arrive at every interval.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_emits_progress_while_slow_await_in_flight() {
+        let (tx, mut rx) = mpsc::channel::<ProgressUpdate>(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let tx_opt = Some(tx);
+        let hb = await_with_heartbeat(
+            tokio::time::sleep(Duration::from_secs(95)),
+            &tx_opt,
+            || ProgressUpdate::Progress {
+                indexed: 7,
+                total_seen: 40,
+                skipped: 0,
+            },
+            Duration::from_secs(10),
+            &cancel,
+        );
+        tokio::pin!(hb);
+        let collect = async {
+            for _ in 0..3 {
+                let msg = rx.recv().await.expect("heartbeat must arrive");
+                match msg {
+                    ProgressUpdate::Progress {
+                        indexed,
+                        total_seen,
+                        skipped,
+                    } => {
+                        assert_eq!(indexed, 7);
+                        assert_eq!(total_seen, 40);
+                        assert_eq!(skipped, 0);
+                    }
+                    _ => panic!("expected a Progress heartbeat"),
+                }
+            }
+        };
+        tokio::select! {
+            _ = collect => {}
+            r = &mut hb => panic!("slow await finished early: {:?}", r),
+        }
+    }
+
+    /// A fast await completes before the first heartbeat tick — no line
+    /// is emitted and the wrapper returns the future's output unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn no_heartbeat_when_await_completes_fast() {
+        let (tx, mut rx) = mpsc::channel::<ProgressUpdate>(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let out = await_with_heartbeat(
+            async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                42_u8
+            },
+            &Some(tx),
+            || ProgressUpdate::Progress {
+                indexed: 0,
+                total_seen: 0,
+                skipped: 0,
+            },
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await
+        .expect("fast await must succeed");
+        assert_eq!(out, 42);
+        assert!(rx.try_recv().is_err(), "no heartbeat before first tick");
+    }
+
+    /// Cancellation wins over an in-flight slow await: the wrapper returns
+    /// the superseded error instead of the future's output.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_during_slow_await_returns_superseded_error() {
+        let (tx, _rx) = mpsc::channel::<ProgressUpdate>(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            cancel2.cancel();
+        });
+        let err = await_with_heartbeat(
+            tokio::time::sleep(Duration::from_secs(95)),
+            &Some(tx),
+            || ProgressUpdate::Progress {
+                indexed: 0,
+                total_seen: 0,
+                skipped: 0,
+            },
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await
+        .expect_err("cancelled await must error");
+        assert_eq!(err, "pipeline superseded by new push (reindex)");
+    }
+
+    /// With no progress channel (non-streaming push), a slow await still
+    /// completes — heartbeats are best-effort, never a failure source.
+    #[tokio::test(start_paused = true)]
+    async fn slow_await_completes_with_no_progress_channel() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let out = await_with_heartbeat(
+            async {
+                tokio::time::sleep(Duration::from_secs(25)).await;
+                "done"
+            },
+            &None,
+            || ProgressUpdate::Progress {
+                indexed: 0,
+                total_seen: 0,
+                skipped: 0,
+            },
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await
+        .expect("await must complete");
+        assert_eq!(out, "done");
     }
 }
